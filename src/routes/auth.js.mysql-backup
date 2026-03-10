@@ -1,0 +1,373 @@
+const express = require('express');
+const Joi = require('joi');
+const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken');
+const db = require('../config/database'); // Already updated for PostgreSQL
+const { authenticateToken } = require('../middleware/auth');
+
+const router = express.Router();
+
+// Validation schemas (keep same)
+const registerSchema = Joi.object({
+  username: Joi.string().alphanum().min(3).max(30).required(),
+  email: Joi.string().email().required(),
+  password: Joi.string().min(6).required(),
+  firstname: Joi.string().max(100).optional().allow('', null),
+  lastname: Joi.string().max(100).optional().allow('', null)
+});
+
+const loginSchema = Joi.object({
+  email: Joi.string().email().required(),
+  password: Joi.string().required()
+});
+
+// IMPORTANT: Password helper function for PHP $2y$ compatibility
+async function verifyPassword(plainPassword, hashedPassword) {
+  try {
+    console.log('Verifying password:', hashedPassword.substring(0, 30) + '...');
+    
+    // If already $2b$ format (new users)
+    if (hashedPassword.startsWith('$2b$')) {
+      return await bcrypt.compare(plainPassword, hashedPassword);
+    }
+    
+    // If $2y$ format (old PHP users) - CONVERT IT
+    if (hashedPassword.startsWith('$2y$')) {
+      console.log('Converting $2y$ hash to $2b$ format');
+      // bcrypt can handle $2y$ internally when we use compare
+      // Just replace $2y$ with $2b$
+      const convertedHash = '$2b$' + hashedPassword.substring(4);
+      return await bcrypt.compare(plainPassword, convertedHash);
+    }
+    
+    // Unknown format
+    console.log('Unknown password hash format:', hashedPassword.substring(0, 10));
+    return false;
+    
+  } catch (error) {
+    console.error('Password verification error:', error);
+    return false;
+  }
+}
+
+// Helper functions for user operations
+const User = {
+  // Find user by email
+  findByEmail: async (email) => {
+    try {
+      const result = await db.execute(
+        'SELECT * FROM users WHERE email = $1',
+        [email]
+      );
+      return result[0][0] || null; // PostgreSQL: result[0] = rows, result[1] = fields
+    } catch (error) {
+      console.error('Error finding user by email:', error);
+      throw error;
+    }
+  },
+
+  // Find user by username
+  findByUsername: async (username) => {
+    try {
+      const result = await db.execute(
+        'SELECT * FROM users WHERE username = $1',
+        [username]
+      );
+      return result[0][0] || null;
+    } catch (error) {
+      console.error('Error finding user by username:', error);
+      throw error;
+    }
+  },
+
+  // Find user by ID
+  findById: async (id) => {
+    try {
+      if (!id) {
+        throw new Error('User ID is required');
+      }
+      const result = await db.execute(
+        'SELECT * FROM users WHERE id = $1',
+        [id]
+      );
+      return result[0][0] || null;
+    } catch (error) {
+      console.error('Error finding user by ID:', error);
+      throw error;
+    }
+  },
+
+  // Create new user - USE bcrypt.hash()
+  create: async (userData) => {
+    try {
+      const hashedPassword = await bcrypt.hash(userData.password, 10);
+      const walletAccountNumber = `XP${Date.now().toString().slice(-8)}`;
+      
+      const result = await db.execute(
+        `INSERT INTO users (username, email, password, firstname, lastname, wallet_account_number, currency) 
+         VALUES ($1, $2, $3, $4, $5, $6, 'NGN')
+         RETURNING id`,
+        [
+          userData.username,
+          userData.email,
+          hashedPassword,
+          userData.firstname || null,
+          userData.lastname || null,
+          walletAccountNumber
+        ]
+      );
+      
+      return result[0][0].id; // PostgreSQL returns inserted row
+    } catch (error) {
+      console.error('Error creating user:', error);
+      throw error;
+    }
+  },
+
+  // Use our new verifyPassword function
+  verifyPassword: async (plainPassword, hashedPassword) => {
+    return await verifyPassword(plainPassword, hashedPassword);
+  }
+};
+
+// Generate tokens function
+const generateTokens = (userId) => {
+  const accessToken = jwt.sign(
+    { userId }, 
+    process.env.JWT_SECRET || 'fallback_secret', 
+    { expiresIn: '24h' }
+  );
+  
+  const refreshToken = jwt.sign(
+    { userId }, 
+    process.env.JWT_REFRESH_SECRET || 'fallback_refresh_secret', 
+    { expiresIn: '7d' }
+  );
+
+  return { accessToken, refreshToken };
+};
+
+// Add this route at the top of auth.js (before other routes)
+router.get('/debug/db-test', async (req, res) => {
+  try {
+    // Test 1: Simple query
+    const result = await db.execute('SELECT COUNT(*) as count FROM users');
+    
+    // Test 2: Check specific user
+    const testResult = await db.execute(
+      'SELECT id, email, LEFT(password, 10) as pass_prefix FROM users WHERE email LIKE $1 LIMIT 3',
+      ['%gmail%']
+    );
+    
+    res.json({
+      success: true,
+      userCount: result[0][0].count,
+      testUsers: testResult[0],
+      dbConnected: true
+    });
+    
+  } catch (error) {
+    console.error('DB Test Error:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message,
+      dbConnected: false
+    });
+  }
+});
+
+// Test route to check password format
+router.get('/debug/password-test', async (req, res) => {
+  try {
+    const result = await db.execute(
+      'SELECT id, username, email, LEFT(password, 10) as pass_start FROM users LIMIT 5'
+    );
+    
+    res.json({
+      success: true,
+      users: result[0],
+      note: 'Check if passwords start with $2y$ (PHP) or $2b$ (Node)'
+    });
+    
+  } catch (error) {
+    console.error('Password test error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Register endpoint
+router.post('/register', async (req, res) => {
+  try {
+    // Validate input
+    const { error, value } = registerSchema.validate(req.body);
+    if (error) {
+      return res.status(400).json({ error: error.details[0].message });
+    }
+
+    const { username, email, password, firstname, lastname } = value;
+
+    // Check if user already exists
+    const existingUser = await User.findByEmail(email) || await User.findByUsername(username);
+    if (existingUser) {
+      return res.status(409).json({ 
+        error: 'User with this email or username already exists' 
+      });
+    }
+
+    // Create user
+    const userId = await User.create({
+      username,
+      email,
+      password,
+      firstname,
+      lastname
+    });
+
+    // Generate tokens
+    const tokens = generateTokens(userId);
+
+    res.status(201).json({
+      message: 'User registered successfully',
+      user: {
+        id: userId,
+        username,
+        email,
+        firstname,
+        lastname
+      },
+      ...tokens
+    });
+
+  } catch (error) {
+    console.error('Registration error:', error);
+    res.status(500).json({ error: 'Internal server error during registration' });
+  }
+});
+
+// Login endpoint - FIXED with proper password verification
+router.post('/login', async (req, res) => {
+  try {
+    console.log('Login attempt:', req.body.email);
+    
+    // Validate input
+    const { error, value } = loginSchema.validate(req.body);
+    if (error) {
+      return res.status(400).json({ error: error.details[0].message });
+    }
+
+    const { email, password } = value;
+
+    // Find user
+    const user = await User.findByEmail(email);
+    if (!user) {
+      console.log('User not found:', email);
+      return res.status(401).json({ error: 'Invalid email or password' });
+    }
+
+    console.log('User found:', user.username, 'Password hash:', user.password.substring(0, 30) + '...');
+
+    // Check if user is banned
+    if (user.is_banned) {
+      return res.status(403).json({ error: 'Account has been suspended' });
+    }
+
+    // Verify password using our new function
+    const isValidPassword = await verifyPassword(password, user.password);
+    console.log('Password valid:', isValidPassword);
+    
+    if (!isValidPassword) {
+      return res.status(401).json({ error: 'Invalid email or password' });
+    }
+
+    // Generate tokens
+    const tokens = generateTokens(user.id);
+
+    // Update last login
+    await db.execute(
+      'UPDATE users SET updated_at = CURRENT_TIMESTAMP WHERE id = $1',
+      [user.id]
+    );
+
+    res.json({
+      message: 'Login successful',
+      user: {
+        id: user.id,
+        username: user.username,
+        email: user.email,
+        firstname: user.firstname,
+        lastname: user.lastname,
+        profile_pic: user.profile_pic,
+        rank: user.rank,
+        balance: user.balance,
+        wallet_account_number: user.wallet_account_number,
+        currency: user.currency,
+        is_admin: user.is_admin
+      },
+      ...tokens
+    });
+
+  } catch (error) {
+    console.error('Login error:', error);
+    res.status(500).json({ error: 'Internal server error during login' });
+  }
+});
+
+// GET /api/auth/profile - Get current user profile
+router.get('/profile', authenticateToken, async (req, res) => {
+  try {
+    console.log('🔵 AUTH PROFILE: Fetching for user', req.user.id);
+    
+    const result = await db.execute(
+      `SELECT id, username, email, profile_pic, rank,
+              matches_played, wins, losses, win_rate,
+              xp_points, is_admin, account_status,
+              wallet_account_number, balance
+       FROM users 
+       WHERE id = $1`,
+      [req.user.id]
+    );
+
+    if (result[0].length === 0) {
+      return res.status(404).json({ 
+        success: false,
+        error: 'User not found' 
+      });
+    }
+
+    res.json({
+      success: true,
+      user: result[0][0]
+    });
+  } catch (error) {
+    console.error('Get profile error:', error);
+    res.status(500).json({ 
+      success: false,
+      error: 'Failed to fetch profile' 
+    });
+  }
+});
+
+// Get current user (me) - Alternative endpoint
+router.get('/me', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id || req.user.userId;
+    
+    const user = await User.findById(userId);
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    // Remove sensitive data
+    const { password, reset_token, token_expiry, ...userData } = user;
+
+    res.json({
+      user: userData
+    });
+
+  } catch (error) {
+    console.error('Get profile error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+module.exports = router;

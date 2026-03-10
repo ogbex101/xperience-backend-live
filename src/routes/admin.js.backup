@@ -1,0 +1,4549 @@
+const express = require('express');
+const router = express.Router();
+const db = require('../config/database');
+const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken');
+const { v4: uuidv4 } = require('uuid');
+const multer = require('multer');
+const emailService = require('../services/emailService');
+
+// ==================== TEST & DEBUG ROUTES ====================
+
+// Test endpoint - should always work
+router.get('/test', (req, res) => {
+  console.log('🔧 Admin API test endpoint called');
+  res.json({ 
+    success: true, 
+    message: 'Admin API is working',
+    timestamp: new Date().toISOString(),
+    version: '1.0.0'
+  });
+});
+
+// Simple test login (no database required)
+router.post('/login-test', (req, res) => {
+  try {
+    const { username, password } = req.body;
+    
+    console.log('🔐 TEST Admin login attempt:', { username, password: '***' });
+    
+    // Hardcoded credentials for testing
+    if (username === 'admin' && password === 'admin@2005') {
+      // Generate JWT token
+      const token = jwt.sign(
+        { 
+          id: 1, 
+          username: 'admin', 
+          role: 'super_admin',
+          type: 'admin'
+        },
+        process.env.JWT_SECRET || 'fallback_secret',
+        { expiresIn: '24h' }
+      );
+      
+      console.log('✅ Test login successful');
+      
+      return res.json({
+        success: true,
+        message: 'Login successful (TEST MODE)',
+        token,
+        admin: {
+          id: 1,
+          username: 'admin',
+          email: 'admin@xperience.com',
+          role: 'super_admin'
+        }
+      });
+    }
+    
+    console.log('❌ Test login failed: Invalid credentials');
+    res.status(401).json({ 
+      success: false, 
+      message: 'Invalid credentials. Use admin/admin@2005 for testing' 
+    });
+    
+  } catch (error) {
+    console.error('❌ Login test error:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Server error during test login' 
+    });
+  }
+});
+
+// ==================== MIDDLEWARE ====================
+
+// Middleware to verify admin token
+const authenticateAdmin = async (req, res, next) => {
+  try {
+    console.log('🛡️ Admin auth middleware checking...');
+    const authHeader = req.headers.authorization;
+    
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      console.log('❌ No Bearer token found');
+      return res.status(401).json({ 
+        success: false, 
+        message: 'Admin token required' 
+      });
+    }
+
+    const token = authHeader.split(' ')[1];
+    console.log('Token received:', token.substring(0, 20) + '...');
+    
+    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'fallback_secret');
+    console.log('Token decoded:', decoded);
+    
+    // Check if user is admin
+    const [admin] = await db.execute(
+      'SELECT id, username, role, is_active FROM admin_users WHERE id = ?',
+      [decoded.id]
+    );
+
+    if (!admin[0] || !admin[0].is_active) {
+      console.log('❌ Admin not found or inactive');
+      return res.status(403).json({ 
+        success: false, 
+        message: 'Admin access denied' 
+      });
+    }
+
+    req.admin = admin[0];
+    console.log('✅ Admin authenticated:', admin[0].username);
+    next();
+  } catch (error) {
+    console.error('❌ Admin auth error:', error.message);
+    res.status(401).json({ 
+      success: false, 
+      message: 'Invalid admin token' 
+    });
+  }
+};
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024 }, // 5MB limit
+  fileFilter: (req, file, cb) => {
+    if (file.mimetype.startsWith('image/')) {
+      cb(null, true);
+    } else {
+      cb(new Error('Only image files are allowed'));
+    }
+  }
+});
+
+// ==================== ADMIN AUTH ====================
+router.post('/login', async (req, res) => {
+  try {
+    const { username, password } = req.body;
+    
+    console.log('🔐 Admin login attempt for:', username);
+    console.log('Password received (first 3 chars):', password ? password.substring(0, 3) + '***' : 'none');
+    
+    if (!username || !password) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Username and password required' 
+      });
+    }
+
+    // ============ TEMPORARY: HARDCODED FALLBACK ============
+    // This ensures login works even if database is empty
+    if (username === 'admin' && password === 'admin@2005') {
+      console.log('✅ Using hardcoded admin credentials (FALLBACK)');
+      
+      // First, try to create admin in database if not exists
+      try {
+        const [existingAdmins] = await db.execute(
+          'SELECT id FROM admin_users WHERE username = ?',
+          [username]
+        );
+        
+        if (existingAdmins.length === 0) {
+          console.log('⚠️ Creating admin user in database...');
+          const hashedPassword = await bcrypt.hash(password, 10);
+          await db.execute(
+            `INSERT INTO admin_users 
+             (username, password_hash, email, role, is_active) 
+             VALUES (?, ?, ?, ?, TRUE)`,
+            [username, hashedPassword, 'admin@xperience.com', 'super_admin']
+          );
+          console.log('✅ Admin user created in database');
+        }
+      } catch (dbError) {
+        console.warn('⚠️ Could not check/create admin in database:', dbError.message);
+        // Continue with hardcoded token even if DB fails
+      }
+      
+      const token = jwt.sign(
+        { 
+          id: 999, 
+          username: 'admin', 
+          role: 'super_admin',
+          type: 'admin'
+        },
+        process.env.JWT_SECRET || 'fallback_secret',
+        { expiresIn: '8h' }
+      );
+
+      return res.json({
+        success: true,
+        message: 'Login successful',
+        token,
+        admin: {
+          id: 999,
+          username: 'admin',
+          email: 'admin@xperience.com',
+          role: 'super_admin'
+        }
+      });
+    }
+    // ============ END TEMPORARY FALLBACK ============
+
+    console.log('🔍 Checking database for admin user...');
+    const [admins] = await db.execute(
+      'SELECT * FROM admin_users WHERE username = ? AND is_active = TRUE',
+      [username]
+    );
+
+    if (admins.length === 0) {
+      console.log('❌ Admin user not found in database');
+      return res.status(401).json({ 
+        success: false, 
+        message: 'Invalid credentials' 
+      });
+    }
+
+    const admin = admins[0];
+    console.log('✅ Admin found:', admin.username);
+    console.log('Password hash type:', admin.password_hash?.substring(0, 10));
+    
+    // Check password
+    let validPassword = false;
+    
+    // Try bcrypt compare first
+    if (admin.password_hash && admin.password_hash.startsWith('$2')) {
+      validPassword = await bcrypt.compare(password, admin.password_hash);
+      console.log('🔐 Bcrypt password check:', validPassword ? '✅ Match' : '❌ No match');
+    } 
+    // If not bcrypt hash, check plain text (for development only)
+    else if (admin.password_hash === password) {
+      validPassword = true;
+      console.log('🔐 Plain password match (DEV MODE)');
+    }
+    
+    if (!validPassword) {
+      console.log('❌ Password does not match');
+      return res.status(401).json({ 
+        success: false, 
+        message: 'Invalid credentials' 
+      });
+    }
+
+    console.log('✅ Password verified successfully');
+    
+    // Update last login
+    await db.execute(
+      'UPDATE admin_users SET last_login = NOW() WHERE id = ?',
+      [admin.id]
+    );
+
+    // Create token
+    const token = jwt.sign(
+      { 
+        id: admin.id, 
+        username: admin.username, 
+        role: admin.role,
+        type: 'admin'
+      },
+      process.env.JWT_SECRET || 'fallback_secret',
+      { expiresIn: '8h' }
+    );
+
+    // Log activity
+    try {
+      await db.execute(
+        `INSERT INTO admin_activity_logs 
+         (admin_id, action_type, description, ip_address) 
+         VALUES (?, 'login', 'Admin logged in', ?)`,
+        [admin.id, req.ip || 'unknown']
+      );
+    } catch (logError) {
+      console.warn('⚠️ Could not log admin activity:', logError.message);
+    }
+
+    console.log('🎉 Admin login successful for:', admin.username);
+    
+    res.json({
+      success: true,
+      message: 'Login successful',
+      token,
+      admin: {
+        id: admin.id,
+        username: admin.username,
+        email: admin.email,
+        role: admin.role,
+        permissions: admin.permissions ? JSON.parse(admin.permissions) : []
+      }
+    });
+
+  } catch (error) {
+    console.error('❌ Admin login error:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Login failed',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+
+// ==================== DASHBOARD STATS ====================
+router.get('/dashboard/stats', authenticateAdmin, async (req, res) => {
+  try {
+    console.log('📊 Fetching dashboard stats for admin:', req.admin.username);
+    
+    // Get tournament stats
+    const [tournamentStats] = await db.execute(`SELECT 
+      COUNT(*) as totalTournaments,
+      SUM(CASE WHEN status = 'upcoming' THEN 1 ELSE 0 END) as upcomingTournaments,
+      SUM(CASE WHEN status = 'ongoing' THEN 1 ELSE 0 END) as ongoingTournaments,
+      SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completedTournaments,
+      SUM(CASE WHEN status = 'cancelled' THEN 1 ELSE 0 END) as cancelledTournaments,
+      COALESCE(SUM(prize_pool + custom_prize_pool), 0) as totalPrizePool,
+      SUM(CASE WHEN admin_monitoring = 1 THEN 1 ELSE 0 END) as monitored_tournaments
+    FROM tournaments`);
+
+    // Get other stats
+    const [stats] = await db.execute(`SELECT 
+      (SELECT COUNT(*) FROM users) as total_users,
+      COALESCE((SELECT SUM(balance) FROM users), 0) as total_balance,
+      COALESCE((SELECT SUM(xp_points) FROM users), 0) as total_xp,
+      (SELECT COUNT(*) FROM withdrawal_requests WHERE status = 'pending') as pending_withdrawals,
+      (SELECT COUNT(*) FROM transactions WHERE DATE(created_at) = CURDATE()) as today_transactions,
+      COALESCE((SELECT SUM(amount) FROM transactions WHERE DATE(created_at) = CURDATE() AND type = 'deposit'), 0) as today_deposits,
+      (SELECT COUNT(*) FROM fraud_flags WHERE status = 'active') as active_fraud_flags,
+      (SELECT COUNT(*) FROM matches WHERE status = 'ongoing') as ongoing_matches,
+      (SELECT COUNT(*) FROM groups WHERE DATE(created_at) = CURDATE()) as today_groups,
+      (SELECT COUNT(*) FROM groups) as total_groups
+    `);
+
+    // Combine stats
+    const combinedStats = {
+      ...stats[0],
+      ...tournamentStats[0]
+    };
+
+    // Get other data...
+    const [recentWithdrawals] = await db.execute(`SELECT 
+      wr.*, u.username, u.email 
+      FROM withdrawal_requests wr
+      JOIN users u ON wr.user_id = u.id
+      WHERE wr.status = 'pending'
+      ORDER BY wr.created_at DESC
+      LIMIT 10`);
+
+    const [recentUsers] = await db.execute(`SELECT 
+      id, username, email, balance, xp_points, created_at 
+      FROM users 
+      ORDER BY created_at DESC 
+      LIMIT 5`);
+
+    const [ongoingMatches] = await db.execute(`SELECT 
+      m.*, 
+      p1.username as player1_username,
+      p2.username as player2_username,
+      w.username as winner_username
+      FROM matches m
+      LEFT JOIN users p1 ON m.player1_id = p1.id
+      LEFT JOIN users p2 ON m.player2_id = p2.id
+      LEFT JOIN users w ON m.winner_id = w.id
+      WHERE m.status = 'ongoing'
+      ORDER BY m.created_at DESC
+      LIMIT 5`);
+
+    const [ongoingTournaments] = await db.execute(`SELECT 
+      t.*, 
+      c.username as creator_username,
+      w.username as winner_username
+      FROM tournaments t
+      LEFT JOIN users c ON t.creator_id = c.id
+      LEFT JOIN users w ON t.winner_id = w.id
+      WHERE t.status = 'ongoing'
+      ORDER BY t.start_date ASC
+      LIMIT 5`);
+
+    const [recentGroups] = await db.execute(`SELECT 
+      g.*, 
+      u.username as creator_username,
+      (SELECT COUNT(*) FROM group_members gm WHERE gm.group_id = g.id AND gm.status = 'joined') as member_count
+      FROM groups g
+      JOIN users u ON g.creator_id = u.id
+      ORDER BY g.created_at DESC
+      LIMIT 5`);
+
+    res.json({
+      success: true,
+      stats: combinedStats,
+      recent_withdrawals: recentWithdrawals,
+      recent_users: recentUsers,
+      ongoing_matches: ongoingMatches,
+      ongoing_tournaments: ongoingTournaments,
+      recent_groups: recentGroups
+    });
+
+  } catch (error) {
+    console.error('❌ Dashboard stats error:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Failed to fetch dashboard stats',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+
+// ==================== WITHDRAWAL MANAGEMENT ====================
+router.get('/withdrawals', authenticateAdmin, async (req, res) => {
+  try {
+    const { status, page = 1, limit = 20 } = req.query;
+    const offset = (page - 1) * limit;
+
+    console.log('📋 Fetching withdrawals - Status:', status, 'Page:', page);
+
+    let query = `
+      SELECT wr.*, u.username, u.email, u.wallet_account_number
+      FROM withdrawal_requests wr
+      JOIN users u ON wr.user_id = u.id
+    `;
+    
+    const params = [];
+    if (status && status !== 'all') {
+      query += ' WHERE wr.status = ?';
+      params.push(status);
+    }
+    
+    query += ' ORDER BY wr.created_at DESC LIMIT ? OFFSET ?';
+    params.push(parseInt(limit), parseInt(offset));
+
+    const [withdrawals] = await db.execute(query, params);
+
+    // Count total
+    let countQuery = 'SELECT COUNT(*) as total FROM withdrawal_requests wr';
+    if (status && status !== 'all') {
+      countQuery += ' WHERE wr.status = ?';
+    }
+    const [countResult] = await db.execute(
+      countQuery, 
+      status && status !== 'all' ? [status] : []
+    );
+    
+    // Log activity
+    try {
+      await db.execute(
+        `INSERT INTO admin_activity_logs 
+         (admin_id, action_type, description) 
+         VALUES (?, 'view', 'Viewed withdrawal requests')`,
+        [req.admin.id]
+      );
+    } catch (logError) {
+      console.warn('⚠️ Could not log activity:', logError.message);
+    }
+
+    res.json({
+      success: true,
+      withdrawals,
+      pagination: {
+        page: parseInt(page),
+        limit: parseInt(limit),
+        total: countResult[0].total,
+        totalPages: Math.ceil(countResult[0].total / limit)
+      }
+    });
+
+  } catch (error) {
+    console.error('❌ Get withdrawals error:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Failed to fetch withdrawals' 
+    });
+  }
+});
+
+router.get('/withdrawals/:id', authenticateAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    console.log('🔍 Fetching withdrawal details for ID:', id);
+
+    const [withdrawals] = await db.execute(`
+      SELECT wr.*, u.*, 
+             JSON_UNQUOTE(JSON_EXTRACT(wr.account_details, '$.bank_name')) as bank_name,
+             JSON_UNQUOTE(JSON_EXTRACT(wr.account_details, '$.account_number')) as account_number,
+             JSON_UNQUOTE(JSON_EXTRACT(wr.account_details, '$.account_name')) as account_name
+      FROM withdrawal_requests wr
+      JOIN users u ON wr.user_id = u.id
+      WHERE wr.id = ?
+    `, [id]);
+
+    if (withdrawals.length === 0) {
+      console.log('❌ Withdrawal not found:', id);
+      return res.status(404).json({ 
+        success: false, 
+        message: 'Withdrawal not found' 
+      });
+    }
+
+    console.log('✅ Withdrawal found:', withdrawals[0].receipt_number);
+
+    // Get transaction details
+    const [transactions] = await db.execute(
+      'SELECT * FROM transactions WHERE id = ?',
+      [withdrawals[0].transaction_id]
+    );
+
+    // Get approval history
+    const [approvals] = await db.execute(`
+      SELECT wa.*, au.username as admin_username
+      FROM withdrawal_approvals wa
+      LEFT JOIN admin_users au ON wa.admin_id = au.id
+      WHERE wa.withdrawal_request_id = ?
+      ORDER BY wa.created_at DESC
+    `, [id]);
+
+    res.json({
+      success: true,
+      withdrawal: withdrawals[0],
+      transaction: transactions[0] || null,
+      approvals: approvals
+    });
+
+  } catch (error) {
+    console.error('❌ Get withdrawal details error:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Failed to fetch withdrawal details' 
+    });
+  }
+});
+
+router.post('/withdrawals/:id/action', authenticateAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { action, notes, proof_document } = req.body;
+    const adminId = req.admin.id;
+
+    console.log('⚡ Processing withdrawal action:', { 
+      withdrawalId: id, 
+      action, 
+      adminId 
+    });
+
+    if (!['approve', 'reject', 'processing', 'completed'].includes(action)) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Invalid action' 
+      });
+    }
+
+    // Get withdrawal
+    const [withdrawals] = await db.execute(
+      'SELECT * FROM withdrawal_requests WHERE id = ?',
+      [id]
+    );
+
+    if (withdrawals.length === 0) {
+      return res.status(404).json({ 
+        success: false, 
+        message: 'Withdrawal not found' 
+      });
+    }
+
+    const withdrawal = withdrawals[0];
+    const oldStatus = withdrawal.status;
+    let newStatus = withdrawal.status;
+
+    console.log('📝 Withdrawal current status:', oldStatus);
+
+    switch (action) {
+      case 'approve':
+        newStatus = 'processing';
+        console.log('✅ Approving withdrawal, new status: processing');
+        break;
+      case 'reject':
+        newStatus = 'rejected';
+        console.log('❌ Rejecting withdrawal, refunding money');
+        // Refund money back to user
+        await db.execute(
+          'UPDATE users SET balance = balance + ? WHERE id = ?',
+          [withdrawal.amount, withdrawal.user_id]
+        );
+        break;
+      case 'processing':
+        newStatus = 'processing';
+        break;
+      case 'completed':
+        newStatus = 'completed';
+        console.log('🏁 Marking withdrawal as completed');
+        break;
+    }
+
+    await db.execute('START TRANSACTION');
+
+    try {
+      // Update withdrawal status
+      await db.execute(
+        'UPDATE withdrawal_requests SET status = ?, processed_by = ?, processed_at = NOW() WHERE id = ?',
+        [newStatus, adminId, id]
+      );
+
+      // Update transaction status
+      await db.execute(
+        'UPDATE transactions SET status = ? WHERE id = ?',
+        [newStatus, withdrawal.transaction_id]
+      );
+
+      // Record approval
+      await db.execute(
+        `INSERT INTO withdrawal_approvals 
+         (withdrawal_request_id, admin_id, old_status, new_status, notes, proof_document) 
+         VALUES (?, ?, ?, ?, ?, ?)`,
+        [id, adminId, oldStatus, newStatus, notes || null, proof_document || null]
+      );
+
+      // Log activity
+      await db.execute(
+        `INSERT INTO admin_activity_logs 
+         (admin_id, action_type, description, affected_user_id, affected_transaction_id) 
+         VALUES (?, 'withdrawal_action', ?, ?, ?)`,
+        [adminId, `${action} withdrawal #${id}`, withdrawal.user_id, withdrawal.transaction_id]
+      );
+
+      await db.execute('COMMIT');
+      console.log('💾 Transaction committed successfully');
+
+      res.json({
+        success: true,
+        message: `Withdrawal ${action}d successfully`,
+        new_status: newStatus
+      });
+
+    } catch (error) {
+      await db.execute('ROLLBACK');
+      console.error('❌ Transaction rollback:', error);
+      throw error;
+    }
+
+  } catch (error) {
+    console.error('❌ Withdrawal action error:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Failed to process withdrawal' 
+    });
+  }
+});
+
+// ==================== USER MANAGEMENT ====================
+router.get('/users', authenticateAdmin, async (req, res) => {
+  try {
+    const { search, page = 1, limit = 20 } = req.query;
+    const offset = (page - 1) * limit;
+
+    console.log('👥 Fetching users - Search:', search, 'Page:', page);
+
+    let query = 'SELECT id, username, email, wallet_account_number, balance, xp_points, rank, created_at FROM users';
+    let countQuery = 'SELECT COUNT(*) as total FROM users';
+    const params = [];
+    const countParams = [];
+
+    if (search) {
+      query += ' WHERE username LIKE ? OR email LIKE ? OR wallet_account_number LIKE ?';
+      countQuery += ' WHERE username LIKE ? OR email LIKE ? OR wallet_account_number LIKE ?';
+      const searchTerm = `%${search}%`;
+      params.push(searchTerm, searchTerm, searchTerm);
+      countParams.push(searchTerm, searchTerm, searchTerm);
+    }
+
+    query += ' ORDER BY created_at DESC LIMIT ? OFFSET ?';
+    params.push(parseInt(limit), parseInt(offset));
+
+    const [users] = await db.execute(query, params);
+    const [countResult] = await db.execute(countQuery, countParams);
+
+    res.json({
+      success: true,
+      users,
+      pagination: {
+        page: parseInt(page),
+        limit: parseInt(limit),
+        total: countResult[0].total,
+        totalPages: Math.ceil(countResult[0].total / limit)
+      }
+    });
+
+  } catch (error) {
+    console.error('❌ Get users error:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Failed to fetch users' 
+    });
+  }
+});
+
+router.get('/users/:id', authenticateAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    console.log('🔍 Fetching user details for ID:', id);
+
+    const [users] = await db.execute(
+      'SELECT * FROM users WHERE id = ?',
+      [id]
+    );
+
+    if (users.length === 0) {
+      console.log('❌ User not found:', id);
+      return res.status(404).json({ 
+        success: false, 
+        message: 'User not found' 
+      });
+    }
+
+    // Get user transactions
+    const [transactions] = await db.execute(
+      'SELECT * FROM transactions WHERE user_id = ? ORDER BY created_at DESC LIMIT 20',
+      [id]
+    );
+
+    // Get user XP transactions
+    const [xpTransactions] = await db.execute(
+      'SELECT * FROM xp_transactions WHERE user_id = ? ORDER BY created_at DESC LIMIT 20',
+      [id]
+    );
+
+    // Get withdrawal history
+    const [withdrawals] = await db.execute(
+      'SELECT * FROM withdrawal_requests WHERE user_id = ? ORDER BY created_at DESC',
+      [id]
+    );
+
+    console.log('✅ User details fetched successfully');
+
+    res.json({
+      success: true,
+      user: users[0],
+      transactions,
+      xp_transactions: xpTransactions,
+      withdrawals
+    });
+
+  } catch (error) {
+    console.error('❌ Get user details error:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Failed to fetch user details' 
+    });
+  }
+});
+// ==================== USER MANAGEMENT ENDPOINTS ====================
+
+// Update user
+router.put('/users/:id', authenticateAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const updateData = req.body;
+    const adminId = req.admin.id;
+
+    console.log('✏️ Updating user ID:', id, 'Data:', updateData);
+
+    // Get current user data
+    const [users] = await db.execute(
+      'SELECT * FROM users WHERE id = ?',
+      [id]
+    );
+
+    if (users.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'User not found'
+      });
+    }
+
+    const currentUser = users[0];
+
+    // Build update query dynamically
+    const updateFields = [];
+    const updateValues = [];
+    
+    // Define allowed fields to update
+    const allowedFields = [
+      'username', 'email', 'firstname', 'lastname', 'rank',
+      'account_status', 'xp_points', 'is_admin', 'is_banned',
+      'enable_2fa', 'login_alerts', 'session_timeout', 'bio',
+      'favorite_games', 'balance'
+    ];
+
+    for (const field of allowedFields) {
+      if (field in updateData) {
+        updateFields.push(`${field} = ?`);
+        updateValues.push(updateData[field]);
+      }
+    }
+
+    if (updateFields.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'No valid fields to update'
+      });
+    }
+
+    // Add updated_at timestamp
+    updateFields.push('updated_at = NOW()');
+    
+    // Add WHERE clause
+    updateValues.push(id);
+
+    const updateQuery = `
+      UPDATE users 
+      SET ${updateFields.join(', ')} 
+      WHERE id = ?
+    `;
+
+    await db.execute(updateQuery, updateValues);
+
+    // Log admin activity
+    await db.execute(
+      `INSERT INTO admin_activity_logs 
+       (admin_id, action_type, description, affected_user_id) 
+       VALUES (?, 'user_update', 'Updated user profile', ?)`,
+      [adminId, id]
+    );
+
+    // Get updated user
+    const [updatedUsers] = await db.execute(
+      'SELECT * FROM users WHERE id = ?',
+      [id]
+    );
+
+    console.log('✅ User updated successfully');
+
+    res.json({
+      success: true,
+      message: 'User updated successfully',
+      user: updatedUsers[0]
+    });
+
+  } catch (error) {
+    console.error('❌ Update user error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to update user'
+    });
+  }
+});
+
+// Ban/Unban user
+router.post('/users/:id/ban', authenticateAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { isBanned, reason } = req.body;
+    const adminId = req.admin.id;
+
+    console.log(`🚫 ${isBanned ? 'Banning' : 'Unbanning'} user ID:`, id, 'Reason:', reason);
+
+    // Check if user exists
+    const [users] = await db.execute(
+      'SELECT id, username, is_banned FROM users WHERE id = ?',
+      [id]
+    );
+
+    if (users.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'User not found'
+      });
+    }
+
+    const currentUser = users[0];
+
+    // Update user
+    await db.execute(
+      'UPDATE users SET is_banned = ?, account_status = ?, updated_at = NOW() WHERE id = ?',
+      [isBanned ? 1 : 0, isBanned ? 'suspended' : 'active', id]
+    );
+
+    // Log admin activity
+    await db.execute(
+      `INSERT INTO admin_activity_logs 
+       (admin_id, action_type, description, affected_user_id, details) 
+       VALUES (?, 'user_ban', ?, ?, ?)`,
+      [adminId, 
+       isBanned ? 'Banned user' : 'Unbanned user',
+       id,
+       JSON.stringify({ reason, previous_status: currentUser.is_banned ? 'banned' : 'active' })]
+    );
+
+    console.log('✅ User ban status updated successfully');
+
+    res.json({
+      success: true,
+      message: `User ${isBanned ? 'banned' : 'unbanned'} successfully`,
+      is_banned: isBanned
+    });
+
+  } catch (error) {
+    console.error('❌ User ban error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to update user ban status'
+    });
+  }
+});
+
+// Update user balance
+router.post('/users/:id/balance', authenticateAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { amount, reason } = req.body;
+    const adminId = req.admin.id;
+
+    console.log('💰 Updating balance for user ID:', id, 'Amount:', amount, 'Reason:', reason);
+
+    if (!amount || isNaN(parseFloat(amount))) {
+      return res.status(400).json({
+        success: false,
+        message: 'Valid amount is required'
+      });
+    }
+
+    // Get current user balance
+    const [users] = await db.execute(
+      'SELECT id, username, balance FROM users WHERE id = ?',
+      [id]
+    );
+
+    if (users.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'User not found'
+      });
+    }
+
+    const currentUser = users[0];
+    const newBalance = parseFloat(currentUser.balance) + parseFloat(amount);
+
+    // Update balance
+    await db.execute(
+      'UPDATE users SET balance = ?, updated_at = NOW() WHERE id = ?',
+      [newBalance, id]
+    );
+
+    // Create transaction record
+    const transactionId = uuidv4();
+    await db.execute(
+      `INSERT INTO transactions 
+       (id, user_id, type, amount, status, description, admin_id, previous_balance, new_balance) 
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        transactionId,
+        id,
+        amount >= 0 ? 'admin_adjustment_add' : 'admin_adjustment_deduct',
+        Math.abs(parseFloat(amount)),
+        'completed',
+        reason || 'Admin balance adjustment',
+        adminId,
+        parseFloat(currentUser.balance),
+        newBalance
+      ]
+    );
+
+    // Log admin activity
+    await db.execute(
+      `INSERT INTO admin_activity_logs 
+       (admin_id, action_type, description, affected_user_id, details) 
+       VALUES (?, 'balance_adjustment', 'Adjusted user balance', ?, ?)`,
+      [adminId, id, JSON.stringify({
+        amount,
+        previous_balance: currentUser.balance,
+        new_balance: newBalance,
+        reason
+      })]
+    );
+
+    console.log('✅ User balance updated successfully');
+
+    res.json({
+      success: true,
+      message: 'Balance updated successfully',
+      previous_balance: parseFloat(currentUser.balance),
+      new_balance: newBalance,
+      adjustment: parseFloat(amount)
+    });
+
+  } catch (error) {
+    console.error('❌ Update balance error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to update user balance'
+    });
+  }
+});
+
+// Delete user
+router.delete('/users/:id', authenticateAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const adminId = req.admin.id;
+
+    console.log('🗑️ Deleting user ID:', id);
+
+    // Check if user exists
+    const [users] = await db.execute(
+      'SELECT id, username, is_admin FROM users WHERE id = ?',
+      [id]
+    );
+
+    if (users.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'User not found'
+      });
+    }
+
+    const user = users[0];
+
+    // Prevent deleting admin users
+    if (user.is_admin) {
+      return res.status(400).json({
+        success: false,
+        message: 'Cannot delete admin users'
+      });
+    }
+
+    // Soft delete - mark as deleted instead of actual deletion
+    await db.execute(
+      'UPDATE users SET account_status = "deleted", is_banned = 1, updated_at = NOW() WHERE id = ?',
+      [id]
+    );
+
+    // Log admin activity
+    await db.execute(
+      `INSERT INTO admin_activity_logs 
+       (admin_id, action_type, description, affected_user_id) 
+       VALUES (?, 'user_delete', 'Deleted user account', ?)`,
+      [adminId, id]
+    );
+
+    console.log('✅ User marked as deleted successfully');
+
+    res.json({
+      success: true,
+      message: 'User deleted successfully'
+    });
+
+  } catch (error) {
+    console.error('❌ Delete user error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to delete user'
+    });
+  }
+});
+
+// Get user stats (for dashboard)
+router.get('/users/:id/stats', authenticateAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    console.log('📊 Fetching stats for user ID:', id);
+
+    const [userStats] = await db.execute(`
+      SELECT 
+        u.id,
+        u.username,
+        u.email,
+        u.rank,
+        u.matches_played,
+        u.wins,
+        u.losses,
+        u.win_rate,
+        u.balance,
+        u.xp_points,
+        u.tournaments_played,
+        u.tournaments_won,
+        u.created_at,
+        u.last_seen,
+        u.account_status,
+        u.is_banned,
+        u.is_admin,
+        (SELECT COUNT(*) FROM transactions WHERE user_id = u.id) as total_transactions,
+        (SELECT COUNT(*) FROM withdrawal_requests WHERE user_id = u.id) as total_withdrawals,
+        (SELECT COUNT(*) FROM matches WHERE (player1_id = u.id OR player2_id = u.id) AND status = 'completed') as completed_matches,
+        (SELECT COUNT(*) FROM tournament_participants WHERE user_id = u.id) as tournaments_participated
+      FROM users u
+      WHERE u.id = ?
+    `, [id]);
+
+    if (userStats.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'User not found'
+      });
+    }
+
+    res.json({
+      success: true,
+      stats: userStats[0]
+    });
+
+  } catch (error) {
+    console.error('❌ Get user stats error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch user stats'
+    });
+  }
+});
+
+// ==================== SYSTEM SETTINGS ====================
+router.get('/settings', authenticateAdmin, async (req, res) => {
+  try {
+    console.log('⚙️ Fetching system settings');
+    
+    const [settings] = await db.execute(
+      'SELECT * FROM system_settings ORDER BY category, setting_key'
+    );
+
+    res.json({
+      success: true,
+      settings
+    });
+
+  } catch (error) {
+    console.error('❌ Get settings error:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Failed to fetch settings' 
+    });
+  }
+});
+
+router.post('/settings/:key', authenticateAdmin, async (req, res) => {
+  try {
+    const { key } = req.params;
+    const { value } = req.body;
+    const adminId = req.admin.id;
+
+    console.log('⚙️ Updating setting:', key, 'Value:', value);
+
+    await db.execute(
+      `INSERT INTO system_settings (setting_key, setting_value, updated_by) 
+       VALUES (?, ?, ?) 
+       ON DUPLICATE KEY UPDATE setting_value = ?, updated_by = ?, updated_at = NOW()`,
+      [key, value, adminId, value, adminId]
+    );
+
+    // Log activity
+    await db.execute(
+      `INSERT INTO admin_activity_logs 
+       (admin_id, action_type, description) 
+       VALUES (?, 'settings_update', 'Updated setting: ${key}')`,
+      [adminId]
+    );
+
+    res.json({
+      success: true,
+      message: 'Setting updated successfully'
+    });
+
+  } catch (error) {
+    console.error('❌ Update setting error:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Failed to update setting' 
+    });
+  }
+});
+// ==================== XP RATES SETTINGS ====================
+
+// GET /api/admin/settings/xp-rates - Get XP conversion rates
+router.get('/settings/xp-rates', authenticateAdmin, async (req, res) => {
+  try {
+    console.log('⚙️ Fetching XP rates settings');
+    
+    // Get XP rates from xp_rates table
+    const [xpRates] = await db.execute(
+      `SELECT currency, xp_per_unit, unit_amount, is_active, description 
+       FROM xp_rates 
+       WHERE is_active = 1
+       ORDER BY currency`
+    );
+
+    // Transform to the format expected by frontend
+    const rates = {};
+    xpRates.forEach(rate => {
+      // Calculate rate: 1 unit of currency = xp_per_unit XP
+      const xpPerCurrency = rate.xp_per_unit / rate.unit_amount;
+      rates[rate.currency] = parseFloat(xpPerCurrency.toFixed(3));
+    });
+
+    // Ensure default currencies exist
+    const defaultRates = {
+      'NGN': 0.025,  // 25 XP per 1000 NGN = 0.025 XP per 1 NGN
+      'USD': 0,      // Disabled by default
+      'EUR': 0,      // Disabled by default  
+      'GBP': 0       // Disabled by default
+    };
+
+    // Merge with existing rates
+    const finalRates = { ...defaultRates, ...rates };
+
+    res.json({
+      success: true,
+      rates: finalRates
+    });
+
+  } catch (error) {
+    console.error('❌ Get XP rates error:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Failed to fetch XP rates',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+
+// POST /api/admin/settings/xp-rates/:currency - Update XP rate for currency
+router.post('/settings/xp-rates/:currency', authenticateAdmin, async (req, res) => {
+  try {
+    const { currency } = req.params;
+    const { rate } = req.body;
+    const adminId = req.admin.id;
+
+    console.log('⚙️ Updating XP rate for currency:', currency, 'Rate:', rate);
+
+    if (!rate || isNaN(parseFloat(rate))) {
+      return res.status(400).json({
+        success: false,
+        message: 'Valid rate value is required'
+      });
+    }
+
+    const xpRate = parseFloat(rate);
+    
+    // Default configuration: 25 XP per unit
+    const xp_per_unit = 25;
+    const unit_amount = 1000 / xpRate; // Calculate unit amount based on rate
+    
+    // Update or insert into xp_rates table
+    await db.execute(
+      `INSERT INTO xp_rates (currency, xp_per_unit, unit_amount, is_active, description) 
+       VALUES (?, ?, ?, 1, ?) 
+       ON DUPLICATE KEY UPDATE 
+       xp_per_unit = VALUES(xp_per_unit),
+       unit_amount = VALUES(unit_amount),
+       updated_at = NOW()`,
+      [
+        currency, 
+        xp_per_unit, 
+        unit_amount,
+        `${xp_per_unit} XP per ${unit_amount.toFixed(2)} ${currency}`
+      ]
+    );
+
+    // Also update in system_settings for backward compatibility
+    const settingKey = `xp_rate_${currency}`;
+    await db.execute(
+      `INSERT INTO system_settings (setting_key, setting_value, category, updated_by) 
+       VALUES (?, ?, 'xp_rates', ?) 
+       ON DUPLICATE KEY UPDATE setting_value = ?, updated_by = ?, updated_at = NOW()`,
+      [settingKey, rate.toString(), adminId, rate.toString(), adminId]
+    );
+
+    // Log activity
+    await db.execute(
+      `INSERT INTO admin_activity_logs 
+       (admin_id, action_type, description) 
+       VALUES (?, 'settings_update', 'Updated XP rate for ${currency}')`,
+      [adminId]
+    );
+
+    res.json({
+      success: true,
+      message: 'XP rate updated successfully',
+      currency,
+      rate: xpRate
+    });
+
+  } catch (error) {
+    console.error('❌ Update XP rate error:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Failed to update XP rate' 
+    });
+  }
+});
+
+// ==================== FRAUD MANAGEMENT ====================
+router.get('/fraud/flags', authenticateAdmin, async (req, res) => {
+  try {
+    const { status } = req.query;
+    console.log('🚨 Fetching fraud flags - Status:', status);
+
+    let query = `
+      SELECT ff.*, u.username, u.email, au.username as assigned_admin_name
+      FROM fraud_flags ff
+      JOIN users u ON ff.user_id = u.id
+      LEFT JOIN admin_users au ON ff.assigned_admin_id = au.id
+    `;
+    
+    const params = [];
+    if (status) {
+      query += ' WHERE ff.status = ?';
+      params.push(status);
+    }
+    
+    query += ' ORDER BY ff.severity DESC, ff.created_at DESC';
+
+    const [flags] = await db.execute(query, params);
+
+    res.json({
+      success: true,
+      flags
+    });
+
+  } catch (error) {
+    console.error('❌ Get fraud flags error:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Failed to fetch fraud flags' 
+    });
+  }
+});
+// ==================== FRAUD MANAGEMENT ENDPOINTS ====================
+
+// 1. GET /api/admin/fraud/stats - Fraud statistics (MUST WORK)
+router.get('/fraud/stats', authenticateAdmin, async (req, res) => {
+  try {
+    console.log('📊 Admin: Fetching fraud statistics');
+    
+    // Get fraud flag stats
+    const [flagStats] = await db.execute(`
+      SELECT 
+        COUNT(*) as total_flags,
+        COUNT(CASE WHEN status = 'pending' THEN 1 END) as pending_flags,
+        COUNT(CASE WHEN status = 'confirmed' THEN 1 END) as confirmed_flags,
+        COUNT(CASE WHEN status = 'false_positive' THEN 1 END) as false_positive_flags
+      FROM fraud_flags
+    `);
+
+    // Get suspicious activities stats
+    const [activityStats] = await db.execute(`
+      SELECT 
+        COUNT(*) as total_activities,
+        COUNT(CASE WHEN status = 'pending' THEN 1 END) as pending_activities,
+        COUNT(CASE WHEN severity_level = 'high' OR severity_level = 'critical' THEN 1 END) as high_risk_activities
+      FROM suspicious_activities
+      WHERE created_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)
+    `);
+
+    // Get user risk stats
+    const [userStats] = await db.execute(`
+      SELECT 
+        COUNT(*) as total_users,
+        COUNT(CASE WHEN risk_score >= 70 THEN 1 END) as high_risk_users,
+        COUNT(CASE WHEN risk_score BETWEEN 40 AND 69 THEN 1 END) as medium_risk_users,
+        COALESCE(SUM(CASE WHEN risk_score >= 40 THEN balance ELSE 0 END), 0) as amount_at_risk
+      FROM users
+      WHERE account_status = 'active' AND is_banned = 0
+    `);
+
+    // Get recent scans
+    const [recentScans] = await db.execute(`
+      SELECT COUNT(*) as recent_scans 
+      FROM fraud_detection_logs 
+      WHERE created_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)
+    `);
+
+    // Get weekly activity data for chart
+    const [weeklyData] = await db.execute(`
+      SELECT 
+        DATE(created_at) as date,
+        COUNT(*) as count,
+        'activities' as type
+      FROM suspicious_activities 
+      WHERE created_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)
+      GROUP BY DATE(created_at)
+      ORDER BY date
+    `);
+
+    res.json({
+      success: true,
+      stats: {
+        ...flagStats[0],
+        ...activityStats[0],
+        ...userStats[0],
+        ...recentScans[0],
+        amount_at_risk: userStats[0]?.amount_at_risk || 0
+      },
+      weeklyData: weeklyData,
+      timestamp: new Date().toISOString()
+    });
+
+  } catch (error) {
+    console.error('❌ Get fraud stats error:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Failed to fetch fraud statistics',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+
+// 2. GET /api/admin/fraud/suspicious-users - Suspicious users (MUST WORK)
+router.get('/fraud/suspicious-users', authenticateAdmin, async (req, res) => {
+  try {
+    const { page = 1, limit = 20, risk_min = 0 } = req.query;
+    const offset = (page - 1) * limit;
+
+    console.log('🔍 Admin: Fetching suspicious users - Page:', page, 'Risk min:', risk_min);
+
+    // Get suspicious users
+    const [users] = await db.execute(`
+      SELECT 
+        u.id,
+        u.username,
+        u.email,
+        u.risk_score,
+        u.balance,
+        u.created_at,
+        u.last_login_at,
+        u.account_status,
+        u.is_banned,
+        COUNT(DISTINCT sa.id) as suspicious_activities_count,
+        COUNT(DISTINCT ff.id) as fraud_flags_count,
+        MAX(sa.created_at) as last_suspicious_activity
+      FROM users u
+      LEFT JOIN suspicious_activities sa ON u.id = sa.user_id AND sa.status = 'pending'
+      LEFT JOIN fraud_flags ff ON u.id = ff.user_id AND ff.status IN ('pending', 'confirmed')
+      WHERE u.risk_score >= ?
+      GROUP BY u.id, u.username, u.email, u.risk_score, u.balance, u.created_at, u.last_login_at, u.account_status, u.is_banned
+      ORDER BY u.risk_score DESC, last_suspicious_activity DESC
+      LIMIT ? OFFSET ?
+    `, [risk_min, parseInt(limit), parseInt(offset)]);
+
+    // Get total count
+    const [countResult] = await db.execute(
+      'SELECT COUNT(*) as total FROM users WHERE risk_score >= ?',
+      [risk_min]
+    );
+
+    // Format the response
+    const formattedUsers = users.map(user => ({
+      id: user.id,
+      username: user.username,
+      email: user.email,
+      risk_score: user.risk_score,
+      risk_level: user.risk_score >= 70 ? 'high' : user.risk_score >= 40 ? 'medium' : 'low',
+      balance: user.balance,
+      account_age: Math.floor((new Date() - new Date(user.created_at)) / (1000 * 60 * 60 * 24)),
+      suspicious_activities_count: user.suspicious_activities_count || 0,
+      fraud_flags_count: user.fraud_flags_count || 0,
+      last_activity: user.last_suspicious_activity || user.last_login_at,
+      account_status: user.account_status,
+      is_banned: user.is_banned
+    }));
+
+    res.json({
+      success: true,
+      users: formattedUsers,
+      pagination: {
+        page: parseInt(page),
+        limit: parseInt(limit),
+        total: countResult[0]?.total || 0,
+        totalPages: Math.ceil((countResult[0]?.total || 0) / limit)
+      }
+    });
+
+  } catch (error) {
+    console.error('❌ Get suspicious users error:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Failed to fetch suspicious users' 
+    });
+  }
+});
+
+// 3. GET /api/admin/fraud/patterns - Get fraud patterns
+router.get('/fraud/patterns', authenticateAdmin, async (req, res) => {
+  try {
+    console.log('🔄 Admin: Fetching fraud patterns');
+    
+    const [patterns] = await db.execute(`
+      SELECT fp.*, au.username as created_by_name
+      FROM fraud_patterns fp
+      LEFT JOIN admin_users au ON fp.created_by = au.id
+      ORDER BY fp.created_at DESC
+    `);
+
+    // Parse JSON rules if they exist
+    const formattedPatterns = patterns.map(pattern => ({
+      ...pattern,
+      rules: pattern.rules ? JSON.parse(pattern.rules) : {}
+    }));
+
+    res.json({
+      success: true,
+      patterns: formattedPatterns
+    });
+
+  } catch (error) {
+    console.error('❌ Get fraud patterns error:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Failed to fetch fraud patterns' 
+    });
+  }
+});
+
+// 4. POST /api/admin/fraud/scan - Run fraud detection scan
+router.post('/fraud/scan', authenticateAdmin, async (req, res) => {
+  try {
+    const { scanType = 'full' } = req.body;
+    const adminId = req.admin.id;
+
+    console.log('🔍 Admin: Initiating fraud scan - Type:', scanType, 'Admin:', adminId);
+
+    // Return immediate response and run scan in background
+    res.json({
+      success: true,
+      message: 'Fraud detection scan initiated',
+      scanType,
+      timestamp: new Date().toISOString()
+    });
+
+    // Run scan in background
+    setTimeout(async () => {
+      try {
+        await runFraudScan(scanType, adminId);
+        console.log('✅ Fraud scan completed in background');
+      } catch (bgError) {
+        console.error('❌ Background scan error:', bgError);
+      }
+    }, 100);
+
+  } catch (error) {
+    console.error('❌ Initiate fraud scan error:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Failed to initiate fraud scan' 
+    });
+  }
+});
+
+// 5. POST /api/admin/fraud/suspicious-activities/:id/review - Review suspicious activity
+router.post('/fraud/suspicious-activities/:id/review', authenticateAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { status, notes } = req.body;
+    const adminId = req.admin.id;
+
+    console.log('📝 Admin: Reviewing suspicious activity:', { id, status, adminId });
+
+    // Validate status
+    if (!['reviewed', 'dismissed', 'confirmed'].includes(status)) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Invalid status. Must be: reviewed, dismissed, or confirmed' 
+      });
+    }
+
+    // Check if activity exists
+    const [activities] = await db.execute(
+      'SELECT * FROM suspicious_activities WHERE id = ?',
+      [id]
+    );
+
+    if (activities.length === 0) {
+      return res.status(404).json({ 
+        success: false, 
+        message: 'Suspicious activity not found' 
+      });
+    }
+
+    const activity = activities[0];
+
+    // Update the activity
+    await db.execute(
+      `UPDATE suspicious_activities 
+       SET status = ?, 
+           reviewed_by = ?, 
+           reviewed_at = NOW(), 
+           review_notes = ?,
+           updated_at = NOW()
+       WHERE id = ?`,
+      [status, adminId, notes || null, id]
+    );
+
+    // If confirmed as fraud, increase user risk score
+    if (status === 'confirmed') {
+      await db.execute(
+        `UPDATE users 
+         SET risk_score = LEAST(risk_score + 20, 100),
+             last_risk_assessment = NOW(),
+             updated_at = NOW()
+         WHERE id = ?`,
+        [activity.user_id]
+      );
+    }
+
+    // Log activity
+    await db.execute(
+      `INSERT INTO admin_activity_logs 
+       (admin_id, action_type, description, affected_user_id) 
+       VALUES (?, 'fraud_review', ?, ?)`,
+      [adminId, `Reviewed suspicious activity #${id} as ${status}`, activity.user_id]
+    );
+
+    res.json({
+      success: true,
+      message: 'Activity reviewed successfully',
+      status: status
+    });
+
+  } catch (error) {
+    console.error('❌ Review suspicious activity error:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Failed to review activity' 
+    });
+  }
+});
+
+// Helper function for background fraud scan
+async function runFraudScan(scanType, adminId) {
+  const startTime = Date.now();
+  const scanId = uuidv4();
+  
+  console.log(`🔄 Starting fraud scan ${scanId} - Type: ${scanType}`);
+
+  try {
+    // Create scan log
+    await db.execute(
+      `INSERT INTO fraud_detection_logs (id, scan_type, status, initiated_by) 
+       VALUES (?, ?, 'running', ?)`,
+      [scanId, scanType, adminId]
+    );
+
+    let usersChecked = 0;
+    let suspiciousFound = 0;
+    const triggeredPatterns = [];
+
+    // Get active fraud patterns
+    const [patterns] = await db.execute(
+      'SELECT * FROM fraud_patterns WHERE is_active = 1'
+    );
+
+    // Determine which users to scan
+    let userQuery = 'SELECT id, username, email, created_at, last_login_at, balance FROM users WHERE risk_score < 100';
+    let queryParams = [];
+
+    if (scanType === 'targeted') {
+      userQuery += ' AND risk_score > 30';
+    } else if (scanType === 'recent') {
+      userQuery += ' AND created_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)';
+    }
+
+    const [users] = await db.execute(userQuery, queryParams);
+
+    // Scan each user
+    for (const user of users) {
+      usersChecked++;
+      let userSuspicious = false;
+
+      // Check each pattern
+      for (const pattern of patterns) {
+        try {
+          const rules = pattern.rules ? JSON.parse(pattern.rules) : {};
+          const isMatch = await checkPattern(user, rules);
+
+          if (isMatch) {
+            userSuspicious = true;
+            suspiciousFound++;
+            triggeredPatterns.push({
+              patternId: pattern.id,
+              patternName: pattern.pattern_name
+            });
+
+            // Record suspicious activity
+            await db.execute(
+              `INSERT INTO suspicious_activities 
+               (id, user_id, activity_type, severity_level, risk_score, description, metadata) 
+               VALUES (?, ?, ?, ?, ?, ?, ?)`,
+              [
+                uuidv4(),
+                user.id,
+                pattern.pattern_type,
+                'medium',
+                pattern.risk_weight * 10,
+                pattern.description || `Detected pattern: ${pattern.pattern_name}`,
+                JSON.stringify({
+                  pattern: pattern.pattern_name,
+                  scan_id: scanId,
+                  user_data: {
+                    username: user.username,
+                    balance: user.balance,
+                    account_age_days: Math.floor((new Date() - new Date(user.created_at)) / (1000 * 60 * 60 * 24))
+                  }
+                })
+              ]
+            );
+
+            // Update user risk score
+            await db.execute(
+              `UPDATE users 
+               SET risk_score = LEAST(risk_score + ?, 100),
+                   last_risk_assessment = NOW(),
+                   updated_at = NOW()
+               WHERE id = ?`,
+              [pattern.risk_weight * 5, user.id]
+            );
+          }
+        } catch (patternError) {
+          console.warn(`⚠️ Error checking pattern ${pattern.pattern_name}:`, patternError.message);
+        }
+      }
+
+      if (userSuspicious) {
+        console.log(`🔍 User ${user.username} (${user.id}) flagged as suspicious`);
+      }
+    }
+
+    const scanDuration = Date.now() - startTime;
+
+    // Update scan log
+    await db.execute(
+      `UPDATE fraud_detection_logs 
+       SET triggered_patterns = ?,
+           users_checked = ?,
+           suspicious_found = ?,
+           scan_duration_ms = ?,
+           status = 'completed'
+       WHERE id = ?`,
+      [JSON.stringify(triggeredPatterns), usersChecked, suspiciousFound, scanDuration, scanId]
+    );
+
+    console.log(`✅ Fraud scan completed: ${usersChecked} users checked, ${suspiciousFound} suspicious activities found`);
+
+  } catch (error) {
+    console.error('❌ Fraud scan error:', error);
+    
+    // Update scan log as failed
+    try {
+      await db.execute(
+        'UPDATE fraud_detection_logs SET status = "failed" WHERE id = ?',
+        [scanId]
+      );
+    } catch (updateError) {
+      console.error('Failed to update scan log:', updateError);
+    }
+  }
+}
+
+// Helper function to check pattern rules
+async function checkPattern(user, rules) {
+  if (!rules || typeof rules !== 'object') {
+    return false;
+  }
+
+  try {
+    // Example pattern checking logic
+    // You should customize this based on your actual fraud detection needs
+    
+    // Check for rapid account creation (multiple accounts from same IP)
+    if (rules.type === 'multiple_accounts') {
+      const [accounts] = await db.execute(
+        'SELECT COUNT(*) as count FROM users WHERE created_at >= DATE_SUB(NOW(), INTERVAL ? HOUR)',
+        [rules.timeframe || 24]
+      );
+      return accounts[0].count > (rules.threshold || 3);
+    }
+
+    // Check for unusual transaction patterns
+    if (rules.type === 'transaction_anomaly') {
+      const [transactions] = await db.execute(
+        `SELECT COUNT(*) as count, SUM(amount) as total 
+         FROM transactions 
+         WHERE user_id = ? AND created_at >= DATE_SUB(NOW(), INTERVAL ? HOUR) AND status = 'completed'`,
+        [user.id, rules.timeframe || 24]
+      );
+      
+      const txCount = transactions[0].count || 0;
+      const totalAmount = Math.abs(transactions[0].total || 0);
+      
+      return txCount > (rules.maxTransactions || 10) || totalAmount > (rules.maxAmount || 100000);
+    }
+
+    // Check for login anomalies
+    if (rules.type === 'login_anomaly') {
+      const [logins] = await db.execute(
+        `SELECT COUNT(DISTINCT ip_address) as unique_ips 
+         FROM user_logins 
+         WHERE user_id = ? AND login_time >= DATE_SUB(NOW(), INTERVAL ? HOUR)`,
+        [user.id, rules.timeframe || 24]
+      );
+      
+      return logins[0].unique_ips > (rules.maxUniqueIPs || 5);
+    }
+
+    // Check account age and activity
+    if (rules.type === 'new_account_high_activity') {
+      const accountAgeHours = Math.floor((new Date() - new Date(user.created_at)) / (1000 * 60 * 60));
+      
+      if (accountAgeHours < (rules.maxAgeHours || 24)) {
+        const [activityCount] = await db.execute(
+          `SELECT COUNT(*) as count 
+           FROM matches 
+           WHERE (player1_id = ? OR player2_id = ?) AND created_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR)`,
+          [user.id, user.id]
+        );
+        
+        return activityCount[0].count > (rules.minActivities || 10);
+      }
+    }
+
+    return false;
+
+  } catch (error) {
+    console.error('Pattern check error:', error);
+    return false;
+  }
+}
+// ==================== TRANSACTIONS MANAGEMENT ====================
+router.get('/transactions', authenticateAdmin, async (req, res) => {
+  try {
+    const { 
+      type, 
+      status, 
+      page = 1, 
+      limit = 20,
+      search 
+    } = req.query;
+    
+    const offset = (page - 1) * limit;
+    
+    console.log('💰 Admin: Fetching transactions - Type:', type, 'Status:', status, 'Page:', page, 'Search:', search);
+
+    let query = `
+      SELECT t.*, u.username, u.email, u.wallet_account_number
+      FROM transactions t
+      JOIN users u ON t.user_id = u.id
+      WHERE 1=1
+    `;
+    
+    let countQuery = `
+      SELECT COUNT(*) as total 
+      FROM transactions t
+      JOIN users u ON t.user_id = u.id
+      WHERE 1=1
+    `;
+    
+    const params = [];
+    const countParams = [];
+
+    // Apply filters
+    if (type && type !== '') {
+      query += ' AND t.type = ?';
+      countQuery += ' AND t.type = ?';
+      params.push(type);
+      countParams.push(type);
+    }
+    
+    if (status && status !== '') {
+      query += ' AND t.status = ?';
+      countQuery += ' AND t.status = ?';
+      params.push(status);
+      countParams.push(status);
+    }
+    
+    // Apply search
+    if (search) {
+      const searchTerm = `%${search}%`;
+      query += ' AND (t.reference LIKE ? OR u.username LIKE ? OR u.email LIKE ? OR u.wallet_account_number LIKE ?)';
+      countQuery += ' AND (t.reference LIKE ? OR u.username LIKE ? OR u.email LIKE ? OR u.wallet_account_number LIKE ?)';
+      params.push(searchTerm, searchTerm, searchTerm, searchTerm);
+      countParams.push(searchTerm, searchTerm, searchTerm, searchTerm);
+    }
+    
+    // Order and pagination
+    query += ' ORDER BY t.created_at DESC LIMIT ? OFFSET ?';
+    params.push(parseInt(limit), parseInt(offset));
+
+    // Execute queries
+    const [transactions] = await db.execute(query, params);
+    const [countResult] = await db.execute(countQuery, countParams);
+
+    // Log activity
+    try {
+      await db.execute(
+        `INSERT INTO admin_activity_logs 
+         (admin_id, action_type, description) 
+         VALUES (?, 'view', 'Viewed transactions list')`,
+        [req.admin.id]
+      );
+    } catch (logError) {
+      console.warn('⚠️ Could not log activity:', logError.message);
+    }
+
+    console.log('✅ Found', transactions.length, 'transactions');
+
+    res.json({
+      success: true,
+      transactions,
+      pagination: {
+        page: parseInt(page),
+        limit: parseInt(limit),
+        total: countResult[0].total,
+        totalPages: Math.ceil(countResult[0].total / limit)
+      }
+    });
+
+  } catch (error) {
+    console.error('❌ Get transactions error:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Failed to fetch transactions',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+
+router.get('/transactions/stats', authenticateAdmin, async (req, res) => {
+  try {
+    console.log('📊 Admin: Fetching transaction statistics');
+    
+    const [stats] = await db.execute(`
+      SELECT 
+        (SELECT COUNT(*) FROM transactions) as total,
+        (SELECT SUM(amount) FROM transactions WHERE status = 'completed' AND amount > 0) as totalAmount,
+        (SELECT COUNT(*) FROM transactions WHERE status = 'pending') as pending,
+        (SELECT COUNT(*) FROM transactions WHERE status = 'completed') as completed,
+        (SELECT COUNT(*) FROM transactions WHERE status = 'failed') as failed,
+        (SELECT COUNT(*) FROM transactions WHERE DATE(created_at) = CURDATE()) as todayCount,
+        (SELECT SUM(amount) FROM transactions WHERE DATE(created_at) = CURDATE() AND amount > 0) as todayAmount
+    `);
+
+    console.log('✅ Transaction stats fetched:', stats[0]);
+
+    res.json({
+      success: true,
+      stats: stats[0] || {
+        total: 0,
+        totalAmount: 0,
+        pending: 0,
+        completed: 0,
+        failed: 0,
+        todayCount: 0,
+        todayAmount: 0
+      }
+    });
+
+  } catch (error) {
+    console.error('❌ Get transaction stats error:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Failed to fetch transaction statistics'
+    });
+  }
+});
+
+router.get('/transactions/:id', authenticateAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    console.log('🔍 Admin: Fetching transaction details for ID:', id);
+
+    const [transactions] = await db.execute(`
+      SELECT t.*, 
+             u.username, 
+             u.email,
+             u.wallet_account_number
+      FROM transactions t
+      JOIN users u ON t.user_id = u.id
+      WHERE t.id = ?
+    `, [id]);
+
+    if (transactions.length === 0) {
+      console.log('❌ Transaction not found:', id);
+      return res.status(404).json({ 
+        success: false, 
+        message: 'Transaction not found' 
+      });
+    }
+
+    const transaction = transactions[0];
+
+    // Get withdrawal request if exists
+    let withdrawalRequest = null;
+    if (transaction.type === 'withdrawal') {
+      const [withdrawals] = await db.execute(
+        'SELECT * FROM withdrawal_requests WHERE transaction_id = ?',
+        [id]
+      );
+      withdrawalRequest = withdrawals[0] || null;
+    }
+
+    console.log('✅ Transaction details fetched:', transaction.reference);
+
+    res.json({
+      success: true,
+      transaction: transaction,
+      withdrawalRequest: withdrawalRequest
+    });
+
+  } catch (error) {
+    console.error('❌ Get transaction details error:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Failed to fetch transaction details' 
+    });
+  }
+});
+
+router.put('/transactions/:id/status', authenticateAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { status, notes } = req.body;
+    const adminId = req.admin.id;
+
+    console.log('⚡ Admin: Updating transaction status:', { 
+      transactionId: id, 
+      newStatus: status,
+      adminId 
+    });
+
+    if (!['pending', 'completed', 'failed', 'pending_approval', 'approved'].includes(status)) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Invalid status' 
+      });
+    }
+
+    // Get current transaction
+    const [transactions] = await db.execute(
+      'SELECT * FROM transactions WHERE id = ?',
+      [id]
+    );
+
+    if (transactions.length === 0) {
+      return res.status(404).json({ 
+        success: false, 
+        message: 'Transaction not found' 
+      });
+    }
+
+    const transaction = transactions[0];
+    const oldStatus = transaction.status;
+
+    // FIXED: Use your withTransaction helper
+    await db.withTransaction(async (connection) => {
+      try {
+        // Update transaction status
+        await connection.execute(
+          'UPDATE transactions SET status = ?, completed_at = IF(status != "completed" AND ? = "completed", NOW(), completed_at), updated_at = NOW() WHERE id = ?',
+          [status, status, id]
+        );
+
+        // Also update withdrawal_requests table if it's a withdrawal
+        if (transaction.type === 'withdrawal') {
+          await connection.execute(
+            'UPDATE withdrawal_requests SET status = ?, processed_by = ?, processed_at = NOW() WHERE transaction_id = ?',
+            [status === 'completed' ? 'processing' : status, adminId, id]
+          );
+        }
+
+        // Handle balance adjustments
+        if (status === 'completed' && oldStatus !== 'completed') {
+          // For deposits: Add to user balance
+          if (transaction.type === 'deposit' && transaction.amount > 0) {
+            await connection.execute(
+              'UPDATE users SET balance = balance + ? WHERE id = ?',
+              [transaction.amount, transaction.user_id]
+            );
+            console.log(`✅ Added ${transaction.amount} to user ${transaction.user_id} balance`);
+          }
+          // For withdrawals: No balance change needed on completion
+        }
+        
+        // Handle refunds/rejections for withdrawals
+        if (transaction.type === 'withdrawal' && (status === 'failed' || status === 'rejected') && oldStatus === 'pending_approval') {
+          // Refund back to user (withdrawals have negative amounts, so we add back)
+          await connection.execute(
+            'UPDATE users SET balance = balance + ABS(?) WHERE id = ?',
+            [transaction.amount, transaction.user_id]
+          );
+          console.log(`✅ Refunded ${Math.abs(transaction.amount)} to user ${transaction.user_id} for failed withdrawal`);
+        }
+
+        // Log the status change - FIXED: Removed details column
+        await connection.execute(
+          `INSERT INTO admin_activity_logs 
+           (admin_id, action_type, description, affected_user_id, affected_transaction_id) 
+           VALUES (?, 'transaction_status', ?, ?, ?)`,
+          [adminId, 
+           `Updated transaction #${id} from ${oldStatus} to ${status}`,
+           transaction.user_id, 
+           id]
+        );
+
+        console.log('💾 Transaction status updated successfully');
+        
+        // Transaction will auto-commit if no error
+      } catch (error) {
+        console.error('❌ Error within transaction:', error);
+        throw error;
+      }
+    });
+
+    res.json({
+      success: true,
+      message: 'Transaction status updated successfully',
+      new_status: status
+    });
+
+  } catch (error) {
+    console.error('❌ Update transaction status error:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Failed to update transaction status',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+router.post('/transactions/:id/refund', authenticateAdmin, async (req, res) => {
+  let refundResult, refundReference;
+  
+  try {
+    const { id } = req.params;
+    const { reason } = req.body;
+    const adminId = req.admin.id;
+
+    console.log('💸 Admin: Processing refund for transaction ID:', id);
+
+    // Get transaction (must be a completed deposit)
+    const [transactions] = await db.execute(
+      'SELECT * FROM transactions WHERE id = ? AND type = "deposit" AND status = "completed"',
+      [id]
+    );
+
+    if (transactions.length === 0) {
+      return res.status(404).json({ 
+        success: false, 
+        message: 'Completed deposit transaction not found' 
+      });
+    }
+
+    const transaction = transactions[0];
+
+    // Generate reference
+    refundReference = `REFUND-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+
+    // FIXED: Use your withTransaction helper
+    await db.withTransaction(async (connection) => {
+      try {
+        // Create refund transaction
+        [refundResult] = await connection.execute(
+          `INSERT INTO transactions 
+           (user_id, amount, currency, type, status, reference, description, external_reference) 
+           VALUES (?, ?, ?, 'refund', 'completed', ?, ?, ?)`,
+          [
+            transaction.user_id,
+            -Math.abs(transaction.amount), // Negative amount for refund
+            transaction.currency,
+            refundReference,
+            reason || 'Admin refund for deposit',
+            transaction.reference
+          ]
+        );
+
+        // Deduct from user balance
+        await connection.execute(
+          'UPDATE users SET balance = balance - ? WHERE id = ?',
+          [Math.abs(transaction.amount), transaction.user_id]
+        );
+
+        // Log activity - FIXED: Removed details column
+        await connection.execute(
+          `INSERT INTO admin_activity_logs 
+           (admin_id, action_type, description, affected_user_id, affected_transaction_id) 
+           VALUES (?, 'transaction_refund', ?, ?, ?)`,
+          [adminId, 
+           `Refunded transaction #${id} - ${transaction.amount} ${transaction.currency}`,
+           transaction.user_id, 
+           id]
+        );
+
+        console.log('✅ Refund processed successfully');
+      } catch (error) {
+        console.error('❌ Error within refund transaction:', error);
+        throw error;
+      }
+    });
+
+    res.json({
+      success: true,
+      message: 'Refund processed successfully',
+      refund_id: refundResult.insertId,
+      refund_reference: refundReference,
+      amount: Math.abs(transaction.amount)
+    });
+
+  } catch (error) {
+    console.error('❌ Process refund error:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Failed to process refund' 
+    });
+  }
+});
+// ==================== MATCHES MANAGEMENT ====================
+router.get('/matches', authenticateAdmin, async (req, res) => {
+  try {
+    const { 
+      status, 
+      game_type, 
+      page = 1, 
+      limit = 20,
+      search 
+    } = req.query;
+    
+    const offset = (page - 1) * limit;
+    
+    console.log('🎮 Admin: Fetching matches - Status:', status, 'Game Type:', game_type, 'Page:', page);
+
+    let query = `
+      SELECT m.*, 
+             p1.username as player1_username,
+             p2.username as player2_username,
+             w.username as winner_username
+      FROM matches m
+      LEFT JOIN users p1 ON m.player1_id = p1.id
+      LEFT JOIN users p2 ON m.player2_id = p2.id
+      LEFT JOIN users w ON m.winner_id = w.id
+      WHERE 1=1
+    `;
+    
+    let countQuery = `
+      SELECT COUNT(*) as total 
+      FROM matches m
+      WHERE 1=1
+    `;
+    
+    const params = [];
+    const countParams = [];
+
+    // Apply filters
+    if (status && status !== '') {
+      query += ' AND m.status = ?';
+      countQuery += ' AND m.status = ?';
+      params.push(status);
+      countParams.push(status);
+    }
+    
+    if (game_type && game_type !== '') {
+      query += ' AND m.game_type = ?';
+      countQuery += ' AND m.game_type = ?';
+      params.push(game_type);
+      countParams.push(game_type);
+    }
+    
+    // Apply search
+    if (search) {
+      const searchTerm = `%${search}%`;
+      query += ' AND (m.id LIKE ? OR m.game LIKE ? OR p1.username LIKE ? OR p2.username LIKE ?)';
+      countQuery += ' AND (m.id LIKE ? OR m.game LIKE ?)';
+      params.push(searchTerm, searchTerm, searchTerm, searchTerm);
+      countParams.push(searchTerm, searchTerm);
+    }
+    
+    // Order and pagination
+    query += ' ORDER BY m.created_at DESC LIMIT ? OFFSET ?';
+    params.push(parseInt(limit), parseInt(offset));
+
+    // Execute queries
+    const [matches] = await db.execute(query, params);
+    const [countResult] = await db.execute(countQuery, countParams);
+
+    // Log activity
+    try {
+      await db.execute(
+        `INSERT INTO admin_activity_logs 
+         (admin_id, action_type, description) 
+         VALUES (?, 'view', 'Viewed matches list')`,
+        [req.admin.id]
+      );
+    } catch (logError) {
+      console.warn('⚠️ Could not log activity:', logError.message);
+    }
+
+    console.log('✅ Found', matches.length, 'matches');
+
+    res.json({
+      success: true,
+      matches,
+      pagination: {
+        page: parseInt(page),
+        limit: parseInt(limit),
+        total: countResult[0].total,
+        totalPages: Math.ceil(countResult[0].total / limit)
+      }
+    });
+
+  } catch (error) {
+    console.error('❌ Get matches error:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Failed to fetch matches',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+
+router.get('/matches/stats', authenticateAdmin, async (req, res) => {
+  try {
+    console.log('📊 Admin: Fetching match statistics');
+    
+    const [stats] = await db.execute(`
+      SELECT 
+        COUNT(*) as total,
+        SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) as pending,
+        SUM(CASE WHEN status = 'ongoing' THEN 1 ELSE 0 END) as ongoing,
+        SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed,
+        COALESCE(SUM(stake_amount), 0) as totalStake,
+        SUM(CASE WHEN admin_monitoring = 1 THEN 1 ELSE 0 END) as adminMonitored,
+        COALESCE(SUM(
+          CASE 
+            WHEN prize_pool_amount > 0 THEN prize_pool_amount
+            WHEN custom_prize_pool > 0 THEN custom_prize_pool
+            ELSE 0 
+          END
+        ), 0) as totalPrize
+      FROM matches
+    `);
+
+    console.log('✅ Match stats fetched:', stats[0]);
+
+    res.json({
+      success: true,
+      stats: stats[0] || {
+        total: 0,
+        pending: 0,
+        ongoing: 0,
+        completed: 0,
+        totalStake: 0,
+        adminMonitored: 0,
+        totalPrize: 0
+      }
+    });
+
+  } catch (error) {
+    console.error('❌ Get match stats error:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Failed to fetch match statistics'
+    });
+  }
+});
+router.get('/matches/:id', authenticateAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    console.log('🔍 Admin: Fetching match details for ID:', id);
+
+    const [matches] = await db.execute(`
+      SELECT m.*, 
+             p1.username as player1_username,
+             p1.email as player1_email,
+             p2.username as player2_username,
+             p2.email as player2_email,
+             w.username as winner_username
+      FROM matches m
+      LEFT JOIN users p1 ON m.player1_id = p1.id
+      LEFT JOIN users p2 ON m.player2_id = p2.id
+      LEFT JOIN users w ON m.winner_id = w.id
+      WHERE m.id = ?
+    `, [id]);
+
+    if (matches.length === 0) {
+      console.log('❌ Match not found:', id);
+      return res.status(404).json({ 
+        success: false, 
+        message: 'Match not found' 
+      });
+    }
+
+    const match = matches[0];
+
+    // Get disputes if any
+    const [disputes] = await db.execute(
+      'SELECT * FROM match_disputes WHERE match_id = ? ORDER BY created_at DESC',
+      [id]
+    );
+
+    console.log('✅ Match details fetched:', match.id);
+
+    res.json({
+      success: true,
+      match: match,
+      disputes: disputes
+    });
+
+  } catch (error) {
+    console.error('❌ Get match details error:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Failed to fetch match details' 
+    });
+  }
+});
+router.post('/matches/:id/cancel', authenticateAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { reason } = req.body;
+    const adminId = req.admin.id;
+
+    console.log('🗑️ Admin: Cancelling match:', { 
+      matchId: id, 
+      reason,
+      adminId 
+    });
+
+    // Get current match
+    const [matches] = await db.execute(
+      'SELECT * FROM matches WHERE id = ? AND status IN ("pending", "ongoing")',
+      [id]
+    );
+
+    if (matches.length === 0) {
+      return res.status(404).json({ 
+        success: false, 
+        message: 'Match not found or cannot be cancelled' 
+      });
+    }
+
+    const match = matches[0];
+
+    await db.withTransaction(async (connection) => {
+      try {
+        // Update match status
+        await connection.execute(
+          'UPDATE matches SET status = "completed", completed_at = NOW() WHERE id = ?',
+          [id]
+        );
+
+        // Refund stake amount to players
+        if (match.stake_amount > 0) {
+          // Refund to player 1
+          await connection.execute(
+            'UPDATE users SET balance = balance + ? WHERE id = ?',
+            [match.stake_amount, match.player1_id]
+          );
+          
+          if (match.player2_id) {
+            // Refund to player 2 if exists
+            await connection.execute(
+              'UPDATE users SET balance = balance + ? WHERE id = ?',
+              [match.stake_amount, match.player2_id]
+            );
+          }
+        }
+
+        // Log admin monitoring activity if admin monitoring was enabled
+        if (match.admin_monitoring === 1) {
+          await connection.execute(
+            `INSERT INTO admin_monitoring_logs 
+             (tournament_id, match_id, admin_id, action_type, details, ip_address) 
+             VALUES (?, ?, ?, ?, ?, ?)`,
+            [
+              null, // tournament_id (null for regular matches)
+              id,
+              adminId,
+              'overrode_result',
+              JSON.stringify({
+                reason: reason,
+                action: 'cancelled_by_admin',
+                stake_amount: match.stake_amount,
+                refunded_to_players: [match.player1_id, match.player2_id].filter(Boolean)
+              }),
+              req.ip || 'unknown'
+            ]
+          );
+        }
+
+        // Log admin activity
+        await connection.execute(
+          `INSERT INTO admin_activity_logs 
+           (admin_id, action_type, description, details) 
+           VALUES (?, 'match_cancellation', ?, ?)`,
+          [adminId, 
+           `Cancelled match #${id}`,
+           JSON.stringify({ 
+             reason, 
+             stake_amount: match.stake_amount,
+             admin_monitoring: match.admin_monitoring,
+             final_decision: true // Referee's word is final
+           })]
+        );
+
+        console.log('✅ Match cancelled successfully');
+      } catch (error) {
+        console.error('❌ Error within match cancellation transaction:', error);
+        throw error;
+      }
+    });
+
+    res.json({
+      success: true,
+      message: 'Match cancelled successfully',
+      admin_monitoring: match.admin_monitoring === 1,
+      final_decision: true // Referee's word is final
+    });
+
+  } catch (error) {
+    console.error('❌ Cancel match error:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Failed to cancel match',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+router.post('/matches/:id/resolve', authenticateAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { winnerId, adminNotes } = req.body;
+    const adminId = req.admin.id;
+
+    console.log('⚡ Admin: Resolving match dispute:', { 
+      matchId: id, 
+      winnerId,
+      adminId 
+    });
+
+    if (!winnerId) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Winner ID is required' 
+      });
+    }
+
+    // Get current match
+    const [matches] = await db.execute(
+      'SELECT * FROM matches WHERE id = ? AND status = "ongoing"',
+      [id]
+    );
+
+    if (matches.length === 0) {
+      return res.status(404).json({ 
+        success: false, 
+        message: 'Match not found or not in ongoing status' 
+      });
+    }
+
+    const match = matches[0];
+
+    await db.withTransaction(async (connection) => {
+      try {
+        // Update match
+        await connection.execute(
+          'UPDATE matches SET status = "completed", winner_id = ?, completed_at = NOW() WHERE id = ?',
+          [winnerId, id]
+        );
+
+        // Distribute prize if any
+        const prizeAmount = match.prize_pool_amount || match.custom_prize_pool || 0;
+        if (prizeAmount > 0) {
+          // Update user balance
+          await connection.execute(
+            'UPDATE users SET balance = balance + ? WHERE id = ?',
+            [prizeAmount, winnerId]
+          );
+          
+          // Create transaction record - NO ID COLUMN (auto-increment)
+          const reference = `MATCH_PRIZE_${id}_${Date.now()}`;
+          await connection.execute(
+            `INSERT INTO transactions 
+             (user_id, type, amount, status, description, reference, currency) 
+             VALUES (?, ?, ?, 'completed', ?, ?, ?)`,
+            [
+              winnerId, 
+              'match_prize', 
+              prizeAmount, 
+              `Prize for winning match #${id}`,
+              reference,
+              'NGN'
+            ]
+          );
+          console.log(`✅ Created transaction with reference: ${reference}`);
+        }
+
+        // Log admin monitoring activity if admin monitoring was enabled
+        if (match.admin_monitoring === 1) {
+          await connection.execute(
+            `INSERT INTO admin_monitoring_logs 
+             (tournament_id, match_id, admin_id, action_type, details, ip_address) 
+             VALUES (?, ?, ?, ?, ?, ?)`,
+            [
+              null, // tournament_id (null for regular matches)
+              id,
+              adminId,
+              'resolved_dispute',
+              JSON.stringify({
+                winner_id: winnerId,
+                admin_notes: adminNotes,
+                stake_amount: match.stake_amount,
+                prize_amount: prizeAmount
+              }),
+              req.ip || 'unknown'
+            ]
+          );
+          console.log('📝 Admin monitoring log created');
+        }
+
+        // Log admin activity
+        await connection.execute(
+          `INSERT INTO admin_activity_logs 
+           (admin_id, action_type, description, affected_user_id, details) 
+           VALUES (?, 'match_resolution', ?, ?, ?)`,
+          [adminId, 
+           `Resolved match #${id} - Winner: ${winnerId}`,
+           winnerId, 
+           JSON.stringify({ 
+             adminNotes, 
+             prizeAmount,
+             admin_monitoring: match.admin_monitoring,
+             final_decision: true
+           })]
+        );
+
+        console.log('✅ Match resolved successfully');
+      } catch (error) {
+        console.error('❌ Error within match resolution transaction:', error);
+        throw error;
+      }
+    });
+
+    res.json({
+      success: true,
+      message: 'Match resolved successfully',
+      winner_id: winnerId,
+      admin_monitoring: match.admin_monitoring === 1,
+      final_decision: true
+    });
+
+  } catch (error) {
+    console.error('❌ Resolve match error:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Failed to resolve match',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+// ==================== MATCH AUDIT LOGS ====================
+router.get('/matches/:id/audit-logs', authenticateAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const adminId = req.admin.id;
+    
+    console.log('📝 Admin: Fetching audit logs for match ID:', id);
+
+    // First, verify match exists
+    const [matches] = await db.execute(
+      'SELECT id FROM matches WHERE id = ?',
+      [id]
+    );
+
+    if (matches.length === 0) {
+      return res.status(404).json({ 
+        success: false, 
+        message: 'Match not found' 
+      });
+    }
+
+    // Get admin monitoring logs from admin_monitoring_logs table
+    let monitoringLogs = [];
+    try {
+      const [logs] = await db.execute(`
+        SELECT 
+          aml.*,
+          au.username as admin_username,
+          'monitoring' as log_source
+        FROM admin_monitoring_logs aml
+        LEFT JOIN admin_users au ON aml.admin_id = au.id
+        WHERE aml.match_id = ?
+        ORDER BY aml.created_at DESC
+        LIMIT 50
+      `, [id]);
+      monitoringLogs = logs;
+    } catch (error) {
+      console.warn('⚠️ Could not fetch monitoring logs:', error.message);
+    }
+
+    // Get related admin activity logs
+    let activityLogs = [];
+    try {
+      const [logs] = await db.execute(`
+        SELECT 
+          al.*,
+          au.username as admin_username,
+          'activity' as log_source
+        FROM admin_activity_logs al
+        LEFT JOIN admin_users au ON al.admin_id = au.id
+        WHERE al.description LIKE ? OR al.description LIKE ?
+        ORDER BY al.created_at DESC
+        LIMIT 50
+      `, [`%match #${id}%`, `%Match #${id}%`]);
+      activityLogs = logs;
+    } catch (error) {
+      console.warn('⚠️ Could not fetch activity logs:', error.message);
+    }
+
+    // Get match dispute logs if any
+    let disputeLogs = [];
+    try {
+      const [logs] = await db.execute(
+        'SELECT * FROM match_disputes WHERE match_id = ? ORDER BY created_at DESC LIMIT 20',
+        [id]
+      );
+      disputeLogs = logs.map(log => ({
+        ...log,
+        log_source: 'dispute',
+        action_type: 'match_dispute',
+        details: JSON.stringify(log)
+      }));
+    } catch (error) {
+      console.warn('⚠️ Could not fetch dispute logs:', error.message);
+    }
+
+    // Get transaction logs for this match
+    let transactionLogs = [];
+    try {
+      const [logs] = await db.execute(
+        `SELECT 
+          t.*,
+          'transaction' as log_source,
+          'match_transaction' as action_type,
+          CONCAT('Transaction: ', t.description) as details
+        FROM transactions t
+        WHERE t.description LIKE ? OR t.reference LIKE ?
+        ORDER BY t.created_at DESC
+        LIMIT 20`,
+        [`%match #${id}%`, `%MATCH_${id}_%`]
+      );
+      transactionLogs = logs;
+    } catch (error) {
+      console.warn('⚠️ Could not fetch transaction logs:', error.message);
+    }
+
+    // Combine all logs
+    const allLogs = [
+      ...monitoringLogs,
+      ...activityLogs,
+      ...disputeLogs,
+      ...transactionLogs
+    ].sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+
+    console.log('✅ Found', allLogs.length, 'audit logs for match', id);
+
+    res.json({
+      success: true,
+      logs: allLogs,
+      match_id: id
+    });
+
+  } catch (error) {
+    console.error('❌ Get audit logs error:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Failed to fetch audit logs',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+router.get('/matches/stats', authenticateAdmin, async (req, res) => {
+  try {
+    console.log('📊 Admin: Fetching match statistics');
+    
+    const [stats] = await db.execute(`
+      SELECT 
+        COUNT(*) as total,
+        SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) as pending,
+        SUM(CASE WHEN status = 'ongoing' THEN 1 ELSE 0 END) as ongoing,
+        SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed,
+        COALESCE(SUM(stake_amount), 0) as totalStake,
+        SUM(CASE WHEN admin_monitoring = 1 THEN 1 ELSE 0 END) as adminMonitored,
+        COALESCE(SUM(
+          CASE 
+            WHEN prize_pool_amount > 0 THEN prize_pool_amount
+            WHEN custom_prize_pool > 0 THEN custom_prize_pool
+            ELSE 0 
+          END
+        ), 0) as totalPrize
+      FROM matches
+    `);
+
+    console.log('✅ Match stats fetched:', stats[0]);
+
+    res.json({
+      success: true,
+      stats: stats[0] || {
+        total: 0,
+        pending: 0,
+        ongoing: 0,
+        completed: 0,
+        totalStake: 0,
+        adminMonitored: 0,
+        totalPrize: 0
+      }
+    });
+
+  } catch (error) {
+    console.error('❌ Get match stats error:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Failed to fetch match statistics'
+    });
+  }
+});
+// ==================== TOURNAMENTS MANAGEMENT ====================
+
+// GET /api/admin/tournaments - Get all tournaments with filters
+router.get('/tournaments', authenticateAdmin, async (req, res) => {
+  try {
+    const { 
+      status, 
+      type, 
+      page = 1, 
+      limit = 20,
+      search 
+    } = req.query;
+    
+    const offset = (page - 1) * limit;
+    
+    console.log('🎯 Admin: Fetching tournaments - Status:', status, 'Type:', type, 'Page:', page);
+
+    let query = `
+      SELECT t.*, 
+             u.username as creator_name,
+             COUNT(DISTINCT tp.id) as current_participants,
+             COUNT(DISTINCT CASE WHEN t.type = 'squad' THEN tp.group_id ELSE NULL END) as current_squads
+      FROM tournaments t
+      LEFT JOIN users u ON t.creator_id = u.id
+      LEFT JOIN tournament_participants tp ON t.id = tp.tournament_id 
+        AND tp.status = 'joined'
+      WHERE 1=1
+    `;
+    
+    let countQuery = `
+      SELECT COUNT(*) as total 
+      FROM tournaments t
+      WHERE 1=1
+    `;
+    
+    const params = [];
+    const countParams = [];
+
+    // Apply filters
+    if (status && status !== '') {
+      query += ' AND t.status = ?';
+      countQuery += ' AND t.status = ?';
+      params.push(status);
+      countParams.push(status);
+    }
+    
+    if (type && type !== '') {
+      query += ' AND t.type = ?';
+      countQuery += ' AND t.type = ?';
+      params.push(type);
+      countParams.push(type);
+    }
+    
+    // Apply search
+    if (search) {
+      const searchTerm = `%${search}%`;
+      query += ' AND (t.name LIKE ? OR t.game LIKE ? OR u.username LIKE ?)';
+      countQuery += ' AND (t.name LIKE ? OR t.game LIKE ?)';
+      params.push(searchTerm, searchTerm, searchTerm);
+      countParams.push(searchTerm, searchTerm);
+    }
+    
+    // Group and pagination
+    query += ' GROUP BY t.id ORDER BY t.created_at DESC LIMIT ? OFFSET ?';
+    params.push(parseInt(limit), parseInt(offset));
+
+    // Execute queries
+    const [tournaments] = await db.execute(query, params);
+    const [countResult] = await db.execute(countQuery, countParams);
+
+    // Log activity
+    try {
+      await db.execute(
+        `INSERT INTO admin_activity_logs 
+         (admin_id, action_type, description) 
+         VALUES (?, 'view', 'Viewed tournaments list')`,
+        [req.admin.id]
+      );
+    } catch (logError) {
+      console.warn('⚠️ Could not log activity:', logError.message);
+    }
+
+    console.log('✅ Found', tournaments.length, 'tournaments');
+
+    res.json({
+      success: true,
+      tournaments: tournaments.map(t => ({
+        ...t,
+        entry_fee: t.xp_entry_fee, // Map for frontend
+        current_participants: t.current_participants || 0,
+        current_squads: t.current_squads || 0
+      })),
+      pagination: {
+        page: parseInt(page),
+        limit: parseInt(limit),
+        total: countResult[0].total,
+        totalPages: Math.ceil(countResult[0].total / limit)
+      }
+    });
+
+  } catch (error) {
+    console.error('❌ Get tournaments error:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Failed to fetch tournaments',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+
+// GET /api/admin/tournaments/stats - Get tournament statistics
+router.get('/tournaments/stats', authenticateAdmin, async (req, res) => {
+  try {
+    console.log('📊 Admin: Fetching tournament statistics');
+    
+    const [stats] = await db.execute(`
+      SELECT 
+        COUNT(*) as totalTournaments,
+        SUM(CASE WHEN status = 'upcoming' THEN 1 ELSE 0 END) as upcomingTournaments,
+        SUM(CASE WHEN status = 'ongoing' THEN 1 ELSE 0 END) as ongoingTournaments,
+        SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completedTournaments,
+        SUM(CASE WHEN status = 'cancelled' THEN 1 ELSE 0 END) as cancelledTournaments,
+        SUM(prize_pool + custom_prize_pool) as totalPrizePool
+      FROM tournaments
+    `);
+
+    console.log('✅ Tournament stats fetched:', stats[0]);
+
+    res.json({
+      success: true,
+      stats: stats[0] || {
+        totalTournaments: 0,
+        upcomingTournaments: 0,
+        ongoingTournaments: 0,
+        completedTournaments: 0,
+        cancelledTournaments: 0,
+        totalPrizePool: 0
+      }
+    });
+
+  } catch (error) {
+    console.error('❌ Get tournament stats error:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Failed to fetch tournament statistics'
+    });
+  }
+});
+
+// GET /api/admin/tournaments - Get all tournaments with filters
+router.get('/tournaments', authenticateAdmin, async (req, res) => {
+  try {
+    const { 
+      status, 
+      type, 
+      monitoring,
+      sort = 'newest',
+      page = 1, 
+      limit = 20,
+      search 
+    } = req.query;
+    
+    const offset = (page - 1) * limit;
+    
+    console.log('🎯 Admin: Fetching tournaments - Status:', status, 'Type:', type, 'Monitoring:', monitoring, 'Sort:', sort, 'Page:', page);
+
+    let query = `
+      SELECT t.*, 
+             u.username as creator_name,
+             COUNT(DISTINCT tp.id) as current_participants,
+             COUNT(DISTINCT CASE WHEN t.type = 'squad' THEN tp.group_id ELSE NULL END) as current_squads,
+             COUNT(DISTINCT aml.id) as log_count
+      FROM tournaments t
+      LEFT JOIN users u ON t.creator_id = u.id
+      LEFT JOIN tournament_participants tp ON t.id = tp.tournament_id 
+        AND tp.status = 'joined'
+      LEFT JOIN admin_monitoring_logs aml ON t.id = aml.tournament_id
+      WHERE 1=1
+    `;
+    
+    let countQuery = `
+      SELECT COUNT(DISTINCT t.id) as total 
+      FROM tournaments t
+      LEFT JOIN users u ON t.creator_id = u.id
+      WHERE 1=1
+    `;
+    
+    const params = [];
+    const countParams = [];
+
+    // Apply filters
+    if (status && status !== '') {
+      query += ' AND t.status = ?';
+      countQuery += ' AND t.status = ?';
+      params.push(status);
+      countParams.push(status);
+    }
+    
+    if (type && type !== '') {
+      query += ' AND t.type = ?';
+      countQuery += ' AND t.type = ?';
+      params.push(type);
+      countParams.push(type);
+    }
+    
+    // Apply monitoring filter
+    if (monitoring && monitoring !== 'all') {
+      if (monitoring === 'monitored') {
+        query += ' AND t.admin_monitoring = 1';
+        countQuery += ' AND t.admin_monitoring = 1';
+      } else if (monitoring === 'not-monitored') {
+        query += ' AND (t.admin_monitoring = 0 OR t.admin_monitoring IS NULL)';
+        countQuery += ' AND (t.admin_monitoring = 0 OR t.admin_monitoring IS NULL)';
+      }
+    }
+    
+    // Apply search
+    if (search && search.trim() !== '') {
+      const searchTerm = `%${search.trim()}%`;
+      query += ' AND (t.name LIKE ? OR t.game LIKE ? OR u.username LIKE ?)';
+      countQuery += ' AND (t.name LIKE ? OR t.game LIKE ? OR u.username LIKE ?)';
+      params.push(searchTerm, searchTerm, searchTerm);
+      countParams.push(searchTerm, searchTerm, searchTerm);
+    }
+    
+    // Group
+    query += ' GROUP BY t.id';
+    
+    // Apply sorting
+    switch(sort) {
+      case 'oldest':
+        query += ' ORDER BY t.created_at ASC';
+        break;
+      case 'prize_high':
+        query += ' ORDER BY (t.prize_pool + t.custom_prize_pool) DESC';
+        break;
+      case 'prize_low':
+        query += ' ORDER BY (t.prize_pool + t.custom_prize_pool) ASC';
+        break;
+      case 'participants_high':
+        query += ' ORDER BY current_participants DESC';
+        break;
+      case 'participants_low':
+        query += ' ORDER BY current_participants ASC';
+        break;
+      case 'newest':
+      default:
+        query += ' ORDER BY t.created_at DESC';
+    }
+    
+    // Add pagination
+    query += ' LIMIT ? OFFSET ?';
+    params.push(parseInt(limit), parseInt(offset));
+
+    // Execute queries
+    const [tournaments] = await db.execute(query, params);
+    const [countResult] = await db.execute(countQuery, countParams);
+
+    // Log activity
+    try {
+      await db.execute(
+        `INSERT INTO admin_activity_logs 
+         (admin_id, action_type, description) 
+         VALUES (?, 'view', 'Viewed tournaments list')`,
+        [req.admin.id]
+      );
+    } catch (logError) {
+      console.warn('⚠️ Could not log activity:', logError.message);
+    }
+
+    console.log('✅ Found', tournaments.length, 'tournaments');
+
+    res.json({
+      success: true,
+      tournaments: tournaments.map(t => ({
+        ...t,
+        entry_fee: t.xp_entry_fee,
+        current_participants: t.current_participants || 0,
+        current_squads: t.current_squads || 0,
+        log_count: t.log_count || 0
+      })),
+      pagination: {
+        page: parseInt(page),
+        limit: parseInt(limit),
+        total: countResult[0]?.total || 0,
+        totalPages: Math.ceil((countResult[0]?.total || 0) / limit)
+      }
+    });
+
+  } catch (error) {
+    console.error('❌ Get tournaments error:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Failed to fetch tournaments',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+
+// GET /api/admin/tournaments/:id/participants - Get tournament participants
+router.get('/tournaments/:id/participants', authenticateAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    console.log('👥 Admin: Fetching participants for tournament:', id);
+
+    const [participants] = await db.execute(`
+      SELECT tp.*, 
+             u.username,
+             u.email,
+             u.rank,
+             u.profile_pic,
+             g.name as group_name
+      FROM tournament_participants tp
+      JOIN users u ON tp.user_id = u.id
+      LEFT JOIN groups g ON tp.group_id = g.id
+      WHERE tp.tournament_id = ? AND tp.status = 'joined'
+      ORDER BY tp.created_at ASC
+    `, [id]);
+
+    console.log('✅ Found', participants.length, 'participants');
+
+    res.json({
+      success: true,
+      participants: participants || [],
+      tournament_id: id
+    });
+
+  } catch (error) {
+    console.error('❌ Get participants error:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Failed to fetch participants' 
+    });
+  }
+});
+
+// POST /api/admin/tournaments/:id/cancel - Cancel tournament
+router.post('/tournaments/:id/cancel', authenticateAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { reason } = req.body;
+    const adminId = req.admin.id;
+
+    console.log('🚫 Admin: Cancelling tournament:', { 
+      tournamentId: id, 
+      reason,
+      adminId 
+    });
+
+    // Get tournament details
+    const [tournaments] = await db.execute(
+      'SELECT * FROM tournaments WHERE id = ? AND status IN ("upcoming", "ongoing")',
+      [id]
+    );
+
+    if (tournaments.length === 0) {
+      return res.status(404).json({ 
+        success: false, 
+        message: 'Tournament not found or cannot be cancelled' 
+      });
+    }
+
+    const tournament = tournaments[0];
+
+    await db.withTransaction(async (connection) => {
+      try {
+        // Update tournament status
+        await connection.query(
+          'UPDATE tournaments SET status = "cancelled", completed_at = NOW() WHERE id = ?',
+          [id]
+        );
+
+        // Refund XP entry fees if any
+        if (tournament.xp_entry_fee > 0) {
+          const [participants] = await connection.query(`
+            SELECT tp.user_id 
+            FROM tournament_participants tp
+            WHERE tp.tournament_id = ? AND tp.status = 'joined'
+          `, [id]);
+
+          for (const participant of participants) {
+            await connection.query(
+              'UPDATE users SET xp_points = xp_points + ? WHERE id = ?',
+              [tournament.xp_entry_fee, participant.user_id]
+            );
+
+            // Record XP refund
+            await connection.query(`
+              INSERT INTO xp_transactions 
+              (user_id, tournament_id, amount, type, description, created_at)
+              VALUES (?, ?, ?, 'refund', ?, NOW())
+            `, [
+              participant.user_id,
+              id,
+              tournament.xp_entry_fee,
+              `XP refund for cancelled tournament: ${tournament.name}`
+            ]);
+          }
+
+          console.log(`✅ Refunded XP to ${participants.length} participants`);
+        }
+
+        // Notify participants
+        const [participants] = await connection.query(`
+          SELECT DISTINCT user_id FROM tournament_participants 
+          WHERE tournament_id = ? AND status = 'joined'
+        `, [id]);
+
+        for (const participant of participants) {
+          await connection.query(`
+            INSERT INTO notifications 
+            (user_id, message, type, status, tournament_id, created_at)
+            VALUES (?, ?, 'system', 'unread', ?, NOW())
+          `, [
+            participant.user_id,
+            `Tournament "${tournament.name}" has been cancelled by admin. ${tournament.xp_entry_fee > 0 ? 'Your entry fee has been refunded.' : ''}`,
+            id
+          ]);
+        }
+
+        // Log admin activity
+        await connection.query(`
+          INSERT INTO admin_activity_logs 
+          (admin_id, action_type, description, details) 
+          VALUES (?, 'tournament_cancellation', ?, ?)
+        `, [
+          adminId,
+          `Cancelled tournament #${id}`,
+          JSON.stringify({
+            reason,
+            tournament_name: tournament.name,
+            entry_fee: tournament.xp_entry_fee,
+            participants_notified: participants.length
+          })
+        ]);
+
+        console.log('✅ Tournament cancelled successfully');
+      } catch (error) {
+        console.error('❌ Error within cancellation transaction:', error);
+        throw error;
+      }
+    });
+
+    res.json({
+      success: true,
+      message: 'Tournament cancelled successfully',
+      refunded: tournament.xp_entry_fee > 0
+    });
+
+  } catch (error) {
+    console.error('❌ Cancel tournament error:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Failed to cancel tournament',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+
+// POST /api/admin/tournaments/:id/distribute-prizes - Distribute tournament prizes
+router.post('/tournaments/:id/distribute-prizes', authenticateAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const adminId = req.admin.id;
+
+    console.log('💰 Admin: Distributing prizes for tournament:', id);
+
+    // Get tournament details
+    const [tournaments] = await db.execute(
+      'SELECT * FROM tournaments WHERE id = ? AND status = "completed"',
+      [id]
+    );
+
+    if (tournaments.length === 0) {
+      return res.status(404).json({ 
+        success: false, 
+        message: 'Tournament not found or not completed' 
+      });
+    }
+
+    const tournament = tournaments[0];
+
+    if (!tournament.winner_id) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Tournament has no winner set' 
+      });
+    }
+
+    // Check if prizes already distributed
+    const [existingPrizes] = await db.execute(`
+      SELECT 1 FROM xp_transactions 
+      WHERE tournament_id = ? AND type = 'earned' AND description LIKE '%prize%'
+      LIMIT 1
+    `, [id]);
+
+    if (existingPrizes.length > 0) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Prizes already distributed for this tournament' 
+      });
+    }
+
+    await db.withTransaction(async (connection) => {
+      try {
+        const totalPrize = tournament.prize_pool || tournament.custom_prize_pool || 0;
+        
+        if (totalPrize > 0) {
+          // Award XP to winner
+          await connection.query(
+            'UPDATE users SET xp_points = xp_points + ? WHERE id = ?',
+            [totalPrize, tournament.winner_id]
+          );
+
+          // Record XP prize transaction
+          await connection.query(`
+            INSERT INTO xp_transactions 
+            (user_id, tournament_id, amount, type, description, created_at)
+            VALUES (?, ?, ?, 'earned', ?, NOW())
+          `, [
+            tournament.winner_id,
+            id,
+            totalPrize,
+            `Tournament prize: ${tournament.name}`
+          ]);
+
+          console.log(`💰 Awarded ${totalPrize} XP to winner ${tournament.winner_id}`);
+        }
+
+        // Log admin activity
+        await connection.query(`
+          INSERT INTO admin_activity_logs 
+          (admin_id, action_type, description, details) 
+          VALUES (?, 'prize_distribution', ?, ?)
+        `, [
+          adminId,
+          `Distributed prizes for tournament #${id}`,
+          JSON.stringify({
+            tournament_name: tournament.name,
+            winner_id: tournament.winner_id,
+            prize_amount: totalPrize,
+            prize_type: tournament.prize_pool_option
+          })
+        ]);
+
+        console.log('✅ Prizes distributed successfully');
+      } catch (error) {
+        console.error('❌ Error within prize distribution transaction:', error);
+        throw error;
+      }
+    });
+
+    res.json({
+      success: true,
+      message: 'Prizes distributed successfully',
+      prize_distributed: tournament.prize_pool || tournament.custom_prize_pool || 0,
+      winner_id: tournament.winner_id
+    });
+
+  } catch (error) {
+    console.error('❌ Distribute prizes error:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Failed to distribute prizes',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+
+// DELETE /api/admin/tournaments/:id/participants/:userId - Remove participant
+router.delete('/tournaments/:id/participants/:userId', authenticateAdmin, async (req, res) => {
+  try {
+    const { id, userId } = req.params;
+    const adminId = req.admin.id;
+    const { reason } = req.body;
+
+    console.log('👢 Admin: Removing participant:', { tournamentId: id, userId, adminId });
+
+    // Check if tournament exists
+    const [tournaments] = await db.execute(
+      'SELECT * FROM tournaments WHERE id = ? AND status = "upcoming"',
+      [id]
+    );
+
+    if (tournaments.length === 0) {
+      return res.status(404).json({ 
+        success: false, 
+        message: 'Tournament not found or already started' 
+      });
+    }
+
+    const tournament = tournaments[0];
+
+    // Check if participant exists
+    const [participants] = await db.execute(`
+      SELECT tp.*, u.username 
+      FROM tournament_participants tp
+      JOIN users u ON tp.user_id = u.id
+      WHERE tp.tournament_id = ? AND tp.user_id = ? AND tp.status = 'joined'
+    `, [id, userId]);
+
+    if (participants.length === 0) {
+      return res.status(404).json({ 
+        success: false, 
+        message: 'Participant not found in tournament' 
+      });
+    }
+
+    const participant = participants[0];
+
+    await db.withTransaction(async (connection) => {
+      try {
+        // Update participant status
+        await connection.query(
+          'UPDATE tournament_participants SET status = "declined" WHERE tournament_id = ? AND user_id = ?',
+          [id, userId]
+        );
+
+        // Refund entry fee if any
+        if (tournament.xp_entry_fee > 0) {
+          await connection.query(
+            'UPDATE users SET xp_points = xp_points + ? WHERE id = ?',
+            [tournament.xp_entry_fee, userId]
+          );
+
+          // Record XP refund
+          await connection.query(`
+            INSERT INTO xp_transactions 
+            (user_id, tournament_id, amount, type, description, created_at)
+            VALUES (?, ?, ?, 'refund', ?, NOW())
+          `, [
+            userId,
+            id,
+            tournament.xp_entry_fee,
+            `XP refund for removal from tournament: ${tournament.name}`
+          ]);
+        }
+
+        // Notify user
+        await connection.query(`
+          INSERT INTO notifications 
+          (user_id, message, type, status, tournament_id, created_at)
+          VALUES (?, ?, 'system', 'unread', ?, NOW())
+        `, [
+          userId,
+          `You have been removed from tournament "${tournament.name}" by admin. ${tournament.xp_entry_fee > 0 ? 'Your entry fee has been refunded.' : ''}`,
+          id
+        ]);
+
+        // Log admin activity
+        await connection.query(`
+          INSERT INTO admin_activity_logs 
+          (admin_id, action_type, description, details) 
+          VALUES (?, 'participant_removal', ?, ?)
+        `, [
+          adminId,
+          `Removed participant ${userId} from tournament #${id}`,
+          JSON.stringify({
+            reason,
+            participant_username: participant.username,
+            tournament_name: tournament.name,
+            entry_fee_refunded: tournament.xp_entry_fee
+          })
+        ]);
+
+        console.log('✅ Participant removed successfully');
+      } catch (error) {
+        console.error('❌ Error within removal transaction:', error);
+        throw error;
+      }
+    });
+
+    res.json({
+      success: true,
+      message: 'Participant removed successfully',
+      refunded: tournament.xp_entry_fee > 0
+    });
+
+  } catch (error) {
+    console.error('❌ Remove participant error:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Failed to remove participant',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+
+// GET /api/admin/tournaments/:id/matches - Get tournament matches
+router.get('/tournaments/:id/matches', authenticateAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    console.log('🎮 Admin: Fetching matches for tournament:', id);
+
+    const [matches] = await db.execute(`
+      SELECT tm.*,
+             p1.username as player1_username,
+             p2.username as player2_username,
+             w.username as winner_username
+      FROM tournament_matches tm
+      LEFT JOIN users p1 ON tm.player1_id = p1.id
+      LEFT JOIN users p2 ON tm.player2_id = p2.id
+      LEFT JOIN users w ON tm.winner_id = w.id
+      WHERE tm.tournament_id = ?
+      ORDER BY tm.round_number ASC, tm.id ASC
+    `, [id]);
+
+    console.log('✅ Found', matches.length, 'matches');
+
+    res.json({
+      success: true,
+      matches: matches || [],
+      tournament_id: id
+    });
+
+  } catch (error) {
+    console.error('❌ Get matches error:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Failed to fetch matches' 
+    });
+  }
+});
+// ==================== ADMIN MONITORING ====================
+
+// GET /api/admin/monitored-tournaments - Get tournaments with admin monitoring
+router.get('/monitored-tournaments', authenticateAdmin, async (req, res) => {
+  try {
+    console.log('🛡️ Admin: Fetching monitored tournaments');
+
+    const [tournaments] = await db.execute(`
+      SELECT t.*, 
+             u.username as creator_name,
+             COUNT(DISTINCT tp.id) as participants_count,
+             COUNT(DISTINCT aml.id) as log_count
+      FROM tournaments t
+      JOIN users u ON t.creator_id = u.id
+      LEFT JOIN tournament_participants tp ON t.id = tp.tournament_id 
+        AND tp.status = 'joined'
+      LEFT JOIN admin_monitoring_logs aml ON t.id = aml.tournament_id
+      WHERE t.admin_monitoring = 1
+      GROUP BY t.id
+      ORDER BY t.created_at DESC
+    `);
+
+    res.json({
+      success: true,
+      tournaments: tournaments || [],
+      count: tournaments.length
+    });
+
+  } catch (error) {
+    console.error('❌ Get monitored tournaments error:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Failed to fetch monitored tournaments'
+    });
+  }
+});
+
+// GET /api/admin/tournaments/:id/monitoring-logs - Get monitoring logs for tournament
+router.get('/tournaments/:id/monitoring-logs', authenticateAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    console.log('📝 Admin: Fetching monitoring logs for tournament:', id);
+
+    const [logs] = await db.execute(`
+      SELECT aml.*, 
+             u.username as admin_name,
+             t.name as tournament_name
+      FROM admin_monitoring_logs aml
+      JOIN users u ON aml.admin_id = u.id
+      JOIN tournaments t ON aml.tournament_id = t.id
+      WHERE aml.tournament_id = ?
+      ORDER BY aml.created_at DESC
+      LIMIT 100
+    `, [id]);
+
+    res.json({
+      success: true,
+      logs: logs || [],
+      tournament_id: id,
+      count: logs.length
+    });
+
+  } catch (error) {
+    console.error('❌ Get monitoring logs error:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Failed to fetch monitoring logs'
+    });
+  }
+});
+
+// GET /api/admin/tournaments/:id/monitoring-stats - Get monitoring statistics
+router.get('/tournaments/:id/monitoring-stats', authenticateAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const [stats] = await db.execute(`
+      SELECT 
+        COUNT(*) as total_actions,
+        SUM(CASE WHEN action_type = 'resolved_dispute' THEN 1 ELSE 0 END) as disputes_resolved,
+        SUM(CASE WHEN action_type = 'overrode_result' THEN 1 ELSE 0 END) as results_overridden,
+        SUM(CASE WHEN action_type = 'distributed_prize' THEN 1 ELSE 0 END) as prizes_distributed,
+        SUM(CASE WHEN action_type = 'warned_player' THEN 1 ELSE 0 END) as warnings_issued,
+        COUNT(DISTINCT admin_id) as unique_admins,
+        MIN(created_at) as first_action,
+        MAX(created_at) as last_action
+      FROM admin_monitoring_logs 
+      WHERE tournament_id = ?
+    `, [id]);
+
+    res.json({
+      success: true,
+      stats: stats[0] || {
+        total_actions: 0,
+        disputes_resolved: 0,
+        results_overridden: 0,
+        prizes_distributed: 0,
+        warnings_issued: 0,
+        unique_admins: 0
+      },
+      tournament_id: id
+    });
+
+  } catch (error) {
+    console.error('❌ Get monitoring stats error:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Failed to fetch monitoring statistics'
+    });
+  }
+});
+// Add to admin.js after existing endpoints
+
+// ==================== SYSTEM MAINTENANCE ENDPOINTS ====================
+
+// GET /api/admin/maintenance/health - System health check
+router.get('/maintenance/health', authenticateAdmin, async (req, res) => {
+  try {
+    console.log('🔧 Checking system health');
+    
+    // Check database connection
+    let dbStatus = 'disconnected';
+    try {
+      await db.execute('SELECT 1');
+      dbStatus = 'connected';
+    } catch (dbError) {
+      console.error('Database connection error:', dbError);
+    }
+
+    // Check API status (simple ping)
+    const apiStatus = 'online'; // Assuming API is running
+    
+    // Check cache status (simplified)
+    const cacheStatus = 'active';
+    
+    // Simulate server load check
+    const loads = ['low', 'normal', 'high'];
+    const serverLoad = loads[Math.floor(Math.random() * loads.length)];
+
+    res.json({
+      success: true,
+      health: {
+        api_status: apiStatus,
+        database_status: dbStatus,
+        cache_status: cacheStatus,
+        server_load: serverLoad,
+        timestamp: new Date().toISOString()
+      }
+    });
+
+  } catch (error) {
+    console.error('❌ Health check error:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Health check failed' 
+    });
+  }
+});
+
+// POST /api/admin/broadcast-message - Send message to all users
+router.post('/broadcast-message', authenticateAdmin, async (req, res) => {
+  try {
+    const { message } = req.body;
+    const adminId = req.admin.id;
+
+    if (!message || message.trim() === '') {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Message is required' 
+      });
+    }
+
+    console.log('📢 Broadcasting in-app message to all users:', message);
+
+    // Get all active users
+    const [users] = await db.execute(
+      'SELECT id FROM users WHERE account_status = "active" AND is_banned = 0'
+    );
+
+    let usersNotified = 0;
+    
+    // Create notifications for all users
+    for (const user of users) {
+      try {
+        await db.execute(
+          `INSERT INTO notifications 
+           (user_id, sender_id, message, type, status, created_at) 
+           VALUES (?, ?, ?, 'system', 'unread', NOW())`,
+          [user.id, adminId, message]
+        );
+        usersNotified++;
+      } catch (error) {
+        console.warn(`⚠️ Could not notify user ${user.id}:`, error.message);
+      }
+    }
+
+    // Log activity
+    await db.execute(
+      `INSERT INTO admin_activity_logs 
+       (admin_id, action_type, description) 
+       VALUES (?, 'broadcast', 'Sent in-app message to all users')`,
+      [adminId]
+    );
+
+    res.json({
+      success: true,
+      message: 'Broadcast message sent successfully',
+      users_notified: usersNotified
+    });
+
+  } catch (error) {
+    console.error('❌ Broadcast message error:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Failed to broadcast message' 
+    });
+  }
+});
+// GET /api/admin/games - Get all games
+router.get('/games', authenticateAdmin, async (req, res) => {
+  try {
+    const { category, is_active, search = '' } = req.query;
+    
+    console.log('🎮 Admin: Fetching games - Category:', category, 'Search:', search);
+
+    let query = 'SELECT * FROM games WHERE 1=1';
+    const params = [];
+
+    if (category && category !== 'all') {
+      query += ' AND category = ?';
+      params.push(category);
+    }
+    
+    if (is_active !== undefined) {
+      query += ' AND is_active = ?';
+      params.push(is_active === 'true' ? 1 : 0);
+    }
+    
+    if (search.trim() !== '') {
+      query += ' AND name LIKE ?';
+      params.push(`%${search.trim()}%`);
+    }
+    
+    query += ' ORDER BY name ASC';
+
+    const [games] = await db.execute(query, params);
+
+    res.json({
+      success: true,
+      games,
+      count: games.length
+    });
+
+  } catch (error) {
+    console.error('❌ Get games error:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Failed to fetch games' 
+    });
+  }
+});
+
+// POST /api/admin/games - Add new game
+router.post('/games', authenticateAdmin, async (req, res) => {
+  try {
+    const { 
+      name, 
+      category = 'other', 
+      min_players = 2, 
+      max_players = 10, 
+      platforms = 'PC,Console,Mobile',
+      description = '',
+      icon_url = null
+    } = req.body;
+    const adminId = req.admin.id;
+
+    if (!name || name.trim() === '') {
+      return res.status(400).json({
+        success: false,
+        message: 'Game name is required'
+      });
+    }
+
+    console.log('🎮 Admin: Adding new game:', name);
+
+    // Check if game already exists
+    const [existingGames] = await db.execute(
+      'SELECT id FROM games WHERE name = ?',
+      [name.trim()]
+    );
+
+    if (existingGames.length > 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'Game already exists'
+      });
+    }
+
+    // Insert new game
+    const [result] = await db.execute(
+      `INSERT INTO games 
+       (name, category, min_players, max_players, platforms, description, icon_url) 
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [
+        name.trim(),
+        category,
+        parseInt(min_players),
+        parseInt(max_players),
+        platforms,
+        description,
+        icon_url
+      ]
+    );
+
+    // Log activity
+    await db.execute(
+      `INSERT INTO admin_activity_logs 
+       (admin_id, action_type, description) 
+       VALUES (?, 'game_add', ?)`,
+      [adminId, `Added new game: ${name}`]
+    );
+
+    res.json({
+      success: true,
+      message: 'Game added successfully',
+      game_id: result.insertId
+    });
+
+  } catch (error) {
+    console.error('❌ Add game error:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Failed to add game' 
+    });
+  }
+});
+
+// PUT /api/admin/games/:id - Update game
+router.put('/games/:id', authenticateAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const gameData = req.body;
+    const adminId = req.admin.id;
+
+    console.log('🎮 Admin: Updating game ID:', id, 'Data:', gameData);
+
+    // Check if game exists
+    const [games] = await db.execute(
+      'SELECT id, name FROM games WHERE id = ?',
+      [id]
+    );
+
+    if (games.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'Game not found'
+      });
+    }
+
+    // Build update query dynamically
+    const updateFields = [];
+    const updateValues = [];
+    
+    const allowedFields = [
+      'name', 'category', 'min_players', 'max_players', 
+      'platforms', 'description', 'icon_url', 'is_active'
+    ];
+
+    for (const field of allowedFields) {
+      if (field in gameData) {
+        updateFields.push(`${field} = ?`);
+        updateValues.push(gameData[field]);
+      }
+    }
+
+    if (updateFields.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'No valid fields to update'
+      });
+    }
+
+    updateValues.push(id);
+
+    const updateQuery = `
+      UPDATE games 
+      SET ${updateFields.join(', ')}, updated_at = NOW()
+      WHERE id = ?
+    `;
+
+    await db.execute(updateQuery, updateValues);
+
+    // Log activity
+    await db.execute(
+      `INSERT INTO admin_activity_logs 
+       (admin_id, action_type, description) 
+       VALUES (?, 'game_update', ?)`,
+      [adminId, `Updated game #${id}`]
+    );
+
+    res.json({
+      success: true,
+      message: 'Game updated successfully'
+    });
+
+  } catch (error) {
+    console.error('❌ Update game error:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Failed to update game' 
+    });
+  }
+});
+
+// DELETE /api/admin/games/:id - Delete game
+router.delete('/games/:id', authenticateAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const adminId = req.admin.id;
+
+    console.log('🎮 Admin: Deleting game ID:', id);
+
+    // Check if game exists
+    const [games] = await db.execute(
+      'SELECT name FROM games WHERE id = ?',
+      [id]
+    );
+
+    if (games.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'Game not found'
+      });
+    }
+
+    const gameName = games[0].name;
+
+    // Soft delete (deactivate) instead of hard delete
+    await db.execute(
+      'UPDATE games SET is_active = 0, updated_at = NOW() WHERE id = ?',
+      [id]
+    );
+
+    // Log activity
+    await db.execute(
+      `INSERT INTO admin_activity_logs 
+       (admin_id, action_type, description) 
+       VALUES (?, 'game_delete', ?)`,
+      [adminId, `Deleted game: ${gameName}`]
+    );
+
+    res.json({
+      success: true,
+      message: 'Game deleted successfully'
+    });
+
+  } catch (error) {
+    console.error('❌ Delete game error:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Failed to delete game' 
+    });
+  }
+});
+
+// POST /api/admin/factory-reset - Reset all settings to defaults
+router.post('/factory-reset', authenticateAdmin, async (req, res) => {
+  try {
+    const adminId = req.admin.id;
+    const { backup = true } = req.body;
+
+    console.log('🏭 Admin performing factory reset', { backup, adminId });
+
+    // Create backup if requested
+    if (backup) {
+      await db.execute(
+        `INSERT INTO settings_backup (admin_id, settings_data) 
+         SELECT ?, JSON_OBJECTAGG(setting_key, setting_value) 
+         FROM system_settings`,
+        [adminId]
+      );
+      console.log('✅ Settings backup created');
+    }
+
+    // Define default settings
+    const defaultSettings = {
+      'platformName': 'Xperience',
+      'platformCurrency': 'NGN',
+      'sessionTimeout': '15',
+      'minDepositAmount': '500',
+      'maxDepositAmount': '100000',
+      'minWithdrawalAmount': '1000',
+      'maxWithdrawalAmount': '100000',
+      'withdrawalLimitDaily': '1',
+      'withdrawalLimitWeekly': '3',
+      'withdrawalLimitMonthly': '11',
+      'enableUSD': 'false',
+      'enableEUR': 'false',
+      'enableGBP': 'false',
+      'enableRegistration': 'true',
+      'requireEmailVerification': 'false',
+      'defaultUserRank': 'E',
+      'maxLoginAttempts': '5',
+      'requireProfileCompletion': 'true',
+      'allowMultipleDevices': 'false',
+      'minMatchStakePercentage': '15',
+      'emailNotifications': 'true',
+      'pushNotifications': 'true',
+      'adminAlerts': 'true',
+      'systemAnnouncements': 'true',
+      'enable2FA': 'false',
+      'requireTransactionPIN': 'true',
+      'enforceStrongPasswords': 'true',
+      'sessionEncryption': 'true',
+      'ipWhitelisting': 'false',
+      'maintenanceMode': 'false',
+      'backupFrequency': 'daily',
+      'logRetentionDays': '30',
+      'cacheEnabled': 'true'
+    };
+
+    // Clear all existing settings
+    await db.execute('DELETE FROM system_settings');
+
+    // Insert default settings
+    for (const [key, value] of Object.entries(defaultSettings)) {
+      await db.execute(
+        `INSERT INTO system_settings (setting_key, setting_value, updated_by) 
+         VALUES (?, ?, ?)`,
+        [key, value, adminId]
+      );
+    }
+
+    // Reset XP rates to defaults
+    await db.execute('DELETE FROM xp_rates');
+    const defaultXpRates = [
+      ['NGN', 25, 1000, 1, '25 XP per 1000 NGN'],
+      ['USD', 25, 1.20, 0, '25 XP per 1.2 USD'],
+      ['EUR', 25, 1.10, 0, '25 XP per 1.1 EUR'],
+      ['GBP', 25, 0.90, 0, '25 XP per 0.9 GBP']
+    ];
+
+    for (const rate of defaultXpRates) {
+      await db.execute(
+        `INSERT INTO xp_rates (currency, xp_per_unit, unit_amount, is_active, description) 
+         VALUES (?, ?, ?, ?, ?)`,
+        rate
+      );
+    }
+
+    // Log activity
+    await db.execute(
+      `INSERT INTO admin_activity_logs 
+       (admin_id, action_type, description) 
+       VALUES (?, 'factory_reset', 'Performed factory reset of all settings')`,
+      [adminId]
+    );
+
+    console.log('✅ Factory reset completed');
+
+    res.json({
+      success: true,
+      message: 'Factory reset completed successfully',
+      backup_created: backup
+    });
+
+  } catch (error) {
+    console.error('❌ Factory reset error:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Factory reset failed' 
+    });
+  }
+});
+
+// POST /api/admin/factory-reset/undo - Restore from last backup
+router.post('/factory-reset/undo', authenticateAdmin, async (req, res) => {
+  try {
+    const adminId = req.admin.id;
+
+    console.log('↩️ Admin undoing factory reset', { adminId });
+
+    // Get latest backup
+    const [backups] = await db.execute(
+      'SELECT * FROM settings_backup ORDER BY created_at DESC LIMIT 1'
+    );
+
+    if (backups.length === 0) {
+      return res.status(404).json({ 
+        success: false, 
+        message: 'No backup found' 
+      });
+    }
+
+    const backup = backups[0];
+    const settingsData = JSON.parse(backup.settings_data);
+
+    // Clear current settings
+    await db.execute('DELETE FROM system_settings');
+
+    // Restore from backup
+    for (const [key, value] of Object.entries(settingsData)) {
+      await db.execute(
+        `INSERT INTO system_settings (setting_key, setting_value, updated_by) 
+         VALUES (?, ?, ?)`,
+        [key, value, adminId]
+      );
+    }
+
+    // Log activity
+    await db.execute(
+      `INSERT INTO admin_activity_logs 
+       (admin_id, action_type, description) 
+       VALUES (?, 'factory_reset_undo', 'Restored settings from backup')`,
+      [adminId]
+    );
+
+    console.log('✅ Factory reset undone');
+
+    res.json({
+      success: true,
+      message: 'Settings restored from backup'
+    });
+
+  } catch (error) {
+    console.error('❌ Undo factory reset error:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Failed to restore from backup' 
+    });
+  }
+});
+// ==================== EMAIL NOTIFICATION SYSTEM ====================
+
+// GET /api/admin/email/templates - Get email templates
+router.get('/email/templates', authenticateAdmin, async (req, res) => {
+  try {
+    console.log('📧 Fetching email templates');
+    
+    const [templates] = await db.execute(
+      'SELECT * FROM email_templates ORDER BY name'
+    );
+
+    res.json({
+      success: true,
+      templates
+    });
+
+  } catch (error) {
+    console.error('❌ Get email templates error:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Failed to fetch email templates' 
+    });
+  }
+});
+
+// POST /api/admin/email/templates - Create email template
+router.post('/email/templates', authenticateAdmin, async (req, res) => {
+  try {
+    const { name, subject, content, variables } = req.body;
+    const adminId = req.admin.id;
+
+    if (!name || !subject || !content) {
+      return res.status(400).json({
+        success: false,
+        message: 'Name, subject, and content are required'
+      });
+    }
+
+    console.log('📧 Creating email template:', name);
+
+    await db.execute(
+      `INSERT INTO email_templates (name, subject, content, variables) 
+       VALUES (?, ?, ?, ?)`,
+      [name, subject, content, variables ? JSON.stringify(variables) : null]
+    );
+
+    // Log activity
+    await db.execute(
+      `INSERT INTO admin_activity_logs 
+       (admin_id, action_type, description) 
+       VALUES (?, 'email_template_create', ?)`,
+      [adminId, `Created email template: ${name}`]
+    );
+
+    res.json({
+      success: true,
+      message: 'Email template created successfully'
+    });
+
+  } catch (error) {
+    console.error('❌ Create email template error:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Failed to create email template' 
+    });
+  }
+});
+
+// POST /api/admin/send-email-notification - Send email to users (FIXED VERSION)
+router.post('/send-email-notification', authenticateAdmin, async (req, res) => {
+  try {
+    const adminId = req.admin.id;
+    
+    console.log('📧 BACKEND FIXED: Received email notification request');
+    console.log('📧 BACKEND FIXED: Request body type:', typeof req.body);
+    console.log('📧 BACKEND FIXED: Request body:', req.body);
+    
+    // Handle both FormData and JSON
+    let subject, message, recipientType, filters, recipients;
+    
+    if (typeof req.body === 'object' && !Array.isArray(req.body)) {
+      // JSON request
+      subject = req.body.subject || '';
+      message = req.body.message || '';
+      recipientType = req.body.recipientType || req.body.sendTo || 'all';
+      recipients = Array.isArray(req.body.recipients) ? req.body.recipients : [];
+      
+      // Handle filters - could be object or JSON string
+      if (typeof req.body.filters === 'string') {
+        try {
+          filters = JSON.parse(req.body.filters);
+        } catch (e) {
+          console.log('⚠️ Could not parse filters as JSON, using empty object');
+          filters = {};
+        }
+      } else if (typeof req.body.filters === 'object') {
+        filters = req.body.filters || {};
+      } else {
+        filters = {};
+      }
+    } else {
+      // Invalid request
+      console.log('❌ Invalid request body type');
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Invalid request format' 
+      });
+    }
+    
+    console.log('📧 BACKEND FIXED: Parsed fields:', { 
+      subject, 
+      message, 
+      recipientType,
+      hasSubject: !!subject && subject.trim() !== '',
+      hasMessage: !!message && message.trim() !== '',
+      filterCount: Object.keys(filters).length,
+      recipientCount: recipients.length 
+    });
+
+    // Validate required fields
+    if (!subject || subject.trim() === '') {
+      console.log('❌ BACKEND: Validation failed: subject is empty');
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Subject is required' 
+      });
+    }
+
+    if (!message || message.trim() === '') {
+      console.log('❌ BACKEND: Validation failed: message is empty');
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Message is required' 
+      });
+    }
+
+    // Clean the values
+    const cleanSubject = subject.trim();
+    const cleanMessage = message.trim();
+
+    let userEmails = [];
+    let userIds = [];
+    
+    // Get users based on recipient type
+    if (recipientType === 'all') {
+      // Get all active users
+      const [users] = await db.execute(
+        'SELECT id, email FROM users WHERE account_status = "active" AND is_banned = 0'
+      );
+      userEmails = users.map(user => user.email);
+      userIds = users.map(user => user.id);
+      console.log(`📧 BACKEND: Found ${users.length} active users for "all"`);
+    } else if (recipientType === 'selected' && recipients.length > 0) {
+      // Get selected users
+      const placeholders = recipients.map(() => '?').join(',');
+      const [users] = await db.execute(
+        `SELECT id, email FROM users WHERE id IN (${placeholders})`,
+        recipients
+      );
+      userEmails = users.map(user => user.email);
+      userIds = users.map(user => user.id);
+      console.log(`📧 BACKEND: Found ${users.length} selected users`);
+    } else if (recipientType === 'filtered') {
+      // Build query based on filters
+      let query = 'SELECT id, email FROM users WHERE account_status = "active" AND is_banned = 0';
+      const params = [];
+      
+      if (filters.rank && filters.rank.trim() !== '') {
+        query += ' AND rank = ?';
+        params.push(filters.rank.trim());
+      }
+      
+      if (filters.status && filters.status !== 'active') {
+        query += ' AND account_status = ?';
+        params.push(filters.status);
+      }
+      
+      if (filters.minBalance) {
+        query += ' AND balance >= ?';
+        params.push(parseFloat(filters.minBalance));
+      }
+      
+      if (filters.maxBalance) {
+        query += ' AND balance <= ?';
+        params.push(parseFloat(filters.maxBalance));
+      }
+      
+      const [users] = await db.execute(query, params);
+      userEmails = users.map(user => user.email);
+      userIds = users.map(user => user.id);
+      console.log(`📧 BACKEND: Found ${users.length} filtered users`);
+    } else {
+      console.log('❌ BACKEND: Invalid recipient type or no recipients');
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Invalid recipient selection' 
+      });
+    }
+
+    if (userEmails.length === 0) {
+      console.log('❌ BACKEND: No recipients found');
+      return res.status(400).json({ 
+        success: false, 
+        message: 'No recipients found' 
+      });
+    }
+
+    console.log(`📧 BACKEND: Will send to ${userEmails.length} users`);
+
+    // Send emails
+    const emailResults = await emailService.sendToUsers(
+      userEmails,
+      cleanSubject,
+      cleanMessage
+    );
+
+    // Count successful emails
+    const sentCount = emailResults.filter(r => r.success).length;
+    const failedCount = emailResults.filter(r => !r.success).length;
+
+    // Store emails in queue for tracking
+    if (userEmails.length > 0) {
+      try {
+        // Insert all emails in batch
+        for (const email of userEmails) {
+          await db.execute(
+            `INSERT INTO email_queue 
+             (recipient_email, subject, content, status, created_at) 
+             VALUES (?, ?, ?, ?, NOW())`,
+            [email, cleanSubject, cleanMessage, sentCount > 0 ? 'sent' : 'failed']
+          );
+        }
+        console.log('📧 BACKEND: Emails logged to queue');
+      } catch (dbError) {
+        console.warn('⚠️ BACKEND: Could not log emails to queue:', dbError.message);
+      }
+    }
+
+    // ============ KEEP BROADCAST MESSAGE FEATURE ============
+    // Create in-app notifications for all users (system broadcast)
+    const broadcastMessage = `SYSTEM: ${cleanSubject} - ${cleanMessage.substring(0, 200)}${cleanMessage.length > 200 ? '...' : ''}`;
+    let broadcastCount = 0;
+    
+    if (userIds.length > 0) {
+      for (const userId of userIds) {
+        try {
+          await db.execute(
+            `INSERT INTO notifications 
+             (user_id, sender_id, message, type, status, created_at) 
+             VALUES (?, ?, ?, 'system', 'unread', NOW())`,
+            [userId, adminId, broadcastMessage]
+          );
+          broadcastCount++;
+        } catch (error) {
+          console.warn(`⚠️ BACKEND: Could not create in-app notification for user ${userId}:`, error.message);
+        }
+      }
+    }
+    // ============ END BROADCAST FEATURE ============
+
+    // Log activity
+    await db.execute(
+      `INSERT INTO admin_activity_logs 
+       (admin_id, action_type, description) 
+       VALUES (?, 'email_notification', ?)`,
+      [adminId, `Sent email to ${sentCount} users: ${cleanSubject} (${failedCount} failed)`]
+    );
+
+    console.log(`✅ BACKEND: Email notification sent to ${sentCount} users`);
+    console.log(`✅ BACKEND: In-app broadcast sent to ${broadcastCount} users`);
+
+    res.json({
+      success: true,
+      message: 'Email and in-app notification sent successfully',
+      email_results: {
+        sent: sentCount,
+        failed: failedCount,
+        total: userEmails.length
+      },
+      broadcast_results: {
+        sent: broadcastCount,
+        total: userIds.length
+      }
+    });
+
+  } catch (error) {
+    console.error('❌ BACKEND: Send email notification error:', error);
+    console.error('❌ BACKEND: Error stack:', error.stack);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Failed to send email notification',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+// GET /api/admin/email/queue - Get email queue
+router.get('/email/queue', authenticateAdmin, async (req, res) => {
+  try {
+    const { status, page = 1, limit = 20 } = req.query;
+    const offset = (page - 1) * limit;
+
+    console.log('📧 Fetching email queue - Status:', status, 'Page:', page);
+
+    let query = 'SELECT * FROM email_queue WHERE 1=1';
+    let countQuery = 'SELECT COUNT(*) as total FROM email_queue WHERE 1=1';
+    const params = [];
+    const countParams = [];
+
+    if (status && status !== 'all') {
+      query += ' AND status = ?';
+      countQuery += ' AND status = ?';
+      params.push(status);
+      countParams.push(status);
+    }
+
+    query += ' ORDER BY created_at DESC LIMIT ? OFFSET ?';
+    params.push(parseInt(limit), parseInt(offset));
+
+    const [queue] = await db.execute(query, params);
+    const [countResult] = await db.execute(countQuery, countParams);
+
+    res.json({
+      success: true,
+      queue,
+      pagination: {
+        page: parseInt(page),
+        limit: parseInt(limit),
+        total: countResult[0].total,
+        totalPages: Math.ceil(countResult[0].total / limit)
+      }
+    });
+
+  } catch (error) {
+    console.error('❌ Get email queue error:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Failed to fetch email queue' 
+    });
+  }
+});
+
+// POST /api/admin/email/test - Test email configuration
+router.post('/email/test', authenticateAdmin, async (req, res) => {
+  try {
+    const { email = req.admin.email } = req.body;
+    const adminId = req.admin.id;
+
+    console.log('🧪 Testing email configuration to:', email);
+
+    const testResult = await emailService.sendEmail(
+      email,
+      'Test Email from Xperience Platform',
+      `
+      <h1>✅ Email Test Successful!</h1>
+      <p>This is a test email from Xperience Platform.</p>
+      <p>If you received this, your email configuration is working correctly.</p>
+      <p><strong>Timestamp:</strong> ${new Date().toISOString()}</p>
+      <p><strong>Admin:</strong> ${req.admin.username}</p>
+      `
+    );
+
+    // Log activity
+    await db.execute(
+      `INSERT INTO admin_activity_logs 
+       (admin_id, action_type, description) 
+       VALUES (?, 'email_test', 'Tested email configuration')`,
+      [adminId]
+    );
+
+    res.json({
+      success: testResult.success,
+      message: testResult.success ? 'Test email sent successfully' : 'Failed to send test email',
+      result: testResult
+    });
+
+  } catch (error) {
+    console.error('❌ Test email error:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Email test failed' 
+    });
+  }
+});
+module.exports = router;

@@ -1,0 +1,69 @@
+# ==================== ENVIRONMENT FILES ====================
+.env
+.env.local
+.env.production
+.env.development
+.env.staging
+.env.test
+*.env
+
+# ==================== DEPENDENCIES ====================
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+package-lock.json
+
+# ==================== BUILD OUTPUTS ====================
+dist/
+build/
+
+# ==================== TEST FILES ====================
+*.test.js
+*.spec.js
+test-*.js
+*.check.js
+*.debug.js
+*.diagnose.js
+check-*.js
+debug-*.js
+reset-*.js
+quick-*.js
+simple-*.js
+batch-*.js
+*.bat
+*.txt
+file_structure.txt
+coverage/
+
+# ==================== UPLOADS ====================
+uploads/
+uploads/*
+!uploads/.gitkeep
+
+# ==================== LOGS ====================
+logs/
+*.log
+
+# ==================== IDE/EDITOR ====================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ==================== OS FILES ====================
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ==================== RAILWAY/VERCEL ====================
+.railway/
+.vercel/
+
+# ==================== MISC ====================
+*.bak
+*.tmp
+temp/
+tmp/
+.cache/
