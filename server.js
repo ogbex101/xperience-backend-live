@@ -1,4 +1,4 @@
-// server.js - FINAL CORRECTED VERSION WITH SUPABASE SUPPORT
+// server.js - UPDATED ENVIRONMENT LOADING
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
@@ -7,9 +7,35 @@ const helmet = require('helmet');
 const dotenv = require('dotenv');
 const path = require('path');
 
-// Load environment variables based on NODE_ENV
-const envFile = process.env.NODE_ENV === 'production' ? '.env.production' : '.env';
-require('dotenv').config({ path: path.resolve(process.cwd(), envFile) });
+// ============ ENVIRONMENT VARIABLES ============
+// In production (Railway), env vars are injected directly
+// In development, load from .env file
+if (process.env.NODE_ENV !== 'production') {
+  // We're in development - load from .env file
+  const envPath = path.resolve(process.cwd(), '.env');
+  console.log(`📝 Loading environment from: ${envPath}`);
+  require('dotenv').config({ path: envPath });
+} else {
+  console.log('🚀 Running in production mode - using Railway environment variables');
+}
+
+// Debug: Check if Supabase variables are loaded
+console.log('\n🔍 Environment Configuration Check:');
+console.log('=====================================');
+console.log(`NODE_ENV: ${process.env.NODE_ENV || 'development'}`);
+console.log(`SUPABASE_URL: ${process.env.SUPABASE_URL ? '✅ Present' : '❌ MISSING'}`);
+console.log(`SUPABASE_ANON_KEY: ${process.env.SUPABASE_ANON_KEY ? '✅ Present' : '❌ MISSING'}`);
+console.log(`SUPABASE_SERVICE_ROLE_KEY: ${process.env.SUPABASE_SERVICE_ROLE_KEY ? '✅ Present' : '❌ MISSING'}`);
+console.log('=====================================\n');
+
+if (!process.env.SUPABASE_URL || !process.env.SUPABASE_ANON_KEY) {
+  console.error('❌ CRITICAL ERROR: Supabase credentials missing!');
+  console.error('   Please check your environment variables in Railway dashboard');
+  if (process.env.NODE_ENV === 'production') {
+    // Don't exit in production - let the app try to recover
+    console.warn('⚠️ Continuing despite missing credentials - this may cause errors!');
+  }
+}
 
 // Import database with Supabase support
 const db = require('./src/config/database');
