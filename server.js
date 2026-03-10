@@ -1,4 +1,4 @@
-// server.js - UPDATED ENVIRONMENT LOADING
+// server.js - COMPLETE UPDATED VERSION WITH FIXED CORS
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
@@ -74,17 +74,54 @@ const io = new Server(server, {
 
 // ============ MIDDLEWARE ============
 
+// Define allowed origins for CORS
+const allowedOrigins = [
+  'http://localhost:5173',
+  'http://localhost:3000',
+  'http://localhost:5000',
+  'https://xperience-frontend-live-49xr.vercel.app',
+  process.env.CLIENT_URL,
+  process.env.PRODUCTION_FRONTEND_URL
+].filter(Boolean); // Remove any undefined values
+
+console.log('✅ Allowed CORS origins:', allowedOrigins);
+
 // Handle OPTIONS (preflight) requests FIRST
 app.options('*', (req, res) => {
-  res.header('Access-Control-Allow-Origin', process.env.CLIENT_URL || "http://localhost:3000");
+  const origin = req.headers.origin;
+  
+  // Check if the origin is allowed
+  if (allowedOrigins.includes(origin)) {
+    res.header('Access-Control-Allow-Origin', origin);
+  } else if (process.env.CLIENT_URL) {
+    // Fallback to CLIENT_URL env var
+    res.header('Access-Control-Allow-Origin', process.env.CLIENT_URL);
+  } else {
+    // Default fallback
+    res.header('Access-Control-Allow-Origin', 'http://localhost:5173');
+  }
+  
   res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
   res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With');
   res.header('Access-Control-Allow-Credentials', 'true');
   res.sendStatus(200);
 });
 
+// CORS middleware
 app.use(cors({
-  origin: process.env.CLIENT_URL || "http://localhost:3000",
+  origin: function(origin, callback) {
+    // Allow requests with no origin (like mobile apps or curl)
+    if (!origin) return callback(null, true);
+    
+    // Check if origin is allowed
+    if (allowedOrigins.indexOf(origin) !== -1) {
+      callback(null, true);
+    } else {
+      console.log('❌ Blocked by CORS - Origin:', origin);
+      console.log('✅ Allowed origins:', allowedOrigins);
+      callback(new Error('Not allowed by CORS'));
+    }
+  },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With']
@@ -96,6 +133,7 @@ app.use(express.urlencoded({ extended: true }));
 // Debug middleware
 app.use((req, res, next) => {
   console.log(`🌐 ${req.method} ${req.url}`);
+  console.log(`   Origin: ${req.headers.origin || 'No origin'}`);
   if (isSupabase) {
     console.log(`📊 Using Supabase (${process.env.NODE_ENV} mode)`);
   }
@@ -326,7 +364,8 @@ server.listen(PORT, () => {
   console.log('='.repeat(50));
   console.log(`📍 Environment: ${process.env.NODE_ENV || 'development'}`);
   console.log(`🗄️  Database: ${isSupabase ? 'Supabase (Cloud)' : 'PostgreSQL (Local)'}`);
-  console.log(`🌐 CORS Origin: ${process.env.CLIENT_URL || "http://localhost:3000"}`);
+  console.log(`🌐 CORS Origins:`);
+  allowedOrigins.forEach(origin => console.log(`   - ${origin}`));
   
   if (isSupabase) {
     console.log(`📡 Real-time: Supabase + Socket.IO`);
