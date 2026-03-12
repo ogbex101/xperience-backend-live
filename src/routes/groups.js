@@ -306,190 +306,62 @@ router.get('/debug/simple/:groupId', async (req, res) => {
 });
 // ==================== PUBLIC ROUTES (NO AUTH REQUIRED) ====================
 
-// Get popular groups (public only) - NO AUTH REQUIRED
 router.get('/popular', async (req, res) => {
   console.log('[GET /popular] Fetching popular groups');
   
   try {
-    if (db.isSupabase) {
-      console.log('[GET /popular] Using Supabase');
-      
-      // Get public groups (is_public = true)
-      const { data: groups, error } = await db.supabase
-        .from('groups')
-        .select(`
-          id,
-          name,
-          description,
-          game_specialty,
-          game_name,
-          is_public,
-          visibility,
-          max_members,
-          current_members,
-          created_at,
-          created_by
-        `)
-        .eq('is_public', true)
-        .order('current_members', { ascending: false })
-        .order('created_at', { ascending: false })
-        .limit(10);
-      
-      if (error) {
-        console.error('[GET /popular] Supabase error:', error);
-        throw error;
-      }
-      
-      console.log(`[GET /popular] Found ${groups?.length || 0} groups`);
-      
-      if (!groups || groups.length === 0) {
-        return res.json({ success: true, groups: [] });
-      }
-      
-      // Get creator names
-      const creatorIds = groups.map(g => g.created_by).filter(Boolean);
-      let creatorMap = {};
-      
-      if (creatorIds.length > 0) {
-        const { data: creators, error: creatorError } = await db.supabase
-          .from('users')
-          .select('id, username, profile_pic, rank')
-          .in('id', creatorIds);
-        
-        if (creatorError) {
-          console.error('[GET /popular] Error fetching creators:', creatorError);
-        } else if (creators) {
-          creatorMap = creators.reduce((acc, creator) => {
-            acc[creator.id] = creator;
-            return acc;
-          }, {});
-        }
-      }
-      
-      // Get tournament stats for each group
-      const groupsWithDetails = await Promise.all((groups || []).map(async (group) => {
-        const creator = creatorMap[group.created_by];
-        const visibilityStr = group.visibility || (group.is_public ? 'public' : 'private');
-        
-        // Get tournament stats
-        let tournamentCount = 0;
-        let winCount = 0;
-        
-        try {
-          const { data: tournaments, error: tourneyError } = await db.supabase
-            .from('group_tournaments')
-            .select(`
-              tournament_id,
-              tournaments!inner (
-                status
-              )
-            `)
-            .eq('group_id', group.id);
-          
-          if (!tourneyError && tournaments) {
-            tournamentCount = tournaments.length;
-            winCount = tournaments.filter(t => 
-              t.tournaments && t.tournaments.status === 'completed'
-            ).length;
-          }
-        } catch (tourneyError) {
-          console.error(`Error getting tournament stats for group ${group.id}:`, tourneyError);
-        }
-        
-        return {
-          id: group.id,
-          name: group.name || 'Unnamed Group',
-          description: group.description || '',
-          game_specialty: group.game_specialty || group.game_name || 'General',
-          visibility: visibilityStr,
-          max_members: Number(group.max_members) || 20,
-          current_members: Number(group.current_members) || 0,
-          created_at: group.created_at,
-          creator_id: group.created_by,
-          creator_name: creator?.username || 'Unknown',
-          creator_profile_pic: creator?.profile_pic || null,
-          creator_rank: creator?.rank || 'E',
-          member_count: Number(group.current_members) || 0,
-          tournament_participations: tournamentCount,
-          tournament_wins: winCount,
-          is_member: false
-        };
-      }));
-      
-      console.log(`[GET /popular] Returning ${groupsWithDetails.length} groups`);
-      res.json({ success: true, groups: groupsWithDetails });
-      
-    } else {
-      // PostgreSQL fallback
-      console.log('[GET /popular] Using PostgreSQL fallback');
-      
-      const result = await db.query(`
-        SELECT 
-          g.id,
-          g.name,
-          g.description,
-          COALESCE(g.game_specialty, g.game_name, 'General') AS game_specialty,
-          COALESCE(g.visibility, CASE WHEN g.is_public THEN 'public' ELSE 'private' END) AS visibility,
-          g.max_members,
-          g.current_members AS member_count,
-          g.created_at,
-          g.created_by AS creator_id,
-          u.username AS creator_name,
-          u.profile_pic AS creator_profile_pic,
-          u.rank AS creator_rank,
-          COALESCE(gt.tournament_count, 0) AS tournament_participations,
-          COALESCE(gt.win_count, 0) AS tournament_wins
-        FROM groups g
-        LEFT JOIN users u ON g.created_by = u.id
-        LEFT JOIN (
-          SELECT 
-            gt.group_id,
-            COUNT(*) AS tournament_count,
-            SUM(CASE WHEN t.status = 'completed' THEN 1 ELSE 0 END) AS win_count
-          FROM group_tournaments gt
-          LEFT JOIN tournaments t ON gt.tournament_id = t.id
-          GROUP BY gt.group_id
-        ) gt ON g.id = gt.group_id
-        WHERE g.is_public = true
-        ORDER BY g.current_members DESC, g.created_at DESC
-        LIMIT 10
-      `);
-      
-      const rows = result[0] || [];
-      
-      const safeGroups = rows.map(group => ({
-        id: group.id || 0,
-        name: group.name || 'Unnamed Group',
-        description: group.description || '',
-        game_specialty: group.game_specialty || 'General',
-        visibility: group.visibility || 'public',
-        max_members: Number(group.max_members) || 20,
-        member_count: Number(group.member_count) || 0,
-        current_members: Number(group.member_count) || 0,
-        created_at: group.created_at || new Date().toISOString(),
-        creator_id: group.creator_id || 0,
-        creator_name: group.creator_name || 'Unknown',
-        creator_profile_pic: group.creator_profile_pic || null,
-        creator_rank: group.creator_rank || 'E',
-        tournament_participations: Number(group.tournament_participations) || 0,
-        tournament_wins: Number(group.tournament_wins) || 0,
-        is_member: false
-      }));
-      
-      console.log(`[GET /popular] Returning ${safeGroups.length} groups`);
-      res.json({ success: true, groups: safeGroups });
+    if (!db.isSupabase) {
+      return res.status(500).json({ success: false, message: 'Database not configured' });
     }
+
+    const { data: groups, error } = await db.supabase
+      .from('groups')
+      .select(`
+        id,
+        name,
+        description,
+        game_specialty,
+        visibility,
+        is_public,
+        max_members,
+        current_members,
+        created_at,
+        created_by
+      `)
+      .or('visibility.eq.public,is_public.eq.true')
+      .order('current_members', { ascending: false })
+      .order('created_at', { ascending: false })
+      .limit(10);
+    
+    if (error) {
+      console.error('[GET /popular] Error:', error);
+      return res.status(500).json({ success: false, message: 'Database error' });
+    }
+    
+    // Get creator names
+    const groupsWithCreators = await Promise.all((groups || []).map(async (group) => {
+      let creatorName = 'Unknown';
+      if (group.created_by) {
+        const { data: user } = await db.supabase
+          .from('users')
+          .select('username')
+          .eq('id', group.created_by)
+          .maybeSingle();
+        if (user) creatorName = user.username;
+      }
+      
+      return {
+        ...group,
+        creator_name: creatorName,
+        member_count: group.current_members || 0
+      };
+    }));
+    
+    res.json({ success: true, groups: groupsWithCreators });
     
   } catch (error) {
     console.error('[GET /popular] Error:', error);
-    console.error('Error stack:', error.stack);
-    
-    res.status(500).json({ 
-      success: false, 
-      message: 'Internal server error',
-      error: process.env.NODE_ENV === 'development' ? error.message : 'An unexpected error occurred',
-      stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
-    });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 // Discover groups (public groups)
