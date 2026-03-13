@@ -210,7 +210,8 @@ app.use('/api/admin', adminRoutes);
 app.use('/api/games', gamesRoutes);
 
 // ============ AUTHENTICATED ROUTES ============
-
+console.log('🔧 Mounting groups routes at /api/groups');
+console.log('   groupsRoutes imported:', !!groupsRoutes);
 // 5. Groups routes with selective authentication - FIXED VERSION
 app.use('/api/groups', (req, res, next) => {
   // Get the actual path (removes /api/groups prefix)

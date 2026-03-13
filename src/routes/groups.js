@@ -4,7 +4,9 @@ const db = require('../config/database');
 const { authenticateToken } = require('../middleware/auth');
 
 // ==================== HELPER FUNCTIONS ====================
-
+console.log('🔥🔥🔥🔥🔥 GROUPS.JS IS BEING EXECUTED 🔥🔥🔥🔥🔥');
+console.log('Time:', new Date().toISOString());
+console.log('__dirname:', __dirname);
 /**
  * Check if user has permission to view group details
  */
@@ -1600,5 +1602,10 @@ router.get('/search/query', async (req, res) => {
     });
   }
 });
-
+console.log('✅ GROUPS ROUTES REGISTERED:');
+console.log('   - GET /debug-ping');
+console.log('   - GET /popular');
+console.log('   - GET /discover');
+console.log('   - GET /my-groups');
+console.log('   - POST /create');
 module.exports = router;
