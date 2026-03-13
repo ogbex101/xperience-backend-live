@@ -29,17 +29,72 @@ router.get('/health', (req, res) => {
   });
 });
 
-// Popular groups - returns empty array for testing
-router.get('/popular', (req, res) => {
-  console.log('🔥 POPULAR GROUPS: Route hit');
-  console.log('   Query params:', req.query);
-  console.log('   Headers:', req.headers['user-agent']);
+router.get('/popular', async (req, res) => {
+  console.log('[GROUPS] GET /popular');
   
-  res.json({ 
-    success: true, 
-    groups: [],
-    message: 'Popular endpoint working (test mode)'
-  });
+  try {
+    if (!db.isSupabase) {
+      return res.status(500).json({ success: false, message: 'Database not configured' });
+    }
+
+    const { data: groups, error } = await db.supabase
+      .from('groups')
+      .select(`
+        id,
+        name,
+        description,
+        game_specialty,
+        visibility,
+        is_public,
+        max_members,
+        current_members,
+        created_at,
+        created_by
+      `)
+      .or('visibility.eq.public,is_public.eq.true')
+      .order('current_members', { ascending: false })
+      .limit(10);
+    
+    if (error) {
+      console.error('[GROUPS] Popular error:', error);
+      return res.status(500).json({ success: false, message: 'Database error' });
+    }
+    
+    const groupsWithDetails = await Promise.all((groups || []).map(async (group) => {
+      let creatorName = 'Unknown';
+      if (group.created_by) {
+        const { data: creator } = await db.supabase
+          .from('users')
+          .select('username')
+          .eq('id', group.created_by)
+          .maybeSingle();
+        if (creator) creatorName = creator.username;
+      }
+      
+      return {
+        id: group.id,
+        name: group.name,
+        description: group.description || '',
+        game_specialty: group.game_specialty || 'General',
+        visibility: group.visibility || (group.is_public ? 'public' : 'private'),
+        max_members: group.max_members || 20,
+        current_members: group.current_members || 0,
+        created_at: group.created_at,
+        creator_id: group.created_by,
+        creator_name: creatorName,
+        member_count: group.current_members || 0,
+        is_member: false,
+        tournament_participations: 0,
+        tournament_wins: 0
+      };
+    }));
+    
+    res.json({ success: true, groups: groupsWithDetails });
+    
+  } catch (error) {
+    console.error('[GROUPS] Popular error:', error);
+    res.status(500).json({ success: false, message: 'Server error' });
+  }
 });
 
 // Discover groups - returns empty array for testing
@@ -52,16 +107,82 @@ router.get('/discover', (req, res) => {
   });
 });
 
-// My groups (mock data)
-router.get('/my-groups', (req, res) => {
-  console.log('👥 MY GROUPS: Route hit');
-  console.log('   User from auth:', req.user ? 'Present' : 'Not present');
+router.get('/my-groups', authenticateToken, async (req, res) => {
+  console.log('[GROUPS] GET /my-groups - User:', req.user.id);
   
-  res.json({ 
-    success: true, 
-    groups: [],
-    message: 'My groups endpoint working (test mode)'
-  });
+  try {
+    if (!db.isSupabase) {
+      return res.status(500).json({ success: false, message: 'Database not configured' });
+    }
+
+    // Get user's memberships
+    const { data: memberships, error: memberError } = await db.supabase
+      .from('group_members')
+      .select('group_id, role, status, joined_at')
+      .eq('user_id', req.user.id)
+      .eq('status', 'joined');
+    
+    if (memberError) {
+      console.error('[GROUPS] Member error:', memberError);
+      return res.status(500).json({ success: false, message: 'Database error' });
+    }
+    
+    if (!memberships || memberships.length === 0) {
+      return res.json({ success: true, groups: [] });
+    }
+    
+    // Get group details
+    const groupIds = memberships.map(m => m.group_id);
+    const { data: groups, error: groupError } = await db.supabase
+      .from('groups')
+      .select('*')
+      .in('id', groupIds);
+    
+    if (groupError) {
+      console.error('[GROUPS] Group error:', groupError);
+      return res.status(500).json({ success: false, message: 'Database error' });
+    }
+    
+    // Get creator names
+    const groupsWithDetails = await Promise.all((groups || []).map(async (group) => {
+      let creatorName = 'Unknown';
+      if (group.created_by) {
+        const { data: creator } = await db.supabase
+          .from('users')
+          .select('username')
+          .eq('id', group.created_by)
+          .maybeSingle();
+        if (creator) creatorName = creator.username;
+      }
+      
+      const membership = memberships.find(m => m.group_id === group.id);
+      
+      return {
+        id: group.id,
+        name: group.name,
+        description: group.description || '',
+        game_specialty: group.game_specialty || 'General',
+        visibility: group.visibility || (group.is_public ? 'public' : 'private'),
+        max_members: group.max_members || 20,
+        current_members: group.current_members || 0,
+        created_at: group.created_at,
+        creator_id: group.created_by,
+        creator_name: creatorName,
+        member_count: group.current_members || 0,
+        role: membership?.role || 'member',
+        joined_at: membership?.joined_at,
+        is_member: true,
+        tournament_participations: 0,
+        tournament_wins: 0
+      };
+    }));
+    
+    res.json({ success: true, groups: groupsWithDetails });
+    
+  } catch (error) {
+    console.error('[GROUPS] My groups error:', error);
+    res.status(500).json({ success: false, message: 'Server error' });
+  }
 });
 
 // Create group (mock)
