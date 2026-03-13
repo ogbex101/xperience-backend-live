@@ -211,16 +211,33 @@ app.use('/api/games', gamesRoutes);
 
 // ============ AUTHENTICATED ROUTES ============
 
-// 5. Groups routes with selective authentication
+// 5. Groups routes with selective authentication - FIXED VERSION
 app.use('/api/groups', (req, res, next) => {
-  const publicRoutes = ['/popular', '/discover'];
-  const isPublicRoute = publicRoutes.some(route => req.path.includes(route));
+  // Get the actual path (removes /api/groups prefix)
+  const fullPath = req.path;
+  console.log(`🔍 Groups access: ${req.method} ${fullPath}`);
+  
+  // Define ALL public routes that DON'T need authentication
+  const publicRoutes = [
+    '/popular', 
+    '/discover', 
+    '/health', 
+    '/debug-ping',
+    '/debug-check'
+  ];
+  
+  // Check if this is a public route
+  const isPublicRoute = publicRoutes.some(route => 
+    fullPath === route || fullPath.startsWith(route + '/')
+  );
   
   if (isPublicRoute) {
-    console.log(`✅ Skipping auth for public route: ${req.path}`);
+    console.log(`✅ Public route - no auth required: ${fullPath}`);
     return next();
   }
   
+  // For all other routes (create, my-groups, etc.), require authentication
+  console.log(`🔒 Protected route - auth required: ${fullPath}`);
   authenticateToken(req, res, next);
 }, groupsRoutes);
 
