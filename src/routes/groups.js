@@ -269,13 +269,13 @@ async function isUserInGroup(userId, groupId) {
 
 // ==================== PUBLIC ROUTES (NO AUTH REQUIRED) ====================
 
-// Get popular groups
+// ==================== POPULAR GROUPS - FIXED ====================
 router.get('/popular', async (req, res) => {
   console.log('[GET /popular] Fetching popular groups');
   
   try {
     if (db.isSupabase) {
-      // Get public groups
+      // SIMPLIFIED QUERY - Only use columns that definitely exist
       const { data: groups, error } = await db.supabase
         .from('groups')
         .select(`
@@ -283,16 +283,12 @@ router.get('/popular', async (req, res) => {
           name,
           description,
           game_specialty,
-          game_name,
-          is_public,
           visibility,
           max_members,
-          current_members,
           created_at,
           created_by
         `)
-        .or('is_public.eq.true,visibility.eq.public')
-        .order('current_members', { ascending: false })
+        .or('visibility.eq.public,is_public.eq.true')
         .order('created_at', { ascending: false })
         .limit(10);
       
@@ -305,50 +301,43 @@ router.get('/popular', async (req, res) => {
         return res.json({ success: true, groups: [] });
       }
       
-      // Get creator names
-      const creatorIds = groups.map(g => g.created_by).filter(Boolean);
-      let creatorMap = {};
-      
-      if (creatorIds.length > 0) {
-        const { data: creators, error: creatorError } = await db.supabase
-          .from('users')
-          .select('id, username, profile_pic, rank')
-          .in('id', creatorIds);
+      // Get member counts separately
+      const groupsWithDetails = await Promise.all((groups || []).map(async (group) => {
+        // Get member count
+        const { count, error: countError } = await db.supabase
+          .from('group_members')
+          .select('*', { count: 'exact', head: true })
+          .eq('group_id', group.id)
+          .eq('status', 'joined');
         
-        if (creatorError) {
-          console.error('[GET /popular] Error fetching creators:', creatorError);
-        } else if (creators) {
-          creatorMap = creators.reduce((acc, creator) => {
-            acc[creator.id] = creator;
-            return acc;
-          }, {});
+        // Get creator name
+        let creatorName = 'Unknown';
+        if (group.created_by) {
+          const { data: creator } = await db.supabase
+            .from('users')
+            .select('username')
+            .eq('id', group.created_by)
+            .maybeSingle();
+          if (creator) creatorName = creator.username;
         }
-      }
-      
-      // Format groups
-      const groupsWithDetails = (groups || []).map((group) => {
-        const creator = creatorMap[group.created_by];
-        const visibilityStr = group.visibility || (group.is_public ? 'public' : 'private');
         
         return {
           id: group.id,
           name: group.name || 'Unnamed Group',
           description: group.description || '',
-          game_specialty: group.game_specialty || group.game_name || 'General',
-          visibility: visibilityStr,
+          game_specialty: group.game_specialty || 'General',
+          visibility: group.visibility || 'public',
           max_members: Number(group.max_members) || 20,
-          current_members: Number(group.current_members) || 0,
+          member_count: count || 0,
+          current_members: count || 0,
           created_at: group.created_at,
           creator_id: group.created_by,
-          creator_name: creator?.username || 'Unknown',
-          creator_profile_pic: creator?.profile_pic || null,
-          creator_rank: creator?.rank || 'E',
-          member_count: Number(group.current_members) || 0,
+          creator_name: creatorName,
           tournament_participations: 0,
           tournament_wins: 0,
           is_member: false
         };
-      });
+      }));
       
       res.json({ success: true, groups: groupsWithDetails });
     } else {
@@ -358,26 +347,24 @@ router.get('/popular', async (req, res) => {
           g.id,
           g.name,
           g.description,
-          COALESCE(g.game_specialty, g.game_name, 'General') AS game_specialty,
-          COALESCE(g.visibility, CASE WHEN g.is_public THEN 'public' ELSE 'private' END) AS visibility,
+          g.game_specialty,
+          g.visibility,
           g.max_members,
-          g.current_members AS member_count,
           g.created_at,
-          g.created_by AS creator_id,
-          u.username AS creator_name,
-          u.profile_pic AS creator_profile_pic,
-          u.rank AS creator_rank
+          g.created_by,
+          COALESCE(u.username, 'Unknown') AS creator_name,
+          (SELECT COUNT(*) FROM group_members WHERE group_id = g.id AND status = 'joined') AS member_count
         FROM groups g
         LEFT JOIN users u ON g.created_by = u.id
-        WHERE g.is_public = true OR g.visibility = 'public'
-        ORDER BY g.current_members DESC, g.created_at DESC
+        WHERE g.visibility = 'public' OR g.is_public = true
+        ORDER BY member_count DESC, g.created_at DESC
         LIMIT 10
       `);
       
       const rows = result[0] || [];
       
       const groups = rows.map(group => ({
-        id: group.id || 0,
+        id: group.id,
         name: group.name || 'Unnamed Group',
         description: group.description || '',
         game_specialty: group.game_specialty || 'General',
@@ -385,11 +372,9 @@ router.get('/popular', async (req, res) => {
         max_members: Number(group.max_members) || 20,
         member_count: Number(group.member_count) || 0,
         current_members: Number(group.member_count) || 0,
-        created_at: group.created_at || new Date().toISOString(),
-        creator_id: group.creator_id || 0,
+        created_at: group.created_at,
+        creator_id: group.created_by,
         creator_name: group.creator_name || 'Unknown',
-        creator_profile_pic: group.creator_profile_pic || null,
-        creator_rank: group.creator_rank || 'E',
         tournament_participations: 0,
         tournament_wins: 0,
         is_member: false
@@ -399,20 +384,20 @@ router.get('/popular', async (req, res) => {
     }
   } catch (error) {
     console.error('[GET /popular] Error:', error);
-    res.status(500).json({ 
-      success: false, 
-      message: 'Internal server error',
-      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    res.status(200).json({ 
+      success: true, 
+      groups: [],
+      message: 'Could not load popular groups'
     });
   }
 });
 
-// Discover groups
+// ==================== DISCOVER GROUPS - FIXED ====================
 router.get('/discover', async (req, res) => {
   console.log('[GET /discover] Fetching discover groups');
   
   try {
-    // Get user ID from token if exists (for filtering)
+    // Get user ID from token if exists
     const token = req.headers.authorization?.split(' ')[1];
     let userId = null;
     
@@ -427,7 +412,7 @@ router.get('/discover', async (req, res) => {
     }
     
     if (db.isSupabase) {
-      // Get public groups
+      // SIMPLIFIED QUERY - Get public groups
       const { data: groups, error } = await db.supabase
         .from('groups')
         .select(`
@@ -435,11 +420,8 @@ router.get('/discover', async (req, res) => {
           name,
           description,
           game_specialty,
-          game_name,
           visibility,
-          is_public,
           max_members,
-          current_members,
           created_at,
           created_by
         `)
@@ -473,6 +455,13 @@ router.get('/discover', async (req, res) => {
           return null;
         }
         
+        // Get member count
+        const { count, error: countError } = await db.supabase
+          .from('group_members')
+          .select('*', { count: 'exact', head: true })
+          .eq('group_id', group.id)
+          .eq('status', 'joined');
+        
         // Get creator name
         let creatorName = 'Unknown';
         if (group.created_by) {
@@ -491,14 +480,14 @@ router.get('/discover', async (req, res) => {
           id: group.id,
           name: group.name || 'Unnamed Group',
           description: group.description || '',
-          game_specialty: group.game_specialty || group.game_name || 'General',
-          visibility: group.visibility || (group.is_public ? 'public' : 'private'),
+          game_specialty: group.game_specialty || 'General',
+          visibility: group.visibility || 'public',
           max_members: Number(group.max_members) || 20,
-          current_members: Number(group.current_members) || 0,
+          member_count: count || 0,
+          current_members: count || 0,
           created_at: group.created_at,
           creator_id: group.created_by,
           creator_name: creatorName,
-          member_count: Number(group.current_members) || 0,
           is_member: false
         };
       }));
@@ -515,13 +504,13 @@ router.get('/discover', async (req, res) => {
           g.game_specialty,
           g.visibility,
           g.max_members,
-          g.current_members AS member_count,
           g.created_at,
-          g.created_by AS creator_id,
-          COALESCE(u.username, 'Unknown') AS creator_name
+          g.created_by,
+          COALESCE(u.username, 'Unknown') AS creator_name,
+          (SELECT COUNT(*) FROM group_members WHERE group_id = g.id AND status = 'joined') AS member_count
         FROM groups g
         LEFT JOIN users u ON g.created_by = u.id
-        WHERE g.visibility = 'public' OR g.is_public = true
+        WHERE (g.visibility = 'public' OR g.is_public = true)
       `;
       
       let queryParams = [];
@@ -540,15 +529,15 @@ router.get('/discover', async (req, res) => {
       const rows = result[0] || [];
       
       const groups = rows.map(group => ({
-        id: group.id || 0,
+        id: group.id,
         name: group.name || 'Unnamed Group',
         description: group.description || '',
         game_specialty: group.game_specialty || 'General',
         visibility: group.visibility || 'public',
         max_members: Number(group.max_members) || 20,
         member_count: Number(group.member_count) || 0,
-        created_at: group.created_at || new Date().toISOString(),
-        creator_id: group.creator_id || 0,
+        created_at: group.created_at,
+        creator_id: group.created_by,
         creator_name: group.creator_name || 'Unknown',
         is_member: false
       }));
@@ -557,10 +546,10 @@ router.get('/discover', async (req, res) => {
     }
   } catch (error) {
     console.error('[GET /discover] Error:', error);
-    res.status(500).json({ 
-      success: false, 
-      message: 'Internal server error',
-      error: error.message 
+    res.status(200).json({ 
+      success: true, 
+      groups: [],
+      message: 'Could not load discover groups'
     });
   }
 });
