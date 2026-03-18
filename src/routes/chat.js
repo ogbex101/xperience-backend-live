@@ -25,52 +25,64 @@ router.get('/history/:userId', async (req, res) => {
       });
     }
     
-    // Verify friendship
-    const { data: friendship, error: friendError } = await client
+    // FIXED: Check friendship without using .single() or .maybeSingle()
+    // Use .select() without expecting a single row - handle multiple rows
+    const { data: friendships, error: friendError } = await client
       .from('friends')
       .select('*')
       .or(`and(user_id.eq.${userId},friend_id.eq.${otherUserId}),and(user_id.eq.${otherUserId},friend_id.eq.${userId})`)
-      .eq('status', 'accepted')
-      .maybeSingle();
+      .eq('status', 'accepted');
     
     if (friendError) {
       console.error('Error checking friendship:', friendError);
     }
     
-    if (!friendship) {
+    // Check if ANY friendship exists (there might be 2 rows - one in each direction)
+    const isFriend = friendships && friendships.length > 0;
+    
+    if (!isFriend) {
       return res.status(403).json({ 
         success: false, 
         message: 'You can only chat with friends' 
       });
     }
     
-    // Get messages
-    const { data: messages, error: messagesError } = await client
-      .from('chat_messages')
-      .select(`
-        *,
-        sender:user_id (
-          username,
-          profile_pic
-        )
-      `)
-      .or(`and(user_id.eq.${userId},room_id.eq.${otherUserId}),and(user_id.eq.${otherUserId},room_id.eq.${userId})`)
-      .order('created_at', { ascending: true })
-      .limit(100);
+    // Get messages - FIXED: Use the correct query based on your schema
+    // Looking at your logs, you're using chat_messages table with room_id
+    let messages = [];
     
-    if (messagesError) {
-      console.error('Error fetching messages:', messagesError);
+    // Get the room ID first (from chat_rooms table)
+    const { data: rooms, error: roomError } = await client
+      .from('chat_rooms')
+      .select('id')
+      .or(`and(user1_id.eq.${userId},user2_id.eq.${otherUserId}),and(user1_id.eq.${otherUserId},user2_id.eq.${userId})`);
+    
+    if (roomError) {
+      console.error('Error finding room:', roomError);
+    }
+    
+    if (rooms && rooms.length > 0) {
+      const roomId = rooms[0].id;
       
-      if (messagesError.message && messagesError.message.includes('relation "chat_messages" does not exist')) {
-        return res.json({ 
-          success: true, 
-          messages: [],
-          count: 0,
-          message: 'No messages yet'
-        });
+      // Get messages for this room
+      const { data: roomMessages, error: messagesError } = await client
+        .from('chat_messages')
+        .select(`
+          *,
+          sender:user_id (
+            username,
+            profile_pic
+          )
+        `)
+        .eq('room_id', roomId)
+        .order('created_at', { ascending: true })
+        .limit(100);
+      
+      if (messagesError) {
+        console.error('Error fetching messages:', messagesError);
+      } else {
+        messages = roomMessages || [];
       }
-      
-      throw messagesError;
     }
     
     // Format messages
@@ -102,12 +114,13 @@ router.get('/history/:userId', async (req, res) => {
       read_status: msg.is_read || false
     }));
     
-    // Mark messages as read
-    if (formattedMessages.length > 0) {
+    // Mark messages as read (if you want this feature)
+    if (formattedMessages.length > 0 && rooms && rooms.length > 0) {
+      const roomId = rooms[0].id;
       const { error: updateError } = await client
         .from('chat_messages')
         .update({ is_read: true })
-        .eq('room_id', otherUserId)
+        .eq('room_id', roomId)
         .eq('user_id', otherUserId)
         .eq('is_read', false);
       
@@ -139,7 +152,12 @@ router.post('/send', async (req, res) => {
     const senderId = req.user.id;
     const client = getClient();
     
-    console.log('📤 Send message request:', { senderId, receiverId, groupId, message: message?.substring(0, 50) });
+    console.log('📤 Send message request:', { 
+      senderId, 
+      receiverId, 
+      groupId, 
+      message: message?.substring(0, 50) 
+    });
     
     if (!message || message.trim() === '') {
       return res.status(400).json({ 
@@ -151,18 +169,20 @@ router.post('/send', async (req, res) => {
     const trimmedMessage = message.trim();
     
     if (receiverId) {
-      const { data: friendship, error: friendError } = await client
+      // FIXED: Check friendship without using .single()
+      const { data: friendships, error: friendError } = await client
         .from('friends')
         .select('*')
         .or(`and(user_id.eq.${senderId},friend_id.eq.${receiverId}),and(user_id.eq.${receiverId},friend_id.eq.${senderId})`)
-        .eq('status', 'accepted')
-        .maybeSingle();
+        .eq('status', 'accepted');
       
       if (friendError) {
         console.error('Error checking friendship:', friendError);
       }
       
-      if (!friendship) {
+      const isFriend = friendships && friendships.length > 0;
+      
+      if (!isFriend) {
         return res.status(403).json({ 
           success: false, 
           message: 'You can only chat with friends' 
@@ -171,19 +191,21 @@ router.post('/send', async (req, res) => {
     }
     
     if (groupId) {
-      const { data: membership, error: memberError } = await client
+      // Check group membership
+      const { data: memberships, error: memberError } = await client
         .from('group_members')
         .select('id')
         .eq('group_id', groupId)
         .eq('user_id', senderId)
-        .eq('status', 'joined')
-        .maybeSingle();
+        .eq('status', 'joined');
       
       if (memberError) {
         console.error('Error checking group membership:', memberError);
       }
       
-      if (!membership) {
+      const isMember = memberships && memberships.length > 0;
+      
+      if (!isMember) {
         return res.status(403).json({ 
           success: false, 
           message: 'You are not a member of this group' 
@@ -191,24 +213,83 @@ router.post('/send', async (req, res) => {
       }
     }
     
+    // Get sender info
     const { data: sender, error: senderError } = await client
       .from('users')
       .select('username, profile_pic')
       .eq('id', senderId)
-      .maybeSingle();
+      .single();
     
     if (senderError) {
       console.error('Error getting sender info:', senderError);
     }
     
-    const roomId = groupId || receiverId;
+    let roomId;
     
+    // Handle private message
+    if (receiverId) {
+      // Find or create chat room
+      const user1 = senderId < receiverId ? senderId : receiverId;
+      const user2 = senderId < receiverId ? receiverId : senderId;
+      
+      const { data: existingRooms, error: roomCheckError } = await client
+        .from('chat_rooms')
+        .select('id')
+        .eq('user1_id', user1)
+        .eq('user2_id', user2);
+      
+      if (roomCheckError) {
+        console.error('Error checking room:', roomCheckError);
+      }
+      
+      if (existingRooms && existingRooms.length > 0) {
+        roomId = existingRooms[0].id;
+        console.log('✅ Found existing room:', roomId);
+      } else {
+        // Create new room
+        const { data: newRoom, error: roomCreateError } = await client
+          .from('chat_rooms')
+          .insert([{
+            user1_id: user1,
+            user2_id: user2,
+            created_at: new Date().toISOString(),
+            last_message_at: new Date().toISOString()
+          }])
+          .select('id')
+          .single();
+        
+        if (roomCreateError) {
+          console.error('Error creating room:', roomCreateError);
+          throw roomCreateError;
+        }
+        
+        roomId = newRoom.id;
+        console.log('✅ Created new room:', roomId);
+      }
+      
+      // Update last_message_at in room
+      await client
+        .from('chat_rooms')
+        .update({ last_message_at: new Date().toISOString() })
+        .eq('id', roomId);
+    } else if (groupId) {
+      // Group message uses groupId as roomId
+      roomId = groupId;
+    } else {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Either receiverId or groupId is required' 
+      });
+    }
+    
+    // Insert message into chat_messages
     const messageData = {
       user_id: senderId,
       room_id: roomId,
       message: trimmedMessage,
       is_read: false,
       created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
       read_by: [],
       delivered_to: [],
       deleted_for: [],
@@ -259,7 +340,7 @@ router.get('/conversations', async (req, res) => {
     
     console.log(`📋 Fetching conversations for user ${userId}`);
     
-    // Get all friends first
+    // Get all friends
     const { data: friendships, error: friendsError } = await client
       .from('friends')
       .select('*')
@@ -279,34 +360,29 @@ router.get('/conversations', async (req, res) => {
       }
     }
     
-    // Get all messages
-    const { data: messages, error: messagesError } = await client
-      .from('chat_messages')
+    // Get chat rooms for this user
+    const { data: rooms, error: roomsError } = await client
+      .from('chat_rooms')
       .select(`
-        *,
-        sender:user_id (
-          id,
-          username,
-          profile_pic,
-          rank
+        id,
+        user1_id,
+        user2_id,
+        last_message_at,
+        messages:chat_messages(
+          message,
+          created_at,
+          user_id,
+          is_read
         )
       `)
-      .or(`user_id.eq.${userId},room_id.eq.${userId}`)
-      .order('created_at', { ascending: false });
+      .or(`user1_id.eq.${userId},user2_id.eq.${userId}`)
+      .order('last_message_at', { ascending: false });
     
-    if (messagesError) {
-      console.error('Error fetching messages:', messagesError);
-      
-      if (messagesError.message && messagesError.message.includes('relation "chat_messages" does not exist')) {
-        return res.json({ 
-          success: true, 
-          conversations: []
-        });
-      }
-      
-      throw messagesError;
+    if (roomsError) {
+      console.error('Error fetching rooms:', roomsError);
     }
     
+    // Build conversations
     const conversationMap = new Map();
     
     // Add all friends as potential conversations
@@ -330,55 +406,34 @@ router.get('/conversations', async (req, res) => {
       }
     }
     
-    // Update with message data
-    for (const msg of messages || []) {
-      let otherUserId = null;
-      if (msg.user_id === userId) {
-        otherUserId = msg.room_id;
-      } else {
-        otherUserId = msg.user_id;
+    // Update with room data
+    for (const room of rooms || []) {
+      const otherUserId = room.user1_id === userId ? room.user2_id : room.user1_id;
+      
+      if (!conversationMap.has(otherUserId)) continue;
+      
+      // Get unread count
+      const { count, error: countError } = await client
+        .from('chat_messages')
+        .select('*', { count: 'exact', head: true })
+        .eq('room_id', room.id)
+        .eq('user_id', otherUserId)
+        .eq('is_read', false);
+      
+      if (countError) {
+        console.error('Error counting unread:', countError);
       }
       
-      if (!otherUserId || otherUserId === userId) continue;
+      const conversation = conversationMap.get(otherUserId);
       
-      if (!conversationMap.has(otherUserId) || 
-          (msg.created_at && (!conversationMap.get(otherUserId).last_message_time || 
-           new Date(msg.created_at) > new Date(conversationMap.get(otherUserId).last_message_time)))) {
-        
-        const { count, error: countError } = await client
-          .from('chat_messages')
-          .select('*', { count: 'exact', head: true })
-          .eq('user_id', otherUserId)
-          .eq('room_id', userId)
-          .eq('is_read', false);
-        
-        let userInfo = conversationMap.get(otherUserId) || {};
-        
-        if (!userInfo.other_user_username) {
-          const { data: userData } = await client
-            .from('users')
-            .select('username, profile_pic, rank')
-            .eq('id', otherUserId)
-            .single();
-          
-          if (userData) {
-            userInfo = {
-              ...userInfo,
-              other_user_username: userData.username,
-              profile_pic: userData.profile_pic,
-              rank: userData.rank || 'E'
-            };
-          }
-        }
-        
-        conversationMap.set(otherUserId, {
-          ...userInfo,
-          other_user_id: otherUserId,
-          last_message: msg.message,
-          last_message_time: msg.created_at,
-          unread_count: count || 0
-        });
+      if (room.messages && room.messages.length > 0) {
+        conversation.last_message = room.messages[0].message;
+        conversation.last_message_time = room.messages[0].created_at;
       }
+      
+      conversation.unread_count = count || 0;
+      
+      conversationMap.set(otherUserId, conversation);
     }
     
     const conversations = Array.from(conversationMap.values())
@@ -432,10 +487,7 @@ router.get('/group-conversations', async (req, res) => {
       console.error('Error fetching group memberships:', memberError);
       
       if (memberError.message && memberError.message.includes('relation "group_members" does not exist')) {
-        return res.json({ 
-          success: true, 
-          groups: []
-        });
+        return res.json({ success: true, groups: [] });
       }
       
       throw memberError;
@@ -449,6 +501,7 @@ router.get('/group-conversations', async (req, res) => {
         return null;
       }
       
+      // Get last message for this group
       const { data: lastMessages, error: lastError } = await client
         .from('chat_messages')
         .select('message, created_at')
@@ -456,12 +509,13 @@ router.get('/group-conversations', async (req, res) => {
         .order('created_at', { ascending: false })
         .limit(1);
       
+      // Get unread count
       const { count, error: countError } = await client
         .from('chat_messages')
         .select('*', { count: 'exact', head: true })
         .eq('room_id', group.id)
-        .eq('is_read', false)
-        .neq('user_id', userId);
+        .neq('user_id', userId)
+        .eq('is_read', false);
       
       return {
         group_id: group.id,
@@ -508,15 +562,25 @@ router.post('/mark-read', async (req, res) => {
     console.log(`📖 Marking messages as read for user ${userId}:`, { senderId, groupId });
     
     if (senderId) {
-      const { error } = await client
-        .from('chat_messages')
-        .update({ is_read: true })
-        .eq('user_id', senderId)
-        .eq('room_id', userId)
-        .eq('is_read', false);
+      // Get room ID first
+      const { data: rooms, error: roomError } = await client
+        .from('chat_rooms')
+        .select('id')
+        .or(`and(user1_id.eq.${userId},user2_id.eq.${senderId}),and(user1_id.eq.${senderId},user2_id.eq.${userId})`);
       
-      if (error) {
-        console.error('Error marking messages as read:', error);
+      if (!roomError && rooms && rooms.length > 0) {
+        const roomId = rooms[0].id;
+        
+        const { error } = await client
+          .from('chat_messages')
+          .update({ is_read: true })
+          .eq('room_id', roomId)
+          .eq('user_id', senderId)
+          .eq('is_read', false);
+        
+        if (error) {
+          console.error('Error marking messages as read:', error);
+        }
       }
     } else if (groupId) {
       const { error } = await client
@@ -531,10 +595,7 @@ router.post('/mark-read', async (req, res) => {
       }
     }
     
-    res.json({ 
-      success: true, 
-      message: 'Messages marked as read' 
-    });
+    res.json({ success: true, message: 'Messages marked as read' });
     
   } catch (error) {
     console.error('❌ Error marking messages as read:', error);
@@ -556,19 +617,20 @@ router.get('/group/:groupId/history', async (req, res) => {
     console.log(`📜 Fetching group chat history: Group ${groupId} for user ${userId}`);
     
     // Verify group membership
-    const { data: membership, error: memberError } = await client
+    const { data: memberships, error: memberError } = await client
       .from('group_members')
       .select('id')
       .eq('group_id', groupId)
       .eq('user_id', userId)
-      .eq('status', 'joined')
-      .maybeSingle();
+      .eq('status', 'joined');
     
     if (memberError) {
       console.error('Error checking group membership:', memberError);
     }
     
-    if (!membership) {
+    const isMember = memberships && memberships.length > 0;
+    
+    if (!isMember) {
       return res.status(403).json({ 
         success: false, 
         message: 'You are not a member of this group' 
