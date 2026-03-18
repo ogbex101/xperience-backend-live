@@ -270,12 +270,13 @@ async function isUserInGroup(userId, groupId) {
 // ==================== PUBLIC ROUTES (NO AUTH REQUIRED) ====================
 
 // ==================== POPULAR GROUPS - FIXED ====================
+// Get popular groups - ULTRA SIMPLE
 router.get('/popular', async (req, res) => {
   console.log('[GET /popular] Fetching popular groups');
   
   try {
     if (db.isSupabase) {
-      // SIMPLIFIED QUERY - Only use columns that definitely exist
+      // First, get public groups with a simple query
       const { data: groups, error } = await db.supabase
         .from('groups')
         .select(`
@@ -294,17 +295,15 @@ router.get('/popular', async (req, res) => {
       
       if (error) {
         console.error('[GET /popular] Supabase error:', error);
-        throw error;
-      }
-      
-      if (!groups || groups.length === 0) {
         return res.json({ success: true, groups: [] });
       }
       
-      // Get member counts separately
-      const groupsWithDetails = await Promise.all((groups || []).map(async (group) => {
+      // Get member counts in a separate query
+      const groupsWithDetails = [];
+      
+      for (const group of groups || []) {
         // Get member count
-        const { count, error: countError } = await db.supabase
+        const { count } = await db.supabase
           .from('group_members')
           .select('*', { count: 'exact', head: true })
           .eq('group_id', group.id)
@@ -317,78 +316,32 @@ router.get('/popular', async (req, res) => {
             .from('users')
             .select('username')
             .eq('id', group.created_by)
-            .maybeSingle();
+            .single();
           if (creator) creatorName = creator.username;
         }
         
-        return {
+        groupsWithDetails.push({
           id: group.id,
           name: group.name || 'Unnamed Group',
           description: group.description || '',
-          game_specialty: group.game_specialty || 'General',
+          game_specialty: group.game_specialty || 'Gaming',
           visibility: group.visibility || 'public',
-          max_members: Number(group.max_members) || 20,
+          max_members: group.max_members || 20,
           member_count: count || 0,
-          current_members: count || 0,
           created_at: group.created_at,
           creator_id: group.created_by,
           creator_name: creatorName,
-          tournament_participations: 0,
           tournament_wins: 0,
+          tournament_participations: 0,
           is_member: false
-        };
-      }));
+        });
+      }
       
       res.json({ success: true, groups: groupsWithDetails });
-    } else {
-      // PostgreSQL fallback
-      const result = await db.query(`
-        SELECT 
-          g.id,
-          g.name,
-          g.description,
-          g.game_specialty,
-          g.visibility,
-          g.max_members,
-          g.created_at,
-          g.created_by,
-          COALESCE(u.username, 'Unknown') AS creator_name,
-          (SELECT COUNT(*) FROM group_members WHERE group_id = g.id AND status = 'joined') AS member_count
-        FROM groups g
-        LEFT JOIN users u ON g.created_by = u.id
-        WHERE g.visibility = 'public' OR g.is_public = true
-        ORDER BY member_count DESC, g.created_at DESC
-        LIMIT 10
-      `);
-      
-      const rows = result[0] || [];
-      
-      const groups = rows.map(group => ({
-        id: group.id,
-        name: group.name || 'Unnamed Group',
-        description: group.description || '',
-        game_specialty: group.game_specialty || 'General',
-        visibility: group.visibility || 'public',
-        max_members: Number(group.max_members) || 20,
-        member_count: Number(group.member_count) || 0,
-        current_members: Number(group.member_count) || 0,
-        created_at: group.created_at,
-        creator_id: group.created_by,
-        creator_name: group.creator_name || 'Unknown',
-        tournament_participations: 0,
-        tournament_wins: 0,
-        is_member: false
-      }));
-      
-      res.json({ success: true, groups });
     }
   } catch (error) {
     console.error('[GET /popular] Error:', error);
-    res.status(200).json({ 
-      success: true, 
-      groups: [],
-      message: 'Could not load popular groups'
-    });
+    res.json({ success: true, groups: [] });
   }
 });
 
