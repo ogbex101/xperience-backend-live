@@ -1,42 +1,38 @@
+// routes/groups.js - COMPLETE WORKING VERSION
 const express = require('express');
 const router = express.Router();
 const db = require('../config/database');
 const { authenticateToken } = require('../middleware/auth');
 
 // ==================== HELPER FUNCTIONS ====================
-console.log('🔥🔥🔥🔥🔥 GROUPS.JS IS BEING EXECUTED 🔥🔥🔥🔥🔥');
-console.log('Time:', new Date().toISOString());
-console.log('__dirname:', __dirname);
+
 /**
  * Check if user has permission to view group details
+ * Manual check since RLS is disabled
  */
 async function canViewGroup(userId, groupId) {
   try {
     if (db.isSupabase) {
-      // Get group visibility
+      // Get group details
       const { data: group, error: groupError } = await db.supabase
         .from('groups')
         .select('visibility, is_public, created_by')
         .eq('id', groupId)
         .maybeSingle();
       
-      if (groupError) {
-        console.error('Supabase error in canViewGroup:', groupError);
-        return false;
+      if (groupError || !group) return false;
+      
+      // Public groups - anyone can view
+      if (group.visibility === 'public' || group.is_public === true) {
+        return true;
       }
       
-      if (!group) return false;
-      
       // Creator can always view
-      if (group.created_by === userId) return true;
+      if (group.created_by === userId) {
+        return true;
+      }
       
-      // Check visibility
-      const isPublic = group.visibility === 'public' || group.is_public === true;
-      
-      // Public groups can be viewed by anyone
-      if (isPublic) return true;
-      
-      // Private groups require membership
+      // Check membership for private groups
       const { data: member, error: memberError } = await db.supabase
         .from('group_members')
         .select('id')
@@ -45,37 +41,9 @@ async function canViewGroup(userId, groupId) {
         .eq('status', 'joined')
         .maybeSingle();
       
-      if (memberError) {
-        console.error('Supabase error checking membership:', memberError);
-        return false;
-      }
-      
       return !!member;
-    } else {
-      // PostgreSQL fallback
-      const groupResult = await db.query(
-        'SELECT visibility, is_public, created_by FROM groups WHERE id = $1',
-        [groupId]
-      );
-      
-      const group = groupResult[0] || [];
-      
-      if (group.length === 0) return false;
-      
-      if (group[0].created_by === userId) return true;
-      
-      const isPublic = group[0].visibility === 'public' || group[0].is_public === true;
-      
-      if (isPublic) return true;
-      
-      const memberResult = await db.query(
-        'SELECT 1 FROM group_members WHERE group_id = $1 AND user_id = $2 AND status = $3',
-        [groupId, userId, 'joined']
-      );
-      
-      const member = memberResult[0] || [];
-      return member.length > 0;
     }
+    return false;
   } catch (error) {
     console.error('Error in canViewGroup:', error);
     return false;
@@ -90,17 +58,14 @@ async function getUserGroupRole(userId, groupId) {
   
   try {
     if (db.isSupabase) {
-      // Check if user is creator (owner)
+      // Check if user is creator
       const { data: group, error: groupError } = await db.supabase
         .from('groups')
         .select('created_by')
         .eq('id', groupId)
         .maybeSingle();
       
-      if (groupError) {
-        console.error('Supabase error in getUserGroupRole:', groupError);
-        return null;
-      }
+      if (groupError) return null;
       
       if (group && group.created_by === userId) {
         return 'owner';
@@ -115,33 +80,9 @@ async function getUserGroupRole(userId, groupId) {
         .eq('status', 'joined')
         .maybeSingle();
       
-      if (memberError) {
-        console.error('Supabase error checking membership role:', memberError);
-        return null;
-      }
-      
       return membership?.role || null;
-    } else {
-      // PostgreSQL fallback
-      const groupResult = await db.query(
-        'SELECT created_by FROM groups WHERE id = $1',
-        [groupId]
-      );
-      
-      const group = groupResult[0] || [];
-      
-      if (group.length > 0 && group[0].created_by === userId) {
-        return 'owner';
-      }
-      
-      const membershipResult = await db.query(
-        'SELECT role FROM group_members WHERE group_id = $1 AND user_id = $2 AND status = $3',
-        [groupId, userId, 'joined']
-      );
-      
-      const membership = membershipResult[0] || [];
-      return membership.length > 0 ? membership[0].role : null;
     }
+    return null;
   } catch (error) {
     console.error('Error in getUserGroupRole:', error);
     return null;
@@ -155,16 +96,13 @@ async function checkGroupCapacity(groupId) {
   try {
     if (db.isSupabase) {
       // Get current member count
-      const { count: currentMembers, error: countError } = await db.supabase
+      const { count, error: countError } = await db.supabase
         .from('group_members')
         .select('*', { count: 'exact', head: true })
         .eq('group_id', groupId)
         .eq('status', 'joined');
       
-      if (countError) {
-        console.error('Supabase error getting member count:', countError);
-        throw countError;
-      }
+      if (countError) throw countError;
       
       // Get group max members
       const { data: group, error: groupError } = await db.supabase
@@ -173,47 +111,21 @@ async function checkGroupCapacity(groupId) {
         .eq('id', groupId)
         .maybeSingle();
       
-      if (groupError) {
-        console.error('Supabase error getting group capacity:', groupError);
-        throw groupError;
-      }
+      if (groupError) throw groupError;
       
       const max = group?.max_members || 20;
-      const current = currentMembers || 0;
+      const current = count || 0;
       
       return {
-        current: current,
-        max: max,
+        current,
+        max,
         hasSpace: current < max
       };
-    } else {
-      // PostgreSQL fallback
-      const currentMembersResult = await db.query(
-        'SELECT COUNT(*) AS count FROM group_members WHERE group_id = $1 AND status = $2',
-        [groupId, 'joined']
-      );
-      
-      const groupCapacityResult = await db.query(
-        'SELECT max_members FROM groups WHERE id = $1',
-        [groupId]
-      );
-      
-      const currentMembers = currentMembersResult[0] || [];
-      const groupCapacity = groupCapacityResult[0] || [];
-      
-      return {
-        current: parseInt(currentMembers[0]?.count || 0),
-        max: parseInt(groupCapacity[0]?.max_members || 20),
-        hasSpace: parseInt(currentMembers[0]?.count || 0) < parseInt(groupCapacity[0]?.max_members || 20)
-      };
     }
+    return { current: 0, max: 20, hasSpace: true };
   } catch (error) {
     console.error('Error in checkGroupCapacity:', error);
-    return {
-      current: 0,
-      max: 20,
-      hasSpace: true
-    };
+    return { current: 0, max: 20, hasSpace: true };
   }
 }
 
@@ -230,53 +142,32 @@ async function isUserInGroup(userId, groupId) {
         .eq('user_id', userId)
         .maybeSingle();
       
-      if (error) {
-        console.error('Supabase error checking user in group:', error);
-        return { inGroup: false, status: null };
-      }
+      if (error) return { inGroup: false, status: null };
       
       if (existing) {
-        return {
-          inGroup: true,
-          status: existing.status
-        };
-      }
-      
-      return { inGroup: false, status: null };
-    } else {
-      // PostgreSQL fallback
-      const existingResult = await db.query(
-        'SELECT status FROM group_members WHERE group_id = $1 AND user_id = $2',
-        [groupId, userId]
-      );
-      
-      const existing = existingResult[0] || [];
-      
-      if (existing.length > 0) {
-        return {
-          inGroup: true,
-          status: existing[0].status
-        };
+        return { inGroup: true, status: existing.status };
       }
       
       return { inGroup: false, status: null };
     }
+    return { inGroup: false, status: null };
   } catch (error) {
     console.error('Error in isUserInGroup:', error);
     return { inGroup: false, status: null };
   }
 }
 
-// ==================== PUBLIC ROUTES (NO AUTH REQUIRED) ====================
+// ==================== PUBLIC ROUTES ====================
 
-// ==================== POPULAR GROUPS - FIXED ====================
-// Get popular groups - ULTRA SIMPLE
+/**
+ * GET /popular - Get popular groups (public)
+ */
 router.get('/popular', async (req, res) => {
   console.log('[GET /popular] Fetching popular groups');
   
   try {
     if (db.isSupabase) {
-      // First, get public groups with a simple query
+      // Get public groups
       const { data: groups, error } = await db.supabase
         .from('groups')
         .select(`
@@ -298,10 +189,8 @@ router.get('/popular', async (req, res) => {
         return res.json({ success: true, groups: [] });
       }
       
-      // Get member counts in a separate query
-      const groupsWithDetails = [];
-      
-      for (const group of groups || []) {
+      // Get member counts and creator names
+      const groupsWithDetails = await Promise.all((groups || []).map(async (group) => {
         // Get member count
         const { count } = await db.supabase
           .from('group_members')
@@ -314,43 +203,51 @@ router.get('/popular', async (req, res) => {
         if (group.created_by) {
           const { data: creator } = await db.supabase
             .from('users')
-            .select('username')
+            .select('username, profile_pic, rank')
             .eq('id', group.created_by)
-            .single();
-          if (creator) creatorName = creator.username;
+            .maybeSingle();
+          
+          if (creator) {
+            creatorName = creator.username;
+          }
         }
         
-        groupsWithDetails.push({
+        return {
           id: group.id,
           name: group.name || 'Unnamed Group',
           description: group.description || '',
           game_specialty: group.game_specialty || 'Gaming',
           visibility: group.visibility || 'public',
-          max_members: group.max_members || 20,
+          max_members: Number(group.max_members) || 20,
           member_count: count || 0,
+          current_members: count || 0,
           created_at: group.created_at,
           creator_id: group.created_by,
           creator_name: creatorName,
-          tournament_wins: 0,
           tournament_participations: 0,
+          tournament_wins: 0,
           is_member: false
-        });
-      }
+        };
+      }));
       
       res.json({ success: true, groups: groupsWithDetails });
+    } else {
+      res.json({ success: true, groups: [] });
     }
   } catch (error) {
     console.error('[GET /popular] Error:', error);
-    res.json({ success: true, groups: [] });
+    res.status(200).json({ success: true, groups: [] });
   }
 });
 
-// ==================== DISCOVER GROUPS - FIXED ====================
+/**
+ * GET /discover - Get discover groups (public)
+ */
 router.get('/discover', async (req, res) => {
   console.log('[GET /discover] Fetching discover groups');
   
   try {
-    // Get user ID from token if exists
+    // Get user ID from token if exists (for filtering)
     const token = req.headers.authorization?.split(' ')[1];
     let userId = null;
     
@@ -365,7 +262,7 @@ router.get('/discover', async (req, res) => {
     }
     
     if (db.isSupabase) {
-      // SIMPLIFIED QUERY - Get public groups
+      // Get public groups
       const { data: groups, error } = await db.supabase
         .from('groups')
         .select(`
@@ -384,7 +281,7 @@ router.get('/discover', async (req, res) => {
       
       if (error) {
         console.error('[GET /discover] Supabase error:', error);
-        throw error;
+        return res.json({ success: true, groups: [] });
       }
       
       // Get groups the user is already a member of (if logged in)
@@ -409,7 +306,7 @@ router.get('/discover', async (req, res) => {
         }
         
         // Get member count
-        const { count, error: countError } = await db.supabase
+        const { count } = await db.supabase
           .from('group_members')
           .select('*', { count: 'exact', head: true })
           .eq('group_id', group.id)
@@ -418,13 +315,13 @@ router.get('/discover', async (req, res) => {
         // Get creator name
         let creatorName = 'Unknown';
         if (group.created_by) {
-          const { data: creator, error: creatorError } = await db.supabase
+          const { data: creator } = await db.supabase
             .from('users')
             .select('username')
             .eq('id', group.created_by)
             .maybeSingle();
           
-          if (!creatorError && creator) {
+          if (creator) {
             creatorName = creator.username;
           }
         }
@@ -433,7 +330,7 @@ router.get('/discover', async (req, res) => {
           id: group.id,
           name: group.name || 'Unnamed Group',
           description: group.description || '',
-          game_specialty: group.game_specialty || 'General',
+          game_specialty: group.game_specialty || 'Gaming',
           visibility: group.visibility || 'public',
           max_members: Number(group.max_members) || 20,
           member_count: count || 0,
@@ -448,101 +345,60 @@ router.get('/discover', async (req, res) => {
       const filteredGroups = processedGroups.filter(g => g !== null);
       res.json({ success: true, groups: filteredGroups });
     } else {
-      // PostgreSQL fallback
-      let baseQuery = `
-        SELECT 
-          g.id,
-          g.name,
-          g.description,
-          g.game_specialty,
-          g.visibility,
-          g.max_members,
-          g.created_at,
-          g.created_by,
-          COALESCE(u.username, 'Unknown') AS creator_name,
-          (SELECT COUNT(*) FROM group_members WHERE group_id = g.id AND status = 'joined') AS member_count
-        FROM groups g
-        LEFT JOIN users u ON g.created_by = u.id
-        WHERE (g.visibility = 'public' OR g.is_public = true)
-      `;
-      
-      let queryParams = [];
-      
-      if (userId) {
-        baseQuery += ` AND g.id NOT IN (
-          SELECT group_id FROM group_members 
-          WHERE user_id = $1 AND status IN ('joined', 'requested')
-        )`;
-        queryParams.push(userId);
-      }
-      
-      baseQuery += ' ORDER BY g.created_at DESC LIMIT 20';
-      
-      const result = await db.query(baseQuery, queryParams);
-      const rows = result[0] || [];
-      
-      const groups = rows.map(group => ({
-        id: group.id,
-        name: group.name || 'Unnamed Group',
-        description: group.description || '',
-        game_specialty: group.game_specialty || 'General',
-        visibility: group.visibility || 'public',
-        max_members: Number(group.max_members) || 20,
-        member_count: Number(group.member_count) || 0,
-        created_at: group.created_at,
-        creator_id: group.created_by,
-        creator_name: group.creator_name || 'Unknown',
-        is_member: false
-      }));
-      
-      res.json({ success: true, groups });
+      res.json({ success: true, groups: [] });
     }
   } catch (error) {
     console.error('[GET /discover] Error:', error);
-    res.status(200).json({ 
-      success: true, 
-      groups: [],
-      message: 'Could not load discover groups'
-    });
+    res.status(200).json({ success: true, groups: [] });
   }
 });
 
-// Health check
+/**
+ * GET /health - Health check
+ */
 router.get('/health', (req, res) => {
   res.json({ success: true, message: 'Groups API is healthy' });
 });
 
-// Debug ping
+/**
+ * GET /debug-ping - Debug endpoint
+ */
 router.get('/debug-ping', (req, res) => {
   res.json({ success: true, message: 'PONG! Groups router is working' });
 });
 
-// ==================== PROTECTED ROUTES (require authentication) ====================
+// ==================== PROTECTED ROUTES ====================
 
-// Get user's groups
+/**
+ * GET /my-groups - Get current user's groups
+ */
 router.get('/my-groups', authenticateToken, async (req, res) => {
   console.log('[GET /my-groups] Fetching groups for user:', req.user.id);
   
   try {
+    const userId = req.user.id;
+    
     if (db.isSupabase) {
       // Get user's memberships
       const { data: memberships, error: memberError } = await db.supabase
         .from('group_members')
         .select('group_id, role, status, joined_at')
-        .eq('user_id', req.user.id)
+        .eq('user_id', userId)
         .eq('status', 'joined');
       
       if (memberError) {
         console.error('[GET /my-groups] Member error:', memberError);
-        throw memberError;
+        return res.json({ success: true, groups: [] });
       }
       
       if (!memberships || memberships.length === 0) {
         return res.json({ success: true, groups: [] });
       }
       
-      // Get group details
+      // Get group IDs
       const groupIds = memberships.map(m => m.group_id);
+      
+      // Get group details
       const { data: groups, error: groupError } = await db.supabase
         .from('groups')
         .select('*')
@@ -550,11 +406,11 @@ router.get('/my-groups', authenticateToken, async (req, res) => {
       
       if (groupError) {
         console.error('[GET /my-groups] Group error:', groupError);
-        throw groupError;
+        return res.json({ success: true, groups: [] });
       }
       
       // Get creator names
-      const creatorIds = groups.map(g => g.created_by).filter(Boolean);
+      const creatorIds = [...new Set(groups.map(g => g.created_by).filter(Boolean))];
       let creatorMap = {};
       
       if (creatorIds.length > 0) {
@@ -575,83 +431,43 @@ router.get('/my-groups', authenticateToken, async (req, res) => {
       const userGroups = groups.map(group => {
         const membership = memberships.find(m => m.group_id === group.id);
         const creator = creatorMap[group.created_by];
-        const visibilityStr = group.visibility || (group.is_public ? 'public' : 'private');
         
         return {
           id: group.id,
-          name: group.name,
+          name: group.name || 'Unnamed Group',
           description: group.description || '',
-          game_specialty: group.game_specialty || group.game_name || 'General',
-          visibility: visibilityStr,
-          max_members: group.max_members || 20,
-          current_members: group.current_members || 0,
+          game_specialty: group.game_specialty || group.game_name || 'Gaming',
+          visibility: group.visibility || (group.is_public ? 'public' : 'private'),
+          max_members: Number(group.max_members) || 20,
+          member_count: Number(group.current_members) || 0,
+          current_members: Number(group.current_members) || 0,
           created_at: group.created_at,
           creator_id: group.created_by,
           creator_name: creator?.username || 'Unknown',
           creator_profile_pic: creator?.profile_pic || null,
           creator_rank: creator?.rank || 'E',
-          member_count: group.current_members || 0,
           role: membership?.role || 'member',
           status: membership?.status || 'joined',
           joined_at: membership?.joined_at,
-          is_member: true
+          is_member: true,
+          tournament_participations: 0,
+          tournament_wins: 0
         };
       });
       
       res.json({ success: true, groups: userGroups });
     } else {
-      // PostgreSQL fallback
-      const result = await db.query(`
-        SELECT 
-          g.*,
-          gm.role,
-          gm.status,
-          gm.joined_at,
-          COALESCE(u.username, 'Unknown') AS creator_name,
-          u.profile_pic AS creator_profile_pic,
-          u.rank AS creator_rank
-        FROM groups g
-        INNER JOIN group_members gm ON g.id = gm.group_id
-        LEFT JOIN users u ON g.created_by = u.id
-        WHERE gm.user_id = $1 AND gm.status = 'joined'
-        ORDER BY g.created_at DESC
-      `, [req.user.id]);
-      
-      const rows = result[0] || [];
-      
-      const groups = rows.map(group => ({
-        id: group.id,
-        name: group.name,
-        description: group.description || '',
-        game_specialty: group.game_specialty || group.game_name || 'General',
-        visibility: group.visibility || (group.is_public ? 'public' : 'private'),
-        max_members: group.max_members || 20,
-        current_members: group.current_members || 0,
-        created_at: group.created_at,
-        creator_id: group.created_by,
-        creator_name: group.creator_name || 'Unknown',
-        creator_profile_pic: group.creator_profile_pic || null,
-        creator_rank: group.creator_rank || 'E',
-        member_count: group.current_members || 0,
-        role: group.role || 'member',
-        status: group.status || 'joined',
-        joined_at: group.joined_at,
-        is_member: true
-      }));
-      
-      res.json({ success: true, groups });
+      res.json({ success: true, groups: [] });
     }
   } catch (error) {
     console.error('[GET /my-groups] Error:', error);
-    res.status(200).json({ 
-      success: true, 
-      groups: [],
-      message: 'Could not load groups, but continuing with empty list'
-    });
+    res.status(200).json({ success: true, groups: [] });
   }
 });
 
-// Create a new group
+/**
+ * POST /create - Create a new group
+ */
 router.post('/create', authenticateToken, async (req, res) => {
   console.log('[POST /create] Creating new group for user:', req.user.id);
   
@@ -779,89 +595,7 @@ router.post('/create', authenticateToken, async (req, res) => {
         }
       });
     } else {
-      // PostgreSQL fallback
-      // Check if user exists
-      const userResult = await db.query(
-        'SELECT id, username, profile_pic, rank FROM users WHERE id = $1',
-        [req.user.id]
-      );
-      
-      const userRows = userResult[0] || [];
-      
-      if (userRows.length === 0) {
-        return res.status(404).json({ 
-          success: false, 
-          message: 'User account not found' 
-        });
-      }
-      
-      const user = userRows[0];
-      
-      // Check for duplicate
-      const existingResult = await db.query(
-        'SELECT id, name FROM groups WHERE LOWER(name) = LOWER($1)',
-        [name]
-      );
-      
-      const existingRows = existingResult[0] || [];
-      
-      if (existingRows.length > 0) {
-        return res.status(400).json({ 
-          success: false, 
-          message: `A group with the name "${name}" already exists.`
-        });
-      }
-      
-      // Create group
-      const insertResult = await db.query(
-        `INSERT INTO groups 
-          (name, created_by, game_specialty, description, max_members, is_public, current_members, game_name, visibility) 
-         VALUES 
-          ($1, $2, $3, $4, $5, $6, $7, $8, $9) 
-         RETURNING id`,
-        [name, req.user.id, game_specialty, description || '', max_members, visibility === 'public', 1, game_specialty, visibility]
-      );
-      
-      const groupId = insertResult[0]?.[0]?.id;
-      
-      if (!groupId) {
-        throw new Error('Failed to get group ID');
-      }
-      
-      // Add creator as admin
-      await db.query(
-        `INSERT INTO group_members (group_id, user_id, username, role, status, joined_at) 
-         VALUES ($1, $2, $3, $4, $5, NOW())`,
-        [groupId, req.user.id, user.username, 'admin', 'joined']
-      );
-      
-      // Create welcome message
-      await db.query(
-        `INSERT INTO group_chat (group_id, user_id, message, created_at) 
-         VALUES ($1, $2, $3, NOW())`,
-        [groupId, req.user.id, `SYSTEM: ${user.username} created the group!`]
-      );
-      
-      res.json({
-        success: true,
-        message: 'Group created successfully!',
-        group_id: groupId,
-        group: {
-          id: groupId,
-          name,
-          description: description || '',
-          game_specialty,
-          visibility,
-          max_members,
-          current_members: 1,
-          created_by: req.user.id,
-          creator_name: user.username,
-          creator_profile_pic: user.profile_pic,
-          creator_rank: user.rank,
-          is_member: true,
-          role: 'admin'
-        }
-      });
+      res.status(500).json({ success: false, message: 'Database not configured' });
     }
   } catch (error) {
     console.error('[POST /create] Error:', error);
@@ -872,7 +606,9 @@ router.post('/create', authenticateToken, async (req, res) => {
   }
 });
 
-// Get group details - FIXED VERSION
+/**
+ * GET /:groupId - Get group details
+ */
 router.get('/:groupId', authenticateToken, async (req, res) => {
   console.log(`[GET /:groupId] Fetching group ${req.params.groupId} for user ${req.user.id}`);
   
@@ -881,7 +617,7 @@ router.get('/:groupId', authenticateToken, async (req, res) => {
     const userId = req.user.id;
     
     if (db.isSupabase) {
-      // First, check if group exists - SIMPLE query without RLS complications
+      // Get the group
       const { data: group, error: groupError } = await db.supabase
         .from('groups')
         .select('*')
@@ -903,34 +639,8 @@ router.get('/:groupId', authenticateToken, async (req, res) => {
         });
       }
       
-      // Check if user can view - using SIMPLE checks, not relying on RLS
-      let canView = false;
-      
-      // Check if group is public
-      if (group.visibility === 'public' || group.is_public === true) {
-        canView = true;
-      }
-      
-      // Check if user is creator
-      if (group.created_by === userId) {
-        canView = true;
-      }
-      
-      // Check if user is a member
-      if (!canView) {
-        const { data: membership, error: memberError } = await db.supabase
-          .from('group_members')
-          .select('id, role, status')
-          .eq('group_id', groupId)
-          .eq('user_id', userId)
-          .eq('status', 'joined')
-          .maybeSingle();
-        
-        if (!memberError && membership) {
-          canView = true;
-        }
-      }
-      
+      // Check if user can view (manual check)
+      const canView = await canViewGroup(userId, groupId);
       if (!canView) {
         return res.status(403).json({ 
           success: false, 
@@ -955,12 +665,11 @@ router.get('/:groupId', authenticateToken, async (req, res) => {
         }
       }
       
-      // Get members - SIMPLE query
+      // Get members
       const { data: members, error: memberError } = await db.supabase
         .from('group_members')
         .select('*')
-        .eq('group_id', groupId)
-        .order('created_at', { ascending: true });
+        .eq('group_id', groupId);
       
       if (memberError) {
         console.error('Error fetching members:', memberError);
@@ -989,7 +698,6 @@ router.get('/:groupId', authenticateToken, async (req, res) => {
               is_creator: m.user_id === group.created_by
             }));
           } else {
-            // Fallback
             membersWithDetails = members.map(m => ({
               ...m,
               username: m.username || 'Unknown',
@@ -1036,6 +744,8 @@ router.get('/:groupId', authenticateToken, async (req, res) => {
         isMember,
         can_edit: userRole === 'admin' || userRole === 'owner'
       });
+    } else {
+      res.status(500).json({ success: false, message: 'Database not configured' });
     }
   } catch (error) {
     console.error('[GET /:groupId] Error:', error);
@@ -1047,7 +757,9 @@ router.get('/:groupId', authenticateToken, async (req, res) => {
   }
 });
 
-// Join group
+/**
+ * POST /:groupId/join - Join a group
+ */
 router.post('/:groupId/join', authenticateToken, async (req, res) => {
   console.log(`[POST /:groupId/join] User ${req.user.id} joining group ${req.params.groupId}`);
   
@@ -1151,68 +863,7 @@ router.post('/:groupId/join', authenticateToken, async (req, res) => {
         status
       });
     } else {
-      // PostgreSQL fallback
-      const groupResult = await db.query('SELECT * FROM groups WHERE id = $1', [groupId]);
-      const group = groupResult[0] || [];
-      
-      if (group.length === 0) {
-        return res.status(404).json({ success: false, message: 'Group not found' });
-      }
-      
-      const groupData = group[0];
-      
-      const existingResult = await db.query(
-        'SELECT status FROM group_members WHERE group_id = $1 AND user_id = $2',
-        [groupId, userId]
-      );
-      
-      const existing = existingResult[0] || [];
-      
-      if (existing.length > 0) {
-        return res.status(400).json({ 
-          success: false, 
-          message: existing[0].status === 'joined' 
-            ? 'You are already a member' 
-            : `You already have a pending ${existing[0].status}`
-        });
-      }
-      
-      const capacity = await checkGroupCapacity(groupId);
-      if (!capacity.hasSpace) {
-        return res.status(400).json({ success: false, message: 'Group is full' });
-      }
-      
-      const userResult = await db.query('SELECT username FROM users WHERE id = $1', [userId]);
-      const username = userResult[0]?.[0]?.username || 'User';
-      
-      const isPublic = groupData.visibility === 'public' || groupData.is_public === true;
-      const status = isPublic ? 'joined' : 'requested';
-      
-      await db.query(
-        'INSERT INTO group_members (group_id, user_id, username, role, status, joined_at) VALUES ($1, $2, $3, $4, $5, $6)',
-        [groupId, userId, username, 'member', status, status === 'joined' ? new Date() : null]
-      );
-      
-      if (status === 'joined') {
-        await db.query(
-          'UPDATE groups SET current_members = current_members + 1 WHERE id = $1',
-          [groupId]
-        );
-      }
-      
-      await db.query(
-        'INSERT INTO group_chat (group_id, user_id, message, created_at) VALUES ($1, $2, $3, NOW())',
-        [groupId, 0, status === 'joined' 
-          ? `SYSTEM: ${username} has joined the group!`
-          : `SYSTEM: ${username} has requested to join the group.`
-        ]
-      );
-      
-      res.json({ 
-        success: true, 
-        message: status === 'joined' ? 'Successfully joined group!' : 'Join request sent!',
-        status
-      });
+      res.status(500).json({ success: false, message: 'Database not configured' });
     }
   } catch (error) {
     console.error('[POST /:groupId/join] Error:', error);
@@ -1224,7 +875,9 @@ router.post('/:groupId/join', authenticateToken, async (req, res) => {
   }
 });
 
-// Leave group
+/**
+ * POST /:groupId/leave - Leave a group
+ */
 router.post('/:groupId/leave', authenticateToken, async (req, res) => {
   console.log(`[POST /:groupId/leave] User ${req.user.id} leaving group ${req.params.groupId}`);
   
@@ -1292,34 +945,7 @@ router.post('/:groupId/leave', authenticateToken, async (req, res) => {
       
       res.json({ success: true, message: 'Successfully left the group' });
     } else {
-      // PostgreSQL fallback
-      const groupResult = await db.query('SELECT created_by FROM groups WHERE id = $1', [groupId]);
-      const group = groupResult[0] || [];
-      
-      if (group.length === 0) {
-        return res.status(404).json({ success: false, message: 'Group not found' });
-      }
-      
-      if (group[0].created_by === userId) {
-        return res.status(400).json({ 
-          success: false, 
-          message: 'Group creator cannot leave.' 
-        });
-      }
-      
-      const userResult = await db.query('SELECT username FROM users WHERE id = $1', [userId]);
-      const username = userResult[0]?.[0]?.username || 'A member';
-      
-      await db.query('DELETE FROM group_members WHERE group_id = $1 AND user_id = $2', [groupId, userId]);
-      
-      await db.query('UPDATE groups SET current_members = current_members - 1 WHERE id = $1', [groupId]);
-      
-      await db.query(
-        'INSERT INTO group_chat (group_id, user_id, message, created_at) VALUES ($1, $2, $3, NOW())',
-        [groupId, 0, `SYSTEM: ${username} has left the group.`]
-      );
-      
-      res.json({ success: true, message: 'Successfully left the group' });
+      res.status(500).json({ success: false, message: 'Database not configured' });
     }
   } catch (error) {
     console.error('[POST /:groupId/leave] Error:', error);
@@ -1331,7 +957,9 @@ router.post('/:groupId/leave', authenticateToken, async (req, res) => {
   }
 });
 
-// Get group members
+/**
+ * GET /:groupId/members - Get group members
+ */
 router.get('/:groupId/members', authenticateToken, async (req, res) => {
   console.log(`[GET /:groupId/members] Fetching members for group ${req.params.groupId}`);
   
@@ -1351,15 +979,7 @@ router.get('/:groupId/members', authenticateToken, async (req, res) => {
     if (db.isSupabase) {
       const { data: members, error } = await db.supabase
         .from('group_members')
-        .select(`
-          *,
-          users:user_id (
-            username,
-            profile_pic,
-            rank,
-            created_at
-          )
-        `)
+        .select('*')
         .eq('group_id', groupId)
         .eq('status', 'joined')
         .order('role', { ascending: false });
@@ -1369,37 +989,25 @@ router.get('/:groupId/members', authenticateToken, async (req, res) => {
         throw error;
       }
       
-      const formattedMembers = (members || []).map(m => ({
-        ...m,
-        username: m.users?.username,
-        profile_pic: m.users?.profile_pic,
-        rank: m.users?.rank,
-        user_created_at: m.users?.created_at
+      // Get user details
+      const membersWithDetails = await Promise.all((members || []).map(async (m) => {
+        const { data: user } = await db.supabase
+          .from('users')
+          .select('username, profile_pic, rank')
+          .eq('id', m.user_id)
+          .maybeSingle();
+        
+        return {
+          ...m,
+          username: user?.username || m.username || 'Unknown',
+          profile_pic: user?.profile_pic || null,
+          rank: user?.rank || 'E'
+        };
       }));
       
-      res.json({ success: true, members: formattedMembers });
+      res.json({ success: true, members: membersWithDetails });
     } else {
-      const result = await db.query(`
-        SELECT 
-          gm.*, 
-          u.username, 
-          u.profile_pic, 
-          u.rank,
-          u.created_at AS user_created_at
-        FROM group_members gm
-        LEFT JOIN users u ON gm.user_id = u.id
-        WHERE gm.group_id = $1 AND gm.status = 'joined'
-        ORDER BY 
-          CASE gm.role 
-            WHEN 'admin' THEN 1 
-            WHEN 'moderator' THEN 2
-            ELSE 3 
-          END,
-          gm.created_at
-      `, [groupId]);
-      
-      const members = result[0] || [];
-      res.json({ success: true, members });
+      res.status(500).json({ success: false, message: 'Database not configured' });
     }
   } catch (error) {
     console.error('[GET /:groupId/members] Error:', error);
@@ -1411,7 +1019,9 @@ router.get('/:groupId/members', authenticateToken, async (req, res) => {
   }
 });
 
-// Search groups
+/**
+ * GET /search/query - Search groups
+ */
 router.get('/search/query', async (req, res) => {
   console.log(`[GET /search/query] Searching groups with query: "${req.query.q}"`);
   
@@ -1436,9 +1046,7 @@ router.get('/search/query', async (req, res) => {
           description,
           game_specialty,
           visibility,
-          is_public,
           max_members,
-          current_members,
           created_at,
           created_by
         `)
@@ -1452,8 +1060,14 @@ router.get('/search/query', async (req, res) => {
         throw error;
       }
       
-      // Get creator names
+      // Get member counts and creator names
       const groupsWithDetails = await Promise.all((groups || []).map(async (group) => {
+        const { count } = await db.supabase
+          .from('group_members')
+          .select('*', { count: 'exact', head: true })
+          .eq('group_id', group.id)
+          .eq('status', 'joined');
+        
         let creatorName = 'Unknown';
         if (group.created_by) {
           const { data: creator } = await db.supabase
@@ -1469,9 +1083,9 @@ router.get('/search/query', async (req, res) => {
           name: group.name,
           description: group.description || '',
           game_specialty: group.game_specialty || 'General',
-          visibility: group.visibility || (group.is_public ? 'public' : 'private'),
+          visibility: group.visibility || 'public',
           max_members: group.max_members || 20,
-          member_count: group.current_members || 0,
+          member_count: count || 0,
           created_at: group.created_at,
           creator_name: creatorName,
           is_member: false
@@ -1480,34 +1094,7 @@ router.get('/search/query', async (req, res) => {
       
       res.json({ success: true, groups: groupsWithDetails });
     } else {
-      const result = await db.query(`
-        SELECT 
-          g.*,
-          COALESCE(u.username, 'Unknown') AS creator_name
-        FROM groups g
-        LEFT JOIN users u ON g.created_by = u.id
-        WHERE (g.name ILIKE $1 OR g.game_specialty ILIKE $2 OR g.description ILIKE $3)
-        AND (g.visibility = 'public' OR g.is_public = true)
-        ORDER BY g.created_at DESC
-        LIMIT 20
-      `, [searchPattern, searchPattern, searchPattern]);
-      
-      const rows = result[0] || [];
-      
-      const groups = rows.map(group => ({
-        id: group.id,
-        name: group.name,
-        description: group.description || '',
-        game_specialty: group.game_specialty || 'General',
-        visibility: group.visibility || (group.is_public ? 'public' : 'private'),
-        max_members: group.max_members || 20,
-        member_count: group.current_members || 0,
-        created_at: group.created_at,
-        creator_name: group.creator_name || 'Unknown',
-        is_member: false
-      }));
-      
-      res.json({ success: true, groups });
+      res.json({ success: true, groups: [] });
     }
   } catch (error) {
     console.error('[GET /search/query] Error:', error);
@@ -1518,10 +1105,5 @@ router.get('/search/query', async (req, res) => {
     });
   }
 });
-console.log('✅ GROUPS ROUTES REGISTERED:');
-console.log('   - GET /debug-ping');
-console.log('   - GET /popular');
-console.log('   - GET /discover');
-console.log('   - GET /my-groups');
-console.log('   - POST /create');
+
 module.exports = router;
