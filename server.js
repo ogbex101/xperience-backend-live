@@ -52,6 +52,7 @@ const chatRoutes = require('./src/routes/chat');
 const adminRoutes = require('./src/routes/admin');
 const leaderboardRoutes = require('./src/routes/leaderboard');
 const walletRoutes = require('./src/routes/wallet');
+console.log('✅ Wallet routes registered at /api/wallet'); // ADD THIS LINE
 const gamesRoutes = require('./src/routes/games');
 const notificationsRouter = require('./src/routes/notifications');
 const suggestedPlayersRoutes = require('./src/routes/suggestedPlayers');

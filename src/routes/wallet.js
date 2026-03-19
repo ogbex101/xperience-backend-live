@@ -122,6 +122,33 @@ const insertXpTransaction = async (xpTransactionData) => {
     return rows && rows.length > 0 ? rows[0] : null;
   }
 };
+// Add this debug route at the very top of wallet.js, before any other routes
+router.get('/debug', (req, res) => {
+  console.log('🔍 Wallet debug route hit!');
+  res.json({ 
+    success: true, 
+    message: 'Wallet router is working',
+    routes: [
+      'GET /balance',
+      'GET /check-pin-status', 
+      'GET /transactions',
+      'GET /xp-transactions',
+      'POST /convert/to-xp',
+      'POST /transfer/funds',
+      'POST /transfer/xp',
+      'POST /withdraw/request',
+      'GET /bank-details',
+      'POST /bank-details',
+      'POST /set-pin',
+      'POST /verify-pin',
+      'POST /simulate-deposit',
+      'GET /currencies',
+      'POST /set-currency',
+      'POST /fund/initialize',
+      'POST /fund/webhook'
+    ]
+  });
+});
 
 // Get available currencies
 router.get('/currencies', authenticateToken, async (req, res) => {
