@@ -619,11 +619,11 @@ const initializeSocket = (io) => {
         }
         
         // Confirm to sender
-        socket.emit('message_sent', { 
-          messageId: messageId, 
-          tempId: tempId,
-          created_at: new Date().toISOString()
-        });
+       socket.emit('message_sent', { 
+  messageId: savedMessage.id, 
+  tempId: tempId,  // Echo back the tempId
+  created_at: savedMessage.created_at
+});
         
         console.log('✅ Message sent confirmation emitted to sender');
         
@@ -814,15 +814,15 @@ const initializeSocket = (io) => {
         // Prepare message for broadcast
         const roomName = `group_${groupId}`;
         const messageToSend = {
-          id: savedMessage.id,
-          groupId: groupId,
-          senderId: socket.userId,
-          senderUsername: sender?.username || socket.username || 'Unknown',
-          senderProfilePic: sender?.profile_pic,
-          message: message,
-          timestamp: savedMessage.created_at,
-          tempId: tempId
-        };
+  id: savedMessage.id,
+  groupId: groupId,
+  senderId: socket.userId,
+  senderUsername: sender?.username || socket.username || 'Unknown',
+  senderProfilePic: sender?.profile_pic,
+  message: message,
+  timestamp: savedMessage.created_at
+  // Don't include tempId here - only in the confirmation to sender
+};
         
         console.log('🔴 Broadcasting to room:', roomName);
         console.log('🔴 Message to send:', JSON.stringify(messageToSend, null, 2));
@@ -836,12 +836,12 @@ const initializeSocket = (io) => {
         // Broadcast to all users in the group room
         io.to(roomName).emit('group_message_received', messageToSend);
         
-        // Send confirmation to sender
-        socket.emit('group_message_sent', {
-          tempId: tempId,
-          messageId: savedMessage.id,
-          timestamp: savedMessage.created_at
-        });
+        // In the group_message handler, when sending confirmation:
+socket.emit('group_message_sent', {
+  tempId: tempId,
+  messageId: savedMessage.id,
+  timestamp: savedMessage.created_at
+});
         
         console.log('✅ Group message broadcast complete');
         console.log('🔴 ===== GROUP MESSAGE COMPLETE =====');
