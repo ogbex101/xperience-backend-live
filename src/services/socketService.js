@@ -484,377 +484,324 @@ const initializeSocket = (io) => {
       console.log(`✅ Typing indicator broadcast to room ${roomName}`);
     });
 
-    // ============ PRIVATE MESSAGES ============
     socket.on('private_message', async (data) => {
-      try {
-        const { to, message, tempId } = data;
-        
-        console.log('📤 Socket.io: Private message from', socket.userId, 'to', to);
-        console.log('📤 Message content:', message);
-        
-        if (!to || !message) {
-          console.error('Invalid message data:', data);
-          return;
-        }
-        
-        let messageId;
-        let roomId;
-        let sender = { username: socket.username, profile_pic: null };
-        
-        if (db.isSupabase) {
-          // STEP 1: Find or create chat room using user1_id and user2_id
-          // Ensure consistent ordering (smaller UUID first)
-          const user1 = socket.userId < to ? socket.userId : to;
-          const user2 = socket.userId < to ? to : socket.userId;
-          
-          // Check if room exists with these two users
-          const { data: existingRoom, error: roomCheckError } = await db.supabaseAdmin
-            .from('chat_rooms')
-            .select('id')
-            .eq('user1_id', user1)
-            .eq('user2_id', user2)
-            .maybeSingle();
-          
-          if (roomCheckError) {
-            console.error('Error checking room:', roomCheckError);
-          }
-          
-          if (existingRoom) {
-            roomId = existingRoom.id;
-            console.log('✅ Found existing room:', roomId);
-          } else {
-            // Create new room with the two users
-            const { data: newRoom, error: roomCreateError } = await db.supabaseAdmin
-              .from('chat_rooms')
-              .insert([{
-                user1_id: user1,
-                user2_id: user2,
-                created_at: new Date().toISOString(),
-                last_message_at: new Date().toISOString(),
-                is_group: false
-              }])
-              .select('id')
-              .single();
-            
-            if (roomCreateError) {
-              console.error('Error creating room:', roomCreateError);
-              throw roomCreateError;
-            }
-            
-            roomId = newRoom.id;
-            console.log('✅ Created new room:', roomId);
-          }
-          
-          // STEP 2: Update last_message_at in room
-          await db.supabaseAdmin
-            .from('chat_rooms')
-            .update({ last_message_at: new Date().toISOString() })
-            .eq('id', roomId);
-          
-          // STEP 3: Insert message into chat_messages with the correct room_id
-          const messageData = {
-            user_id: socket.userId,
-            room_id: roomId,  // Use the actual room ID
-            message: message,
-            is_read: false,
-            created_at: new Date().toISOString(),
-            updated_at: new Date().toISOString(),
-            read_by: [],
-            delivered_to: [],
-            deleted_for: [],
-            cleared_for_users: []
-          };
-          
-          console.log('📤 Saving message to chat_messages with room_id:', roomId);
-          
-          const { data: msgData, error: msgError } = await db.supabaseAdmin
-            .from('chat_messages')
-            .insert([messageData])
-            .select('id, created_at')
-            .single();
-
-          if (msgError) {
-            console.error('❌ Error saving message:', msgError);
-            throw msgError;
-          }
-          
-          messageId = msgData.id;
-          console.log('✅ Message saved with ID:', messageId);
-
-          // Get sender info
-          const { data: userData } = await db.supabaseAdmin
-            .from('users')
-            .select('username, profile_pic')
-            .eq('id', socket.userId)
-            .single();
-
-          if (userData) {
-            sender = userData;
-          }
-        } else {
-          // PostgreSQL fallback
-          console.log('PostgreSQL fallback not implemented');
-          return;
-        }
-        
-        const messageData = {
-          id: messageId,
-          sender_id: socket.userId,
-          sender_username: sender.username || socket.username || 'Unknown',
-          sender_profile_pic: sender.profile_pic,
-          receiver_id: to,
-          message: message,
-          created_at: new Date().toISOString(),
-          read_status: false,
-          tempId: tempId
-        };
-        
-        // Send to recipient if online
-        const recipientSocketId = onlineUsers.get(to);
-        if (recipientSocketId) {
-          io.to(recipientSocketId).emit('new_message', messageData);
-          console.log('✅ Message sent to recipient socket:', recipientSocketId);
-        } else {
-          console.log('ℹ️ Recipient is offline, message saved to database');
-        }
-        
-        // Confirm to sender
-       socket.emit('message_sent', { 
-  messageId: savedMessage.id, 
-  tempId: tempId,  // Echo back the tempId
-  created_at: savedMessage.created_at
-});
-        
-        console.log('✅ Message sent confirmation emitted to sender');
-        
-      } catch (error) {
-        console.error('❌ Error sending private message:', error);
-        socket.emit('error', { message: 'Failed to send message: ' + error.message });
+  try {
+    const { to, message, tempId } = data;
+    
+    console.log('📤 Socket.io: Private message from', socket.userId, 'to', to);
+    console.log('📤 Message content:', message);
+    
+    if (!to || !message) {
+      console.error('Invalid message data:', data);
+      return;
+    }
+    
+    let messageId;
+    let roomId;
+    let sender = { username: socket.username, profile_pic: null };
+    
+    if (db.isSupabase) {
+      // STEP 1: Find or create chat room using user1_id and user2_id
+      const user1 = socket.userId < to ? socket.userId : to;
+      const user2 = socket.userId < to ? to : socket.userId;
+      
+      // Check if room exists with these two users
+      const { data: existingRoom, error: roomCheckError } = await db.supabaseAdmin
+        .from('chat_rooms')
+        .select('id')
+        .eq('user1_id', user1)
+        .eq('user2_id', user2)
+        .maybeSingle();
+      
+      if (roomCheckError) {
+        console.error('Error checking room:', roomCheckError);
       }
-    });
-
-    // ============ GROUP MESSAGES - FIXED VERSION ============
-    socket.on('group_message', async (data) => {
-      try {
-        console.log('🔴 ===== GROUP MESSAGE RECEIVED =====');
-        console.log('🔴 Data:', JSON.stringify(data, null, 2));
-        console.log('🔴 User ID:', socket.userId);
-        console.log('🔴 Username:', socket.username);
-        
-        const { groupId, message, tempId } = data;
-        
-        console.log('🔴 Group ID:', groupId);
-        console.log('🔴 Message:', message);
-        console.log('🔴 Temp ID:', tempId);
-        
-        if (!groupId || !message) {
-          console.error('❌ Missing groupId or message');
-          socket.emit('group_message_error', { 
-            message: 'Missing group ID or message',
-            tempId 
-          });
-          return;
-        }
-        
-        if (!message.trim()) {
-          console.error('❌ Empty message');
-          socket.emit('group_message_error', { 
-            message: 'Message cannot be empty',
-            tempId 
-          });
-          return;
-        }
-        
-        // Check if user is member of this group
-        console.log('🔴 Checking group membership...');
-        const { data: membership, error: memberError } = await db.supabaseAdmin
-          .from('group_members')
-          .select('id, role')
-          .eq('group_id', groupId)
-          .eq('user_id', socket.userId)
-          .eq('status', 'joined');
-        
-        if (memberError) {
-          console.error('❌ Error checking membership:', memberError);
-        }
-        
-        console.log('🔴 Membership result:', membership);
-        
-        const isMember = membership && membership.length > 0;
-        
-        if (!isMember) {
-          console.error('❌ User is not a member of this group');
-          socket.emit('group_message_error', { 
-            message: 'You are not a member of this group',
-            tempId 
-          });
-          return;
-        }
-        
-        // Ensure a chat room exists for this group
-        console.log('🔴 Checking if chat room exists for group:', groupId);
-        
-        const { data: existingRoom, error: roomCheckError } = await db.supabaseAdmin
+      
+      if (existingRoom) {
+        roomId = existingRoom.id;
+        console.log('✅ Found existing room:', roomId);
+      } else {
+        // Create new room with the two users
+        const { data: newRoom, error: roomCreateError } = await db.supabaseAdmin
           .from('chat_rooms')
+          .insert([{
+            user1_id: user1,
+            user2_id: user2,
+            created_at: new Date().toISOString(),
+            last_message_at: new Date().toISOString(),
+            is_group: false
+          }])
           .select('id')
-          .eq('id', groupId)
-          .maybeSingle();
-        
-        if (roomCheckError) {
-          console.error('❌ Error checking room:', roomCheckError);
-        }
-        
-        if (!existingRoom) {
-          console.log('🔴 No chat room found for group, creating one...');
-          
-          // Get group details to get creator
-          const { data: group, error: groupError } = await db.supabaseAdmin
-            .from('groups')
-            .select('created_by, name')
-            .eq('id', groupId)
-            .single();
-          
-          if (groupError) {
-            console.error('❌ Error fetching group:', groupError);
-          }
-          
-          // Create a chat room for this group
-          const { data: newRoom, error: roomCreateError } = await db.supabaseAdmin
-            .from('chat_rooms')
-            .insert([{
-              id: groupId,  // Use the group_id as the room_id
-              user1_id: group?.created_by || socket.userId,  // Group creator as user1, fallback to current user
-              user2_id: null,  // NULL for groups
-              created_at: new Date().toISOString(),
-              last_message_at: new Date().toISOString(),
-              is_group: true  // Mark as group chat
-            }])
-            .select()
-            .single();
-          
-          if (roomCreateError) {
-            console.error('❌ Error creating chat room:', roomCreateError);
-            
-            // If room already exists but we got an error, try to fetch it again
-            if (roomCreateError.code === '23505') { // Unique violation
-              console.log('🔴 Room already exists, fetching...');
-              const { data: retryRoom } = await db.supabaseAdmin
-                .from('chat_rooms')
-                .select('id')
-                .eq('id', groupId)
-                .single();
-              
-              if (!retryRoom) {
-                throw new Error('Failed to create or find chat room');
-              }
-            } else {
-              throw roomCreateError;
-            }
-          } else {
-            console.log('✅ Chat room created for group:', groupId);
-          }
-        } else {
-          console.log('✅ Chat room already exists for group');
-          
-          // Update last_message_at
-          await db.supabaseAdmin
-            .from('chat_rooms')
-            .update({ last_message_at: new Date().toISOString() })
-            .eq('id', groupId);
-        }
-        
-        // Save message to database
-        console.log('🔴 Attempting to save group message to database...');
-        
-        const messageData = {
-          user_id: socket.userId,
-          room_id: groupId,
-          message: message,
-          is_read: false,
-          created_at: new Date().toISOString(),
-          updated_at: new Date().toISOString(),
-          read_by: [],
-          delivered_to: [],
-          deleted_for: [],
-          cleared_for_users: []
-        };
-        
-        const { data: savedMessage, error: saveError } = await db.supabaseAdmin
-          .from('chat_messages')
-          .insert([messageData])
-          .select()
           .single();
         
-        if (saveError) {
-          console.error('❌ Error saving group message:', saveError);
-          console.error('❌ Error code:', saveError.code);
-          console.error('❌ Error message:', saveError.message);
-          console.error('❌ Error details:', saveError.details);
-          socket.emit('group_message_error', { 
-            message: 'Failed to save message: ' + saveError.message,
-            tempId 
-          });
-          return;
+        if (roomCreateError) {
+          console.error('Error creating room:', roomCreateError);
+          throw roomCreateError;
         }
         
-        console.log('✅ Group message saved successfully!');
-        console.log('✅ Saved message ID:', savedMessage.id);
-        
-        // Get sender info
-        const { data: sender, error: senderError } = await db.supabaseAdmin
-          .from('users')
-          .select('username, profile_pic')
-          .eq('id', socket.userId)
-          .single();
-        
-        if (senderError) {
-          console.error('Error fetching sender:', senderError);
-        }
-        
-        // Prepare message for broadcast
-        const roomName = `group_${groupId}`;
-        const messageToSend = {
-  id: savedMessage.id,
-  groupId: groupId,
-  senderId: socket.userId,
-  senderUsername: sender?.username || socket.username || 'Unknown',
-  senderProfilePic: sender?.profile_pic,
-  message: message,
-  timestamp: savedMessage.created_at
-  // Don't include tempId here - only in the confirmation to sender
-};
-        
-        console.log('🔴 Broadcasting to room:', roomName);
-        console.log('🔴 Message to send:', JSON.stringify(messageToSend, null, 2));
-        
-        // Make sure socket is in the room
-        if (!socket.rooms.has(roomName)) {
-          await socket.join(roomName);
-          console.log(`✅ User joined room ${roomName}`);
-        }
-        
-        // Broadcast to all users in the group room
-        io.to(roomName).emit('group_message_received', messageToSend);
-        
-        // In the group_message handler, when sending confirmation:
-socket.emit('group_message_sent', {
-  tempId: tempId,
-  messageId: savedMessage.id,
-  timestamp: savedMessage.created_at
-});
-        
-        console.log('✅ Group message broadcast complete');
-        console.log('🔴 ===== GROUP MESSAGE COMPLETE =====');
-        
-      } catch (error) {
-        console.error('❌ Fatal error in group_message handler:', error);
-        console.error('❌ Error stack:', error.stack);
-        socket.emit('group_message_error', { 
-          message: 'Server error: ' + error.message,
-          tempId: data?.tempId 
-        });
+        roomId = newRoom.id;
+        console.log('✅ Created new room:', roomId);
       }
+      
+      // STEP 2: Update last_message_at in room
+      await db.supabaseAdmin
+        .from('chat_rooms')
+        .update({ last_message_at: new Date().toISOString() })
+        .eq('id', roomId);
+      
+      // STEP 3: Insert message into chat_messages with the correct room_id
+      const messageData = {
+        user_id: socket.userId,
+        room_id: roomId,
+        message: message,
+        is_read: false,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+        read_by: [],
+        delivered_to: [],
+        deleted_for: [],
+        cleared_for_users: []
+      };
+      
+      console.log('📤 Saving message to chat_messages with room_id:', roomId);
+      
+      const { data: msgData, error: msgError } = await db.supabaseAdmin
+        .from('chat_messages')
+        .insert([messageData])
+        .select('id, created_at')
+        .single();
+
+      if (msgError) {
+        console.error('❌ Error saving message:', msgError);
+        throw msgError;
+      }
+      
+      messageId = msgData.id;
+      console.log('✅ Message saved with ID:', messageId);
+
+      // Get sender info
+      const { data: userData } = await db.supabaseAdmin
+        .from('users')
+        .select('username, profile_pic')
+        .eq('id', socket.userId)
+        .single();
+
+      if (userData) {
+        sender = userData;
+      }
+    } else {
+      // PostgreSQL fallback
+      console.log('PostgreSQL fallback not implemented');
+      return;
+    }
+    
+    // ============ FIXED: Send to recipient WITHOUT tempId ============
+    const messageForRecipient = {
+      id: messageId,
+      sender_id: socket.userId,
+      sender_username: sender.username || socket.username || 'Unknown',
+      sender_profile_pic: sender.profile_pic,
+      receiver_id: to,
+      message: message,
+      created_at: new Date().toISOString(),
+      read_status: false
+      // IMPORTANT: NO tempId here!
+    };
+    
+    // Send to recipient if online
+    const recipientSocketId = onlineUsers.get(to);
+    if (recipientSocketId) {
+      io.to(recipientSocketId).emit('new_message', messageForRecipient);
+      console.log('✅ Message sent to recipient (without tempId)');
+    } else {
+      console.log('ℹ️ Recipient is offline, message saved to database');
+    }
+    
+    // ============ Send confirmation to SENDER WITH tempId ============
+    socket.emit('message_sent', { 
+      messageId: messageId, 
+      tempId: tempId,
+      created_at: new Date().toISOString()
     });
+    
+    console.log('✅ Message sent confirmation emitted to sender');
+    
+  } catch (error) {
+    console.error('❌ Error sending private message:', error);
+    socket.emit('error', { message: 'Failed to send message: ' + error.message });
+  }
+});
+
+
+socket.on('group_message', async (data) => {
+  try {
+    console.log('🔴 ===== GROUP MESSAGE RECEIVED =====');
+    console.log('🔴 Data:', JSON.stringify(data, null, 2));
+    
+    const { groupId, message, tempId } = data;
+    
+    if (!groupId || !message) {
+      console.error('❌ Missing groupId or message');
+      socket.emit('group_message_error', { message: 'Missing group ID or message', tempId });
+      return;
+    }
+    
+    if (!message.trim()) {
+      console.error('❌ Empty message');
+      socket.emit('group_message_error', { message: 'Message cannot be empty', tempId });
+      return;
+    }
+    
+    // Check if user is member of this group
+    const { data: membership, error: memberError } = await db.supabaseAdmin
+      .from('group_members')
+      .select('id, role')
+      .eq('group_id', groupId)
+      .eq('user_id', socket.userId)
+      .eq('status', 'joined');
+    
+    if (memberError) {
+      console.error('❌ Error checking membership:', memberError);
+    }
+    
+    const isMember = membership && membership.length > 0;
+    
+    if (!isMember) {
+      console.error('❌ User is not a member of this group');
+      socket.emit('group_message_error', { message: 'You are not a member of this group', tempId });
+      return;
+    }
+    
+    // Ensure chat room exists for group
+    const { data: existingRoom, error: roomCheckError } = await db.supabaseAdmin
+      .from('chat_rooms')
+      .select('id')
+      .eq('id', groupId)
+      .maybeSingle();
+    
+    if (roomCheckError) {
+      console.error('❌ Error checking room:', roomCheckError);
+    }
+    
+    if (!existingRoom) {
+      console.log('🔴 No chat room found for group, creating one...');
+      
+      const { data: group, error: groupError } = await db.supabaseAdmin
+        .from('groups')
+        .select('created_by, name')
+        .eq('id', groupId)
+        .single();
+      
+      if (groupError) {
+        console.error('❌ Error fetching group:', groupError);
+      }
+      
+      const { data: newRoom, error: roomCreateError } = await db.supabaseAdmin
+        .from('chat_rooms')
+        .insert([{
+          id: groupId,
+          user1_id: group?.created_by || socket.userId,
+          user2_id: null,
+          created_at: new Date().toISOString(),
+          last_message_at: new Date().toISOString(),
+          is_group: true
+        }])
+        .select()
+        .single();
+      
+      if (roomCreateError && roomCreateError.code !== '23505') {
+        console.error('❌ Error creating chat room:', roomCreateError);
+        throw roomCreateError;
+      }
+    } else {
+      // Update last_message_at
+      await db.supabaseAdmin
+        .from('chat_rooms')
+        .update({ last_message_at: new Date().toISOString() })
+        .eq('id', groupId);
+    }
+    
+    // Save message to database
+    const messageData = {
+      user_id: socket.userId,
+      room_id: groupId,
+      message: message,
+      is_read: false,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+      read_by: [],
+      delivered_to: [],
+      deleted_for: [],
+      cleared_for_users: []
+    };
+    
+    const { data: savedMessage, error: saveError } = await db.supabaseAdmin
+      .from('chat_messages')
+      .insert([messageData])
+      .select()
+      .single();
+    
+    if (saveError) {
+      console.error('❌ Error saving group message:', saveError);
+      socket.emit('group_message_error', { message: 'Failed to save message: ' + saveError.message, tempId });
+      return;
+    }
+    
+    console.log('✅ Group message saved with ID:', savedMessage.id);
+    
+    // Get sender info
+    const { data: sender, error: senderError } = await db.supabaseAdmin
+      .from('users')
+      .select('username, profile_pic')
+      .eq('id', socket.userId)
+      .single();
+    
+    if (senderError) {
+      console.error('Error fetching sender:', senderError);
+    }
+    
+    const roomName = `group_${groupId}`;
+    
+    // Make sure socket is in the room
+    if (!socket.rooms.has(roomName)) {
+      await socket.join(roomName);
+      console.log(`✅ User joined room ${roomName}`);
+    }
+    
+    // ============ FIXED: Broadcast to OTHER users WITHOUT tempId ============
+    const messageForOthers = {
+      id: savedMessage.id,
+      groupId: groupId,
+      senderId: socket.userId,
+      senderUsername: sender?.username || socket.username || 'Unknown',
+      senderProfilePic: sender?.profile_pic,
+      message: message,
+      timestamp: savedMessage.created_at
+      // IMPORTANT: NO tempId here!
+    };
+    
+    // Broadcast to ALL OTHER users in the group room (excluding sender)
+    socket.to(roomName).emit('group_message_received', messageForOthers);
+    console.log(`✅ Group message broadcast to other users in room ${roomName} (without tempId)`);
+    
+    // ============ Send confirmation to SENDER WITH tempId ============
+    socket.emit('group_message_sent', {
+      tempId: tempId,
+      messageId: savedMessage.id,
+      timestamp: savedMessage.created_at
+    });
+    console.log(`✅ Group message confirmation sent to sender (with tempId)`);
+    
+    console.log('🔴 ===== GROUP MESSAGE COMPLETE =====');
+    
+  } catch (error) {
+    console.error('❌ Fatal error in group_message handler:', error);
+    socket.emit('group_message_error', { 
+      message: 'Server error: ' + error.message,
+      tempId: data?.tempId 
+    });
+  }
+});
 
     // ============ JOIN GROUP ROOM ============
     socket.on('join_group', async (data) => {
