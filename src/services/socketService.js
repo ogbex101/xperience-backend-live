@@ -484,12 +484,13 @@ const initializeSocket = (io) => {
       console.log(`✅ Typing indicator broadcast to room ${roomName}`);
     });
 
-    socket.on('private_message', async (data) => {
+   socket.on('private_message', async (data) => {
   try {
     const { to, message, tempId } = data;
     
     console.log('📤 Socket.io: Private message from', socket.userId, 'to', to);
     console.log('📤 Message content:', message);
+    console.log('📤 TempId:', tempId);
     
     if (!to || !message) {
       console.error('Invalid message data:', data);
@@ -501,11 +502,11 @@ const initializeSocket = (io) => {
     let sender = { username: socket.username, profile_pic: null };
     
     if (db.isSupabase) {
-      // STEP 1: Find or create chat room using user1_id and user2_id
+      // STEP 1: Find or create chat room
       const user1 = socket.userId < to ? socket.userId : to;
       const user2 = socket.userId < to ? to : socket.userId;
       
-      // Check if room exists with these two users
+      // Check if room exists
       const { data: existingRoom, error: roomCheckError } = await db.supabaseAdmin
         .from('chat_rooms')
         .select('id')
@@ -521,7 +522,7 @@ const initializeSocket = (io) => {
         roomId = existingRoom.id;
         console.log('✅ Found existing room:', roomId);
       } else {
-        // Create new room with the two users
+        // Create new room
         const { data: newRoom, error: roomCreateError } = await db.supabaseAdmin
           .from('chat_rooms')
           .insert([{
@@ -543,13 +544,13 @@ const initializeSocket = (io) => {
         console.log('✅ Created new room:', roomId);
       }
       
-      // STEP 2: Update last_message_at in room
+      // STEP 2: Update last_message_at
       await db.supabaseAdmin
         .from('chat_rooms')
         .update({ last_message_at: new Date().toISOString() })
         .eq('id', roomId);
       
-      // STEP 3: Insert message into chat_messages with the correct room_id
+      // STEP 3: Insert message
       const messageData = {
         user_id: socket.userId,
         room_id: roomId,
@@ -618,6 +619,7 @@ const initializeSocket = (io) => {
     }
     
     // ============ Send confirmation to SENDER WITH tempId ============
+    // IMPORTANT: Only send message_sent, NOT also new_message to sender
     socket.emit('message_sent', { 
       messageId: messageId, 
       tempId: tempId,
@@ -631,7 +633,6 @@ const initializeSocket = (io) => {
     socket.emit('error', { message: 'Failed to send message: ' + error.message });
   }
 });
-
 
 socket.on('group_message', async (data) => {
   try {
