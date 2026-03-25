@@ -566,22 +566,23 @@ router.post('/fund/initialize', authenticateToken, async (req, res) => {
       user = userRows && userRows.length > 0 ? userRows[0] : null;
     }
     
-    const flutterwaveConfig = {
-      public_key: process.env.FLUTTERWAVE_PUBLIC_KEY || 'FLWPUBK_TEST-xxxxxxxxxxxxxxxxxxxxxxxxxxxx-X',
-      tx_ref: reference,
-      amount: amount,
-      currency: currency,
-      redirect_url: `${process.env.CLIENT_URL}/wallet/callback`,
-      customer: {
-        email: user?.email || 'customer@example.com',
-        name: user?.username || 'User',
-      },
-      customizations: {
-        title: "XP Gaming Wallet",
-        description: `Deposit of ${amount} ${currency}`,
-        logo: "https://your-logo-url.com/logo.png"
-      }
-    };
+    // In your wallet.js, in the /fund/initialize endpoint
+const flutterwaveConfig = {
+  public_key: process.env.FLUTTERWAVE_PUBLIC_KEY,
+  tx_ref: reference,
+  amount: amount,
+  currency: currency,
+  redirect_url: `${process.env.CLIENT_URL || 'https://xperience-frontend-live-49xr.vercel.app'}/wallet/callback`,
+  customer: {
+    email: user?.email || 'customer@example.com',
+    name: user?.username || 'User',
+  },
+  customizations: {
+    title: "XP Gaming Wallet",
+    description: `Deposit of ${amount} ${currency}`,
+    logo: "https://your-logo-url.com/logo.png"
+  }
+};
     
     res.json({
       success: true,

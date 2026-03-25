@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const db = require('../config/database');
+const supabase = require('../config/supabase'); // Assuming you have supabase client configured
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const { v4: uuidv4 } = require('uuid');
@@ -29,7 +29,6 @@ router.post('/login-test', (req, res) => {
     
     // Hardcoded credentials for testing
     if (username === 'admin' && password === 'admin@2005') {
-      // Generate JWT token
       const token = jwt.sign(
         { 
           id: 1, 
@@ -73,10 +72,7 @@ router.post('/login-test', (req, res) => {
 
 // ==================== MIDDLEWARE ====================
 
-// ==================== MIDDLEWARE ====================
-
-// Middleware to verify admin token - FIXED VERSION
-// Middleware to verify admin token - IMPROVED VERSION
+// Middleware to verify admin token
 const authenticateAdmin = async (req, res, next) => {
   try {
     console.log('🛡️ Admin auth middleware checking...');
@@ -92,7 +88,6 @@ const authenticateAdmin = async (req, res, next) => {
 
     const token = authHeader.split(' ')[1];
     
-    // Check if token is null or "null" string
     if (!token || token === 'null' || token === 'undefined') {
       console.log('❌ Token is null/undefined');
       return res.status(401).json({ 
@@ -112,14 +107,20 @@ const authenticateAdmin = async (req, res, next) => {
     });
     
     // Check if user is admin
-    const result = await db.execute(
-      'SELECT id, username, role, is_active FROM admin_users WHERE id = $1',
-      [decoded.id]
-    );
+    const { data: adminRows, error: adminError } = await supabase
+      .from('admin_users')
+      .select('id, username, role, is_active')
+      .eq('id', decoded.id);
 
-    // Handle different PostgreSQL result formats
-    const adminRows = result.rows || result[0] || [];
-    const admin = adminRows.length > 0 ? adminRows[0] : null;
+    if (adminError) {
+      console.error('❌ Admin query error:', adminError);
+      return res.status(401).json({ 
+        success: false, 
+        message: 'Authentication failed' 
+      });
+    }
+
+    const admin = adminRows && adminRows.length > 0 ? adminRows[0] : null;
 
     if (!admin || admin.is_active !== true) {
       console.log('❌ Admin not found or inactive');
@@ -148,6 +149,7 @@ const authenticateAdmin = async (req, res, next) => {
     });
   }
 };
+
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 5 * 1024 * 1024 }, // 5MB limit
@@ -161,7 +163,7 @@ const upload = multer({
 });
 
 // ==================== ADMIN AUTH ====================
-// ==================== ADMIN AUTH ====================
+
 router.post('/login', async (req, res) => {
   try {
     const { username, password } = req.body;
@@ -177,31 +179,31 @@ router.post('/login', async (req, res) => {
     }
 
     // ============ TEMPORARY: HARDCODED FALLBACK ============
-    // This ensures login works even if database is empty
     if (username === 'admin' && password === 'admin@2005') {
       console.log('✅ Using hardcoded admin credentials (FALLBACK)');
       
-      // First, try to create admin in database if not exists
       try {
-        const [existingAdmins] = await db.execute(
-          'SELECT id FROM admin_users WHERE username = $1',
-          [username]
-        );
+        const { data: existingAdmins, error: checkError } = await supabase
+          .from('admin_users')
+          .select('id')
+          .eq('username', username);
         
-        if (existingAdmins.length === 0) {
+        if (!checkError && (!existingAdmins || existingAdmins.length === 0)) {
           console.log('⚠️ Creating admin user in database...');
           const hashedPassword = await bcrypt.hash(password, 10);
-          await db.execute(
-            `INSERT INTO admin_users 
-             (username, password_hash, email, role, is_active) 
-             VALUES ($1, $2, $3, $4, TRUE)`,
-            [username, hashedPassword, 'admin@xperience.com', 'super_admin']
-          );
+          await supabase
+            .from('admin_users')
+            .insert({
+              username: username,
+              password_hash: hashedPassword,
+              email: 'admin@xperience.com',
+              role: 'super_admin',
+              is_active: true
+            });
           console.log('✅ Admin user created in database');
         }
       } catch (dbError) {
         console.warn('⚠️ Could not check/create admin in database:', dbError.message);
-        // Continue with hardcoded token even if DB fails
       }
       
       const token = jwt.sign(
@@ -224,19 +226,28 @@ router.post('/login', async (req, res) => {
           username: 'admin',
           email: 'admin@xperience.com',
           role: 'super_admin',
-          permissions: [] // Return empty array for hardcoded admin
+          permissions: []
         }
       });
     }
     // ============ END TEMPORARY FALLBACK ============
 
     console.log('🔍 Checking database for admin user...');
-    const [admins] = await db.execute(
-      'SELECT * FROM admin_users WHERE username = $1 AND is_active = TRUE',
-      [username]
-    );
+    const { data: admins, error: adminError } = await supabase
+      .from('admin_users')
+      .select('*')
+      .eq('username', username)
+      .eq('is_active', true);
 
-    if (admins.length === 0) {
+    if (adminError) {
+      console.error('❌ Admin query error:', adminError);
+      return res.status(500).json({ 
+        success: false, 
+        message: 'Database error' 
+      });
+    }
+
+    if (!admins || admins.length === 0) {
       console.log('❌ Admin user not found in database');
       return res.status(401).json({ 
         success: false, 
@@ -248,15 +259,12 @@ router.post('/login', async (req, res) => {
     console.log('✅ Admin found:', admin.username);
     console.log('Password hash type:', admin.password_hash?.substring(0, 10));
     
-    // Check password
     let validPassword = false;
     
-    // Try bcrypt compare first
     if (admin.password_hash && admin.password_hash.startsWith('$2')) {
       validPassword = await bcrypt.compare(password, admin.password_hash);
       console.log('🔐 Bcrypt password check:', validPassword ? '✅ Match' : '❌ No match');
     } 
-    // If not bcrypt hash, check plain text (for development only)
     else if (admin.password_hash === password) {
       validPassword = true;
       console.log('🔐 Plain password match (DEV MODE)');
@@ -273,10 +281,10 @@ router.post('/login', async (req, res) => {
     console.log('✅ Password verified successfully');
     
     // Update last login
-    await db.execute(
-      'UPDATE admin_users SET last_login = NOW() WHERE id = $1',
-      [admin.id]
-    );
+    await supabase
+      .from('admin_users')
+      .update({ last_login: new Date().toISOString() })
+      .eq('id', admin.id);
 
     // Create token
     const token = jwt.sign(
@@ -292,19 +300,21 @@ router.post('/login', async (req, res) => {
 
     // Log activity
     try {
-      await db.execute(
-        `INSERT INTO admin_activity_logs 
-         (admin_id, action_type, description, ip_address) 
-         VALUES ($1, 'login', 'Admin logged in', $2)`,
-        [admin.id, req.ip || 'unknown']
-      );
+      await supabase
+        .from('admin_activity_logs')
+        .insert({
+          admin_id: admin.id,
+          action_type: 'login',
+          description: 'Admin logged in',
+          ip_address: req.ip || 'unknown'
+        });
     } catch (logError) {
       console.warn('⚠️ Could not log admin activity:', logError.message);
     }
 
     console.log('🎉 Admin login successful for:', admin.username);
     
-    // ============ FIXED PERMISSIONS PARSING ============
+    // Parse permissions
     let permissions = [];
     try {
       if (admin.permissions) {
@@ -312,18 +322,14 @@ router.post('/login', async (req, res) => {
         console.log('🔧 Admin permissions type:', typeof admin.permissions);
         
         if (typeof admin.permissions === 'string') {
-          // Try to parse as JSON
           try {
             permissions = JSON.parse(admin.permissions);
             console.log('✅ Parsed permissions as JSON:', permissions);
           } catch (jsonError) {
             console.warn('⚠️ Could not parse permissions as JSON:', jsonError.message);
             
-            // If it's a string that looks like an array but not valid JSON
-            // Example: "['view_users', 'view_transactions']"
             if (admin.permissions.startsWith('[') && admin.permissions.endsWith(']')) {
               try {
-                // Try to clean up the string
                 const cleaned = admin.permissions
                   .replace(/'/g, '"')
                   .replace(/\[|\]/g, '')
@@ -335,11 +341,9 @@ router.post('/login', async (req, res) => {
                 console.warn('⚠️ Could not extract permissions from string:', cleanError.message);
               }
             } else if (admin.permissions.includes(',')) {
-              // Comma-separated list
               permissions = admin.permissions.split(',').map(item => item.trim());
               console.log('✅ Split permissions from comma-separated string:', permissions);
             } else {
-              // Single permission
               permissions = [admin.permissions.trim()];
               console.log('✅ Single permission:', permissions);
             }
@@ -348,7 +352,6 @@ router.post('/login', async (req, res) => {
           permissions = admin.permissions;
           console.log('✅ Permissions already an array:', permissions);
         } else if (admin.permissions && typeof admin.permissions === 'object') {
-          // Convert object keys to array
           permissions = Object.keys(admin.permissions);
           console.log('✅ Converted object to permissions array:', permissions);
         }
@@ -358,13 +361,11 @@ router.post('/login', async (req, res) => {
       permissions = [];
     }
     
-    // Ensure permissions is always an array
     if (!Array.isArray(permissions)) {
       permissions = [];
     }
     
     console.log('🔧 Final permissions:', permissions);
-    // ============ END FIX ============
     
     res.json({
       success: true,
@@ -375,7 +376,7 @@ router.post('/login', async (req, res) => {
         username: admin.username,
         email: admin.email,
         role: admin.role,
-        permissions: permissions // Always return an array
+        permissions: permissions
       }
     });
 
@@ -390,101 +391,189 @@ router.post('/login', async (req, res) => {
 });
 
 // ==================== DASHBOARD STATS ====================
+
 router.get('/dashboard/stats', authenticateAdmin, async (req, res) => {
   try {
     console.log('📊 Fetching dashboard stats for admin:', req.admin.username);
     
-    // Get tournament stats - FIXED: boolean comparison and PostgreSQL date functions
-    const [tournamentStats] = await db.execute(`SELECT 
-      COUNT(*) as totalTournaments,
-      SUM(CASE WHEN status = 'upcoming' THEN 1 ELSE 0 END) as upcomingTournaments,
-      SUM(CASE WHEN status = 'ongoing' THEN 1 ELSE 0 END) as ongoingTournaments,
-      SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completedTournaments,
-      SUM(CASE WHEN status = 'cancelled' THEN 1 ELSE 0 END) as cancelledTournaments,
-      COALESCE(SUM(prize_pool + custom_prize_pool), 0) as totalPrizePool,
-      SUM(CASE WHEN admin_monitoring = true THEN 1 ELSE 0 END) as monitored_tournaments
-    FROM tournaments`);
+    // Get tournament stats
+    const { data: tournamentStats, error: tournamentError } = await supabase
+      .from('tournaments')
+      .select('*', { count: 'exact' });
 
-    // Get other stats - UPDATED WITH GROUP STATS - FIXED: PostgreSQL date functions
-    const [stats] = await db.execute(`SELECT 
-      (SELECT COUNT(*) FROM users) as total_users,
-      COALESCE((SELECT SUM(balance) FROM users), 0) as total_balance,
-      COALESCE((SELECT SUM(xp_points) FROM users), 0) as total_xp,
-      (SELECT COUNT(*) FROM withdrawal_requests WHERE status = 'pending') as pending_withdrawals,
-      (SELECT COUNT(*) FROM transactions WHERE DATE(created_at) = CURRENT_DATE) as today_transactions,
-      COALESCE((SELECT SUM(amount) FROM transactions WHERE DATE(created_at) = CURRENT_DATE AND type = 'deposit'), 0) as today_deposits,
-      (SELECT COUNT(*) FROM fraud_flags WHERE status = 'active') as active_fraud_flags,
-      (SELECT COUNT(*) FROM matches WHERE status = 'ongoing') as ongoing_matches,
-      (SELECT COUNT(*) FROM groups WHERE DATE(created_at) = CURRENT_DATE) as today_groups,
-      (SELECT COUNT(*) FROM groups) as total_groups,
-      (SELECT COUNT(*) FROM groups WHERE visibility = 'public') as public_groups,
-      (SELECT COUNT(*) FROM groups WHERE visibility = 'private') as private_groups,
-      (SELECT COUNT(*) FROM group_members WHERE status = 'joined') as total_group_members,
-      (SELECT COUNT(*) FROM groups WHERE created_at >= NOW() - INTERVAL '7 days') as active_groups
-    `);
+    if (tournamentError) {
+      console.error('Tournament stats error:', tournamentError);
+    }
 
-    // Combine stats
-    const combinedStats = {
-      ...stats[0],
-      ...tournamentStats[0]
+    // Calculate tournament stats
+    const tournamentStatsCalc = {
+      totalTournaments: tournamentStats?.length || 0,
+      upcomingTournaments: tournamentStats?.filter(t => t.status === 'upcoming').length || 0,
+      ongoingTournaments: tournamentStats?.filter(t => t.status === 'ongoing').length || 0,
+      completedTournaments: tournamentStats?.filter(t => t.status === 'completed').length || 0,
+      cancelledTournaments: tournamentStats?.filter(t => t.status === 'cancelled').length || 0,
+      totalPrizePool: tournamentStats?.reduce((sum, t) => sum + (t.prize_pool || 0) + (t.custom_prize_pool || 0), 0) || 0,
+      monitored_tournaments: tournamentStats?.filter(t => t.admin_monitoring === true).length || 0
     };
 
-    // Get other data...
-    const [recentWithdrawals] = await db.execute(`SELECT 
-      wr.*, u.username, u.email 
-      FROM withdrawal_requests wr
-      JOIN users u ON wr.user_id = u.id
-      WHERE wr.status = 'pending'
-      ORDER BY wr.created_at DESC
-      LIMIT 10`);
+    // Get user stats
+    const { data: users, error: usersError } = await supabase
+      .from('users')
+      .select('balance, xp_points');
 
-    const [recentUsers] = await db.execute(`SELECT 
-      id, username, email, balance, xp_points, created_at 
-      FROM users 
-      ORDER BY created_at DESC 
-      LIMIT 5`);
+    // Get withdrawal stats
+    const { data: withdrawals, error: withdrawalError } = await supabase
+      .from('withdrawal_requests')
+      .select('status, amount')
+      .eq('status', 'pending');
 
-    const [ongoingMatches] = await db.execute(`SELECT 
-      m.*, 
-      p1.username as player1_username,
-      p2.username as player2_username,
-      w.username as winner_username
-      FROM matches m
-      LEFT JOIN users p1 ON m.player1_id = p1.id
-      LEFT JOIN users p2 ON m.player2_id = p2.id
-      LEFT JOIN users w ON m.winner_id = w.id
-      WHERE m.status = 'ongoing'
-      ORDER BY m.created_at DESC
-      LIMIT 5`);
+    // Get transaction stats
+    const today = new Date().toISOString().split('T')[0];
+    const { data: todayTransactions, error: txError } = await supabase
+      .from('transactions')
+      .select('amount, type')
+      .gte('created_at', `${today}T00:00:00`)
+      .lte('created_at', `${today}T23:59:59`);
 
-    const [ongoingTournaments] = await db.execute(`SELECT 
-      t.*, 
-      c.username as creator_username,
-      w.username as winner_username
-      FROM tournaments t
-      LEFT JOIN users c ON t.creator_id = c.id
-      LEFT JOIN users w ON t.winner_id = w.id
-      WHERE t.status = 'ongoing'
-      ORDER BY t.start_date ASC
-      LIMIT 5`);
+    // Get fraud stats
+    const { data: fraudFlags, error: fraudError } = await supabase
+      .from('fraud_flags')
+      .select('status')
+      .eq('status', 'active');
 
-    const [recentGroups] = await db.execute(`SELECT 
-      g.*, 
-      u.username as creator_username,
-      (SELECT COUNT(*) FROM group_members gm WHERE gm.group_id = g.id AND gm.status = 'joined') as member_count
-      FROM groups g
-      JOIN users u ON g.creator_id = u.id
-      ORDER BY g.created_at DESC
-      LIMIT 5`);
+    // Get match stats
+    const { data: ongoingMatches, error: matchError } = await supabase
+      .from('matches')
+      .select('*')
+      .eq('status', 'ongoing');
+
+    // Get group stats
+    const { data: groups, error: groupError } = await supabase
+      .from('groups')
+      .select('id, visibility, created_at');
+
+    const { data: groupMembers, error: memberError } = await supabase
+      .from('group_members')
+      .select('*')
+      .eq('status', 'joined');
+
+    const stats = {
+      total_users: users?.length || 0,
+      total_balance: users?.reduce((sum, u) => sum + (parseFloat(u.balance) || 0), 0) || 0,
+      total_xp: users?.reduce((sum, u) => sum + (parseFloat(u.xp_points) || 0), 0) || 0,
+      pending_withdrawals: withdrawals?.length || 0,
+      today_transactions: todayTransactions?.length || 0,
+      today_deposits: todayTransactions?.filter(tx => tx.type === 'deposit').reduce((sum, tx) => sum + parseFloat(tx.amount), 0) || 0,
+      active_fraud_flags: fraudFlags?.length || 0,
+      ongoing_matches: ongoingMatches?.length || 0,
+      today_groups: groups?.filter(g => g.created_at?.split('T')[0] === today).length || 0,
+      total_groups: groups?.length || 0,
+      public_groups: groups?.filter(g => g.visibility === 'public').length || 0,
+      private_groups: groups?.filter(g => g.visibility === 'private').length || 0,
+      total_group_members: groupMembers?.length || 0,
+      active_groups: groups?.filter(g => {
+        const createdDate = new Date(g.created_at);
+        const weekAgo = new Date();
+        weekAgo.setDate(weekAgo.getDate() - 7);
+        return createdDate >= weekAgo;
+      }).length || 0
+    };
+
+    const combinedStats = { ...stats, ...tournamentStatsCalc };
+
+    // Get recent withdrawals
+    const { data: recentWithdrawals, error: wrError } = await supabase
+      .from('withdrawal_requests')
+      .select(`
+        *,
+        users (
+          username,
+          email
+        )
+      `)
+      .eq('status', 'pending')
+      .order('created_at', { ascending: false })
+      .limit(10);
+
+    // Get recent users
+    const { data: recentUsers, error: ruError } = await supabase
+      .from('users')
+      .select('id, username, email, balance, xp_points, created_at')
+      .order('created_at', { ascending: false })
+      .limit(5);
+
+    // Get ongoing matches with player info
+    const { data: ongoingMatchesData, error: omError } = await supabase
+      .from('matches')
+      .select(`
+        *,
+        player1:player1_id (username),
+        player2:player2_id (username),
+        winner:winner_id (username)
+      `)
+      .eq('status', 'ongoing')
+      .order('created_at', { ascending: false })
+      .limit(5);
+
+    // Format ongoing matches
+    const formattedMatches = ongoingMatchesData?.map(m => ({
+      ...m,
+      player1_username: m.player1?.username,
+      player2_username: m.player2?.username,
+      winner_username: m.winner?.username
+    })) || [];
+
+    // Get ongoing tournaments
+    const { data: ongoingTournaments, error: otError } = await supabase
+      .from('tournaments')
+      .select(`
+        *,
+        creator:creator_id (username),
+        winner:winner_id (username)
+      `)
+      .eq('status', 'ongoing')
+      .order('start_date', { ascending: true })
+      .limit(5);
+
+    const formattedTournaments = ongoingTournaments?.map(t => ({
+      ...t,
+      creator_username: t.creator?.username,
+      winner_username: t.winner?.username
+    })) || [];
+
+    // Get recent groups
+    const { data: recentGroups, error: rgError } = await supabase
+      .from('groups')
+      .select(`
+        *,
+        creator:creator_id (username)
+      `)
+      .order('created_at', { ascending: false })
+      .limit(5);
+
+    // Get member counts for groups
+    const groupsWithCounts = await Promise.all((recentGroups || []).map(async (group) => {
+      const { count } = await supabase
+        .from('group_members')
+        .select('*', { count: 'exact', head: true })
+        .eq('group_id', group.id)
+        .eq('status', 'joined');
+      
+      return {
+        ...group,
+        creator_username: group.creator?.username,
+        member_count: count || 0
+      };
+    }));
 
     res.json({
       success: true,
       stats: combinedStats,
-      recent_withdrawals: recentWithdrawals,
-      recent_users: recentUsers,
-      ongoing_matches: ongoingMatches,
-      ongoing_tournaments: ongoingTournaments,
-      recent_groups: recentGroups
+      recent_withdrawals: recentWithdrawals || [],
+      recent_users: recentUsers || [],
+      ongoing_matches: formattedMatches,
+      ongoing_tournaments: formattedTournaments,
+      recent_groups: groupsWithCounts
     });
 
   } catch (error) {
@@ -497,6 +586,8 @@ router.get('/dashboard/stats', authenticateAdmin, async (req, res) => {
   }
 });
 
+// ==================== WITHDRAWAL MANAGEMENT ====================
+
 router.get('/withdrawals', authenticateAdmin, async (req, res) => {
   try {
     const { status = '', page = 1, limit = 20 } = req.query;
@@ -504,70 +595,36 @@ router.get('/withdrawals', authenticateAdmin, async (req, res) => {
 
     console.log('📋 Fetching withdrawals - Status:', status, 'Page:', page);
 
-    // Build query with parameterized values
-    // FIXED: Cast user_id to integer for proper comparison
-    let query = `
-      SELECT 
-        wr.*,
-        u.username,
-        u.email,
-        u.wallet_account_number
-      FROM withdrawal_requests wr
-      JOIN users u ON wr.user_id::integer = u.id
-    `;
-    
-    let countQuery = `
-      SELECT COUNT(*) as total 
-      FROM withdrawal_requests wr
-      JOIN users u ON wr.user_id::integer = u.id
-    `;
-    
-    const params = [];
-    const countParams = [];
-    let paramCount = 1;
-    let countParamCount = 1;
-    
-    // Add status filter if provided
+    let query = supabase
+      .from('withdrawal_requests')
+      .select(`
+        *,
+        users (
+          username,
+          email,
+          wallet_account_number
+        )
+      `);
+
     if (status && status.trim() !== '') {
-      query += ` WHERE wr.status = $${paramCount}`;
-      countQuery += ` WHERE wr.status = $${countParamCount}`;
-      params.push(status);
-      countParams.push(status);
-      paramCount++;
-      countParamCount++;
-    }
-    
-    // Add ordering and pagination
-    query += ` ORDER BY wr.created_at DESC`;
-    
-    if (limit) {
-      query += ` LIMIT $${paramCount}`;
-      params.push(parseInt(limit));
-      paramCount++;
-    }
-    
-    if (offset) {
-      query += ` OFFSET $${paramCount}`;
-      params.push(parseInt(offset));
+      query = query.eq('status', status);
     }
 
-    console.log('📝 Query:', query);
-    console.log('📝 Params:', params);
+    query = query.order('created_at', { ascending: false });
 
-    // Execute queries
-    const withdrawalsResult = await db.execute(query, params);
-    const countResult = await db.execute(countQuery, countParams);
-    
-    // Handle different result formats
-    const withdrawals = withdrawalsResult.rows || withdrawalsResult[0] || [];
-    const total = countResult.rows ? 
-      parseInt(countResult.rows[0]?.total || 0) : 
-      (countResult[0] ? parseInt(countResult[0][0]?.total || 0) : 0);
+    const { data: withdrawals, error, count } = await query
+      .range(offset, offset + limit - 1)
+      .select('*', { count: 'exact' });
 
-    console.log('✅ Found', withdrawals.length, 'withdrawals out of', total, 'total');
+    if (error) {
+      console.error('Withdrawals query error:', error);
+      throw error;
+    }
 
-    // Format the withdrawals to include parsed bank details
-    const formattedWithdrawals = withdrawals.map(withdrawal => {
+    console.log('✅ Found', withdrawals?.length || 0, 'withdrawals out of', count || 0, 'total');
+
+    // Format withdrawals
+    const formattedWithdrawals = (withdrawals || []).map(withdrawal => {
       let accountDetails = {};
       try {
         if (withdrawal.account_details) {
@@ -581,19 +638,22 @@ router.get('/withdrawals', authenticateAdmin, async (req, res) => {
 
       return {
         ...withdrawal,
-        account_details: accountDetails
+        username: withdrawal.users?.username,
+        email: withdrawal.users?.email,
+        wallet_account_number: withdrawal.users?.wallet_account_number,
+        account_details: accountDetails,
+        users: undefined
       };
     });
 
-    // Return proper response structure
     res.json({
       success: true,
       withdrawals: formattedWithdrawals,
       pagination: {
         page: parseInt(page),
         limit: parseInt(limit),
-        total: total,
-        totalPages: Math.ceil(total / limit)
+        total: count || 0,
+        totalPages: Math.ceil((count || 0) / limit)
       }
     });
 
@@ -606,22 +666,23 @@ router.get('/withdrawals', authenticateAdmin, async (req, res) => {
     });
   }
 });
+
 router.get('/withdrawals/:id', authenticateAdmin, async (req, res) => {
   try {
     const { id } = req.params;
     console.log('🔍 Fetching withdrawal details for ID:', id);
 
-    const [withdrawals] = await db.execute(`
-      SELECT wr.*, u.*, 
-             JSON_UNQUOTE(JSON_EXTRACT(wr.account_details, '$.bank_name')) as bank_name,
-             JSON_UNQUOTE(JSON_EXTRACT(wr.account_details, '$.account_number')) as account_number,
-             JSON_UNQUOTE(JSON_EXTRACT(wr.account_details, '$.account_name')) as account_name
-      FROM withdrawal_requests wr
-      JOIN users u ON wr.user_id = u.id
-      WHERE wr.id = ?
-    `, [id]);
+    const { data: withdrawals, error } = await supabase
+      .from('withdrawal_requests')
+      .select(`
+        *,
+        users (*)
+      `)
+      .eq('id', id);
 
-    if (withdrawals.length === 0) {
+    if (error) throw error;
+
+    if (!withdrawals || withdrawals.length === 0) {
       console.log('❌ Withdrawal not found:', id);
       return res.status(404).json({ 
         success: false, 
@@ -629,28 +690,47 @@ router.get('/withdrawals/:id', authenticateAdmin, async (req, res) => {
       });
     }
 
-    console.log('✅ Withdrawal found:', withdrawals[0].receipt_number);
+    const withdrawal = withdrawals[0];
+    
+    // Parse account details
+    let accountDetails = {};
+    try {
+      if (withdrawal.account_details) {
+        accountDetails = typeof withdrawal.account_details === 'string' 
+          ? JSON.parse(withdrawal.account_details) 
+          : withdrawal.account_details;
+      }
+    } catch (error) {
+      console.warn('Could not parse account_details:', error);
+    }
+
+    console.log('✅ Withdrawal found:', withdrawal.receipt_number);
 
     // Get transaction details
-    const [transactions] = await db.execute(
-      'SELECT * FROM transactions WHERE id = ?',
-      [withdrawals[0].transaction_id]
-    );
+    const { data: transactions, error: txError } = await supabase
+      .from('transactions')
+      .select('*')
+      .eq('id', withdrawal.transaction_id);
 
     // Get approval history
-    const [approvals] = await db.execute(`
-      SELECT wa.*, au.username as admin_username
-      FROM withdrawal_approvals wa
-      LEFT JOIN admin_users au ON wa.admin_id = au.id
-      WHERE wa.withdrawal_request_id = ?
-      ORDER BY wa.created_at DESC
-    `, [id]);
+    const { data: approvals, error: appError } = await supabase
+      .from('withdrawal_approvals')
+      .select(`
+        *,
+        admin_users (username)
+      `)
+      .eq('withdrawal_request_id', id)
+      .order('created_at', { ascending: false });
 
     res.json({
       success: true,
-      withdrawal: withdrawals[0],
-      transaction: transactions[0] || null,
-      approvals: approvals
+      withdrawal: {
+        ...withdrawal,
+        account_details: accountDetails,
+        users: withdrawal.users
+      },
+      transaction: transactions?.[0] || null,
+      approvals: approvals || []
     });
 
   } catch (error) {
@@ -682,12 +762,14 @@ router.post('/withdrawals/:id/action', authenticateAdmin, async (req, res) => {
     }
 
     // Get withdrawal
-    const [withdrawals] = await db.execute(
-      'SELECT * FROM withdrawal_requests WHERE id = ?',
-      [id]
-    );
+    const { data: withdrawals, error: wError } = await supabase
+      .from('withdrawal_requests')
+      .select('*')
+      .eq('id', id);
 
-    if (withdrawals.length === 0) {
+    if (wError) throw wError;
+
+    if (!withdrawals || withdrawals.length === 0) {
       return res.status(404).json({ 
         success: false, 
         message: 'Withdrawal not found' 
@@ -709,10 +791,11 @@ router.post('/withdrawals/:id/action', authenticateAdmin, async (req, res) => {
         newStatus = 'rejected';
         console.log('❌ Rejecting withdrawal, refunding money');
         // Refund money back to user
-        await db.execute(
-          'UPDATE users SET balance = balance + ? WHERE id = ?',
-          [withdrawal.amount, withdrawal.user_id]
-        );
+        const { error: balanceError } = await supabase.rpc('increment_user_balance', {
+          user_id: withdrawal.user_id,
+          amount: withdrawal.amount
+        });
+        if (balanceError) throw balanceError;
         break;
       case 'processing':
         newStatus = 'processing';
@@ -723,39 +806,56 @@ router.post('/withdrawals/:id/action', authenticateAdmin, async (req, res) => {
         break;
     }
 
-    await db.execute('START TRANSACTION');
-
+    // Start a transaction using RPC or multiple operations
     try {
       // Update withdrawal status
-      await db.execute(
-        'UPDATE withdrawal_requests SET status = ?, processed_by = ?, processed_at = NOW() WHERE id = ?',
-        [newStatus, adminId, id]
-      );
+      const { error: updateError } = await supabase
+        .from('withdrawal_requests')
+        .update({
+          status: newStatus,
+          processed_by: adminId,
+          processed_at: new Date().toISOString()
+        })
+        .eq('id', id);
+
+      if (updateError) throw updateError;
 
       // Update transaction status
-      await db.execute(
-        'UPDATE transactions SET status = ? WHERE id = ?',
-        [newStatus, withdrawal.transaction_id]
-      );
+      const { error: txUpdateError } = await supabase
+        .from('transactions')
+        .update({ status: newStatus })
+        .eq('id', withdrawal.transaction_id);
+
+      if (txUpdateError) throw txUpdateError;
 
       // Record approval
-      await db.execute(
-        `INSERT INTO withdrawal_approvals 
-         (withdrawal_request_id, admin_id, old_status, new_status, notes, proof_document) 
-         VALUES (?, ?, ?, ?, ?, ?)`,
-        [id, adminId, oldStatus, newStatus, notes || null, proof_document || null]
-      );
+      const { error: approvalError } = await supabase
+        .from('withdrawal_approvals')
+        .insert({
+          withdrawal_request_id: id,
+          admin_id: adminId,
+          old_status: oldStatus,
+          new_status: newStatus,
+          notes: notes || null,
+          proof_document: proof_document || null
+        });
+
+      if (approvalError) throw approvalError;
 
       // Log activity
-      await db.execute(
-        `INSERT INTO admin_activity_logs 
-         (admin_id, action_type, description, affected_user_id, affected_transaction_id) 
-         VALUES (?, 'withdrawal_action', ?, ?, ?)`,
-        [adminId, `${action} withdrawal #${id}`, withdrawal.user_id, withdrawal.transaction_id]
-      );
+      const { error: logError } = await supabase
+        .from('admin_activity_logs')
+        .insert({
+          admin_id: adminId,
+          action_type: 'withdrawal_action',
+          description: `${action} withdrawal #${id}`,
+          affected_user_id: withdrawal.user_id,
+          affected_transaction_id: withdrawal.transaction_id
+        });
 
-      await db.execute('COMMIT');
-      console.log('💾 Transaction committed successfully');
+      if (logError) throw logError;
+
+      console.log('💾 All operations completed successfully');
 
       res.json({
         success: true,
@@ -764,8 +864,7 @@ router.post('/withdrawals/:id/action', authenticateAdmin, async (req, res) => {
       });
 
     } catch (error) {
-      await db.execute('ROLLBACK');
-      console.error('❌ Transaction rollback:', error);
+      console.error('❌ Operation error:', error);
       throw error;
     }
 
@@ -778,6 +877,8 @@ router.post('/withdrawals/:id/action', authenticateAdmin, async (req, res) => {
   }
 });
 
+// ==================== USER MANAGEMENT ====================
+
 router.get('/users', authenticateAdmin, async (req, res) => {
   try {
     const { search, page = 1, limit = 20 } = req.query;
@@ -785,39 +886,28 @@ router.get('/users', authenticateAdmin, async (req, res) => {
 
     console.log('👥 Fetching users - Search:', search, 'Page:', page);
 
-    let query = 'SELECT id, username, email, wallet_account_number, balance, xp_points, rank, created_at FROM users';
-    let countQuery = 'SELECT COUNT(*) as total FROM users';
-    const params = [];
-    const countParams = [];
-    let paramCount = 0;
-    let countParamCount = 0;
+    let query = supabase
+      .from('users')
+      .select('id, username, email, wallet_account_number, balance, xp_points, rank, created_at', { count: 'exact' });
 
     if (search) {
-      paramCount++;
-      query += ` WHERE username ILIKE $${paramCount} OR email ILIKE $${paramCount} OR wallet_account_number ILIKE $${paramCount}`;
-      countParamCount++;
-      countQuery += ` WHERE username ILIKE $${countParamCount} OR email ILIKE $${countParamCount} OR wallet_account_number ILIKE $${countParamCount}`;
-      const searchTerm = `%${search}%`;
-      params.push(searchTerm, searchTerm, searchTerm);
-      countParams.push(searchTerm, searchTerm, searchTerm);
+      query = query.or(`username.ilike.%${search}%,email.ilike.%${search}%,wallet_account_number.ilike.%${search}%`);
     }
 
-    paramCount++;
-    paramCount++;
-    query += ` ORDER BY created_at DESC LIMIT $${paramCount - 1} OFFSET $${paramCount}`;
-    params.push(parseInt(limit), parseInt(offset));
+    const { data: users, error, count } = await query
+      .order('created_at', { ascending: false })
+      .range(offset, offset + limit - 1);
 
-    const [users] = await db.execute(query, params);
-    const [countResult] = await db.execute(countQuery, countParams);
+    if (error) throw error;
 
     res.json({
       success: true,
-      users,
+      users: users || [],
       pagination: {
         page: parseInt(page),
         limit: parseInt(limit),
-        total: parseInt(countResult[0].total),
-        totalPages: Math.ceil(parseInt(countResult[0].total) / limit)
+        total: count || 0,
+        totalPages: Math.ceil((count || 0) / limit)
       }
     });
 
@@ -835,12 +925,14 @@ router.get('/users/:id', authenticateAdmin, async (req, res) => {
     const { id } = req.params;
     console.log('🔍 Fetching user details for ID:', id);
 
-    const [users] = await db.execute(
-      'SELECT * FROM users WHERE id = $1',
-      [id]
-    );
+    const { data: users, error } = await supabase
+      .from('users')
+      .select('*')
+      .eq('id', id);
 
-    if (users.length === 0) {
+    if (error) throw error;
+
+    if (!users || users.length === 0) {
       console.log('❌ User not found:', id);
       return res.status(404).json({ 
         success: false, 
@@ -849,31 +941,36 @@ router.get('/users/:id', authenticateAdmin, async (req, res) => {
     }
 
     // Get user transactions
-    const [transactions] = await db.execute(
-      'SELECT * FROM transactions WHERE user_id = $1 ORDER BY created_at DESC LIMIT 20',
-      [id]
-    );
+    const { data: transactions, error: txError } = await supabase
+      .from('transactions')
+      .select('*')
+      .eq('user_id', id)
+      .order('created_at', { ascending: false })
+      .limit(20);
 
     // Get user XP transactions
-    const [xpTransactions] = await db.execute(
-      'SELECT * FROM xp_transactions WHERE user_id = $1 ORDER BY created_at DESC LIMIT 20',
-      [id]
-    );
+    const { data: xpTransactions, error: xpError } = await supabase
+      .from('xp_transactions')
+      .select('*')
+      .eq('user_id', id)
+      .order('created_at', { ascending: false })
+      .limit(20);
 
     // Get withdrawal history
-    const [withdrawals] = await db.execute(
-      'SELECT * FROM withdrawal_requests WHERE user_id = $1 ORDER BY created_at DESC',
-      [id]
-    );
+    const { data: withdrawals, error: wError } = await supabase
+      .from('withdrawal_requests')
+      .select('*')
+      .eq('user_id', id)
+      .order('created_at', { ascending: false });
 
     console.log('✅ User details fetched successfully');
 
     res.json({
       success: true,
       user: users[0],
-      transactions,
-      xp_transactions: xpTransactions,
-      withdrawals
+      transactions: transactions || [],
+      xp_transactions: xpTransactions || [],
+      withdrawals: withdrawals || []
     });
 
   } catch (error) {
@@ -884,7 +981,6 @@ router.get('/users/:id', authenticateAdmin, async (req, res) => {
     });
   }
 });
-// ==================== USER MANAGEMENT ENDPOINTS ====================
 
 router.put('/users/:id', authenticateAdmin, async (req, res) => {
   try {
@@ -895,12 +991,14 @@ router.put('/users/:id', authenticateAdmin, async (req, res) => {
     console.log('✏️ Updating user ID:', id, 'Data:', updateData);
 
     // Get current user data
-    const [users] = await db.execute(
-      'SELECT * FROM users WHERE id = $1',
-      [id]
-    );
+    const { data: users, error: userError } = await supabase
+      .from('users')
+      .select('*')
+      .eq('id', id);
 
-    if (users.length === 0) {
+    if (userError) throw userError;
+
+    if (!users || users.length === 0) {
       return res.status(404).json({
         success: false,
         message: 'User not found'
@@ -909,11 +1007,6 @@ router.put('/users/:id', authenticateAdmin, async (req, res) => {
 
     const currentUser = users[0];
 
-    // Build update query dynamically
-    const updateFields = [];
-    const updateValues = [];
-    let paramCount = 0;
-    
     // Define allowed fields to update
     const allowedFields = [
       'username', 'email', 'firstname', 'lastname', 'rank',
@@ -922,57 +1015,52 @@ router.put('/users/:id', authenticateAdmin, async (req, res) => {
       'favorite_games', 'balance'
     ];
 
+    const updateObject = {};
     for (const field of allowedFields) {
       if (field in updateData) {
-        paramCount++;
-        updateFields.push(`${field} = $${paramCount}`);
-        updateValues.push(updateData[field]);
+        updateObject[field] = updateData[field];
       }
     }
 
-    if (updateFields.length === 0) {
+    if (Object.keys(updateObject).length === 0) {
       return res.status(400).json({
         success: false,
         message: 'No valid fields to update'
       });
     }
 
-    // Add updated_at timestamp
-    paramCount++;
-    updateFields.push('updated_at = NOW()');
-    
-    // Add WHERE clause
-    paramCount++;
-    updateValues.push(id);
+    updateObject.updated_at = new Date().toISOString();
 
-    const updateQuery = `
-      UPDATE users 
-      SET ${updateFields.join(', ')} 
-      WHERE id = $${paramCount}
-    `;
+    // Update user
+    const { error: updateError } = await supabase
+      .from('users')
+      .update(updateObject)
+      .eq('id', id);
 
-    await db.execute(updateQuery, updateValues);
+    if (updateError) throw updateError;
 
     // Log admin activity
-    await db.execute(
-      `INSERT INTO admin_activity_logs 
-       (admin_id, action_type, description, affected_user_id) 
-       VALUES ($1, 'user_update', 'Updated user profile', $2)`,
-      [adminId, id]
-    );
+    await supabase
+      .from('admin_activity_logs')
+      .insert({
+        admin_id: adminId,
+        action_type: 'user_update',
+        description: 'Updated user profile',
+        affected_user_id: id
+      });
 
     // Get updated user
-    const [updatedUsers] = await db.execute(
-      'SELECT * FROM users WHERE id = $1',
-      [id]
-    );
+    const { data: updatedUsers } = await supabase
+      .from('users')
+      .select('*')
+      .eq('id', id);
 
     console.log('✅ User updated successfully');
 
     res.json({
       success: true,
       message: 'User updated successfully',
-      user: updatedUsers[0]
+      user: updatedUsers?.[0] || null
     });
 
   } catch (error) {
@@ -993,12 +1081,14 @@ router.post('/users/:id/ban', authenticateAdmin, async (req, res) => {
     console.log(`🚫 ${isBanned ? 'Banning' : 'Unbanning'} user ID:`, id, 'Reason:', reason);
 
     // Check if user exists
-    const [users] = await db.execute(
-      'SELECT id, username, is_banned FROM users WHERE id = $1',
-      [id]
-    );
+    const { data: users, error: userError } = await supabase
+      .from('users')
+      .select('id, username, is_banned')
+      .eq('id', id);
 
-    if (users.length === 0) {
+    if (userError) throw userError;
+
+    if (!users || users.length === 0) {
       return res.status(404).json({
         success: false,
         message: 'User not found'
@@ -1007,23 +1097,28 @@ router.post('/users/:id/ban', authenticateAdmin, async (req, res) => {
 
     const currentUser = users[0];
 
-    // Update user - FIXED: boolean values
-    await db.execute(
-      'UPDATE users SET is_banned = $1, account_status = $2, updated_at = NOW() WHERE id = $3',
-      [isBanned, isBanned ? 'suspended' : 'active', id]
-    );
+    // Update user
+    const { error: updateError } = await supabase
+      .from('users')
+      .update({
+        is_banned: isBanned,
+        account_status: isBanned ? 'suspended' : 'active',
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', id);
+
+    if (updateError) throw updateError;
 
     // Log admin activity
-    await db.execute(
-      `INSERT INTO admin_activity_logs 
-       (admin_id, action_type, description, affected_user_id, details) 
-       VALUES ($1, $2, $3, $4, $5)`,
-      [adminId, 
-       'user_ban',
-       isBanned ? 'Banned user' : 'Unbanned user',
-       id,
-       JSON.stringify({ reason, previous_status: currentUser.is_banned ? 'banned' : 'active' })]
-    );
+    await supabase
+      .from('admin_activity_logs')
+      .insert({
+        admin_id: adminId,
+        action_type: 'user_ban',
+        description: isBanned ? 'Banned user' : 'Unbanned user',
+        affected_user_id: id,
+        details: JSON.stringify({ reason, previous_status: currentUser.is_banned ? 'banned' : 'active' })
+      });
 
     console.log('✅ User ban status updated successfully');
 
@@ -1041,6 +1136,7 @@ router.post('/users/:id/ban', authenticateAdmin, async (req, res) => {
     });
   }
 });
+
 router.post('/users/:id/balance', authenticateAdmin, async (req, res) => {
   try {
     const { id } = req.params;
@@ -1057,12 +1153,14 @@ router.post('/users/:id/balance', authenticateAdmin, async (req, res) => {
     }
 
     // Get current user balance
-    const [users] = await db.execute(
-      'SELECT id, username, balance FROM users WHERE id = $1',
-      [id]
-    );
+    const { data: users, error: userError } = await supabase
+      .from('users')
+      .select('id, username, balance')
+      .eq('id', id);
 
-    if (users.length === 0) {
+    if (userError) throw userError;
+
+    if (!users || users.length === 0) {
       return res.status(404).json({
         success: false,
         message: 'User not found'
@@ -1073,42 +1171,50 @@ router.post('/users/:id/balance', authenticateAdmin, async (req, res) => {
     const newBalance = parseFloat(currentUser.balance) + parseFloat(amount);
 
     // Update balance
-    await db.execute(
-      'UPDATE users SET balance = $1, updated_at = NOW() WHERE id = $2',
-      [newBalance, id]
-    );
+    const { error: updateError } = await supabase
+      .from('users')
+      .update({
+        balance: newBalance,
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', id);
+
+    if (updateError) throw updateError;
 
     // Create transaction record
     const transactionId = uuidv4();
-    await db.execute(
-      `INSERT INTO transactions 
-       (id, user_id, type, amount, status, description, admin_id, previous_balance, new_balance) 
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-      [
-        transactionId,
-        id,
-        amount >= 0 ? 'admin_adjustment_add' : 'admin_adjustment_deduct',
-        Math.abs(parseFloat(amount)),
-        'completed',
-        reason || 'Admin balance adjustment',
-        adminId,
-        parseFloat(currentUser.balance),
-        newBalance
-      ]
-    );
+    const { error: txError } = await supabase
+      .from('transactions')
+      .insert({
+        id: transactionId,
+        user_id: id,
+        type: amount >= 0 ? 'admin_adjustment_add' : 'admin_adjustment_deduct',
+        amount: Math.abs(parseFloat(amount)),
+        status: 'completed',
+        description: reason || 'Admin balance adjustment',
+        admin_id: adminId,
+        previous_balance: parseFloat(currentUser.balance),
+        new_balance: newBalance,
+        created_at: new Date().toISOString()
+      });
+
+    if (txError) throw txError;
 
     // Log admin activity
-    await db.execute(
-      `INSERT INTO admin_activity_logs 
-       (admin_id, action_type, description, affected_user_id, details) 
-       VALUES ($1, 'balance_adjustment', 'Adjusted user balance', $2, $3)`,
-      [adminId, id, JSON.stringify({
-        amount,
-        previous_balance: currentUser.balance,
-        new_balance: newBalance,
-        reason
-      })]
-    );
+    await supabase
+      .from('admin_activity_logs')
+      .insert({
+        admin_id: adminId,
+        action_type: 'balance_adjustment',
+        description: 'Adjusted user balance',
+        affected_user_id: id,
+        details: JSON.stringify({
+          amount,
+          previous_balance: currentUser.balance,
+          new_balance: newBalance,
+          reason
+        })
+      });
 
     console.log('✅ User balance updated successfully');
 
@@ -1128,6 +1234,7 @@ router.post('/users/:id/balance', authenticateAdmin, async (req, res) => {
     });
   }
 });
+
 router.delete('/users/:id', authenticateAdmin, async (req, res) => {
   try {
     const { id } = req.params;
@@ -1136,12 +1243,14 @@ router.delete('/users/:id', authenticateAdmin, async (req, res) => {
     console.log('🗑️ Deleting user ID:', id);
 
     // Check if user exists
-    const [users] = await db.execute(
-      'SELECT id, username, is_admin FROM users WHERE id = $1',
-      [id]
-    );
+    const { data: users, error: userError } = await supabase
+      .from('users')
+      .select('id, username, is_admin')
+      .eq('id', id);
 
-    if (users.length === 0) {
+    if (userError) throw userError;
+
+    if (!users || users.length === 0) {
       return res.status(404).json({
         success: false,
         message: 'User not found'
@@ -1158,19 +1267,27 @@ router.delete('/users/:id', authenticateAdmin, async (req, res) => {
       });
     }
 
-    // Soft delete - mark as deleted instead of actual deletion
-    await db.execute(
-      'UPDATE users SET account_status = \'deleted\', is_banned = true, updated_at = NOW() WHERE id = $1',
-      [id]
-    );
+    // Soft delete - mark as deleted
+    const { error: updateError } = await supabase
+      .from('users')
+      .update({
+        account_status: 'deleted',
+        is_banned: true,
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', id);
+
+    if (updateError) throw updateError;
 
     // Log admin activity
-    await db.execute(
-      `INSERT INTO admin_activity_logs 
-       (admin_id, action_type, description, affected_user_id) 
-       VALUES ($1, 'user_delete', 'Deleted user account', $2)`,
-      [adminId, id]
-    );
+    await supabase
+      .from('admin_activity_logs')
+      .insert({
+        admin_id: adminId,
+        action_type: 'user_delete',
+        description: 'Deleted user account',
+        affected_user_id: id
+      });
 
     console.log('✅ User marked as deleted successfully');
 
@@ -1194,43 +1311,56 @@ router.get('/users/:id/stats', authenticateAdmin, async (req, res) => {
 
     console.log('📊 Fetching stats for user ID:', id);
 
-    const [userStats] = await db.execute(`
-      SELECT 
-        u.id,
-        u.username,
-        u.email,
-        u.rank,
-        u.matches_played,
-        u.wins,
-        u.losses,
-        u.win_rate,
-        u.balance,
-        u.xp_points,
-        u.tournaments_played,
-        u.tournaments_won,
-        u.created_at,
-        u.last_seen,
-        u.account_status,
-        u.is_banned,
-        u.is_admin,
-        (SELECT COUNT(*) FROM transactions WHERE user_id = u.id) as total_transactions,
-        (SELECT COUNT(*) FROM withdrawal_requests WHERE user_id = u.id) as total_withdrawals,
-        (SELECT COUNT(*) FROM matches WHERE (player1_id = u.id OR player2_id = u.id) AND status = 'completed') as completed_matches,
-        (SELECT COUNT(*) FROM tournament_participants WHERE user_id = u.id) as tournaments_participated
-      FROM users u
-      WHERE u.id = $1
-    `, [id]);
+    // Get user info
+    const { data: users, error: userError } = await supabase
+      .from('users')
+      .select('*')
+      .eq('id', id);
 
-    if (userStats.length === 0) {
+    if (userError) throw userError;
+
+    if (!users || users.length === 0) {
       return res.status(404).json({
         success: false,
         message: 'User not found'
       });
     }
 
+    const user = users[0];
+
+    // Get counts
+    const { count: transactionCount } = await supabase
+      .from('transactions')
+      .select('*', { count: 'exact', head: true })
+      .eq('user_id', id);
+
+    const { count: withdrawalCount } = await supabase
+      .from('withdrawal_requests')
+      .select('*', { count: 'exact', head: true })
+      .eq('user_id', id);
+
+    const { count: completedMatches } = await supabase
+      .from('matches')
+      .select('*', { count: 'exact', head: true })
+      .or(`player1_id.eq.${id},player2_id.eq.${id}`)
+      .eq('status', 'completed');
+
+    const { count: tournamentsParticipated } = await supabase
+      .from('tournament_participants')
+      .select('*', { count: 'exact', head: true })
+      .eq('user_id', id);
+
+    const userStats = {
+      ...user,
+      total_transactions: transactionCount || 0,
+      total_withdrawals: withdrawalCount || 0,
+      completed_matches: completedMatches || 0,
+      tournaments_participated: tournamentsParticipated || 0
+    };
+
     res.json({
       success: true,
-      stats: userStats[0]
+      stats: userStats
     });
 
   } catch (error) {
@@ -1243,17 +1373,22 @@ router.get('/users/:id/stats', authenticateAdmin, async (req, res) => {
 });
 
 // ==================== SYSTEM SETTINGS ====================
+
 router.get('/settings', authenticateAdmin, async (req, res) => {
   try {
     console.log('⚙️ Fetching system settings');
     
-    const [settings] = await db.execute(
-      'SELECT * FROM system_settings ORDER BY category, setting_key'
-    );
+    const { data: settings, error } = await supabase
+      .from('system_settings')
+      .select('*')
+      .order('category', { ascending: true })
+      .order('setting_key', { ascending: true });
+
+    if (error) throw error;
 
     res.json({
       success: true,
-      settings
+      settings: settings || []
     });
 
   } catch (error) {
@@ -1273,20 +1408,25 @@ router.post('/settings/:key', authenticateAdmin, async (req, res) => {
 
     console.log('⚙️ Updating setting:', key, 'Value:', value);
 
-    await db.execute(
-      `INSERT INTO system_settings (setting_key, setting_value, updated_by) 
-       VALUES (?, ?, ?) 
-       ON DUPLICATE KEY UPDATE setting_value = ?, updated_by = ?, updated_at = NOW()`,
-      [key, value, adminId, value, adminId]
-    );
+    const { error } = await supabase
+      .from('system_settings')
+      .upsert({
+        setting_key: key,
+        setting_value: value,
+        updated_by: adminId,
+        updated_at: new Date().toISOString()
+      }, { onConflict: 'setting_key' });
+
+    if (error) throw error;
 
     // Log activity
-    await db.execute(
-      `INSERT INTO admin_activity_logs 
-       (admin_id, action_type, description) 
-       VALUES (?, 'settings_update', 'Updated setting: ${key}')`,
-      [adminId]
-    );
+    await supabase
+      .from('admin_activity_logs')
+      .insert({
+        admin_id: adminId,
+        action_type: 'settings_update',
+        description: `Updated setting: ${key}`
+      });
 
     res.json({
       success: true,
@@ -1301,39 +1441,34 @@ router.post('/settings/:key', authenticateAdmin, async (req, res) => {
     });
   }
 });
+
 // ==================== XP RATES SETTINGS ====================
 
-// GET /api/admin/settings/xp-rates - Get XP conversion rates
-// GET /api/admin/settings/xp-rates - Get XP conversion rates
 router.get('/settings/xp-rates', authenticateAdmin, async (req, res) => {
   try {
     console.log('⚙️ Fetching XP rates settings');
     
-    // Get XP rates from xp_rates table - FIXED: PostgreSQL boolean comparison
-    const [xpRates] = await db.execute(
-      `SELECT currency, xp_per_unit, unit_amount, is_active, description 
-       FROM xp_rates 
-       WHERE is_active = true OR is_active = 1
-       ORDER BY currency`
-    );
+    const { data: xpRates, error } = await supabase
+      .from('xp_rates')
+      .select('currency, xp_per_unit, unit_amount, is_active, description')
+      .eq('is_active', true)
+      .order('currency');
 
-    // Transform to the format expected by frontend
+    if (error) throw error;
+
     const rates = {};
-    xpRates.forEach(rate => {
-      // Calculate rate: 1 unit of currency = xp_per_unit XP
+    (xpRates || []).forEach(rate => {
       const xpPerCurrency = rate.xp_per_unit / rate.unit_amount;
       rates[rate.currency] = parseFloat(xpPerCurrency.toFixed(3));
     });
 
-    // Ensure default currencies exist
     const defaultRates = {
-      'NGN': 0.025,  // 25 XP per 1000 NGN = 0.025 XP per 1 NGN
-      'USD': 0,      // Disabled by default
-      'EUR': 0,      // Disabled by default  
-      'GBP': 0       // Disabled by default
+      'NGN': 0.025,
+      'USD': 0,
+      'EUR': 0,
+      'GBP': 0
     };
 
-    // Merge with existing rates
     const finalRates = { ...defaultRates, ...rates };
 
     res.json({
@@ -1351,7 +1486,6 @@ router.get('/settings/xp-rates', authenticateAdmin, async (req, res) => {
   }
 });
 
-// POST /api/admin/settings/xp-rates/:currency - Update XP rate for currency
 router.post('/settings/xp-rates/:currency', authenticateAdmin, async (req, res) => {
   try {
     const { currency } = req.params;
@@ -1368,47 +1502,44 @@ router.post('/settings/xp-rates/:currency', authenticateAdmin, async (req, res) 
     }
 
     const xpRate = parseFloat(rate);
-    
-    // Default configuration: 25 XP per unit
     const xp_per_unit = 25;
-    const unit_amount = 1000 / xpRate; // Calculate unit amount based on rate
-    
-    // Update or insert into xp_rates table - FIXED: PostgreSQL syntax
-    await db.execute(
-      `INSERT INTO xp_rates (currency, xp_per_unit, unit_amount, is_active, description) 
-       VALUES ($1, $2, $3, true, $4) 
-       ON CONFLICT (currency) 
-       DO UPDATE SET 
-       xp_per_unit = EXCLUDED.xp_per_unit,
-       unit_amount = EXCLUDED.unit_amount,
-       updated_at = NOW()`,
-      [
-        currency, 
-        xp_per_unit, 
-        unit_amount,
-        `${xp_per_unit} XP per ${unit_amount.toFixed(2)} ${currency}`
-      ]
-    );
+    const unit_amount = 1000 / xpRate;
+
+    const { error: xpError } = await supabase
+      .from('xp_rates')
+      .upsert({
+        currency: currency,
+        xp_per_unit: xp_per_unit,
+        unit_amount: unit_amount,
+        is_active: true,
+        description: `${xp_per_unit} XP per ${unit_amount.toFixed(2)} ${currency}`,
+        updated_at: new Date().toISOString()
+      }, { onConflict: 'currency' });
+
+    if (xpError) throw xpError;
 
     // Also update in system_settings for backward compatibility
     const settingKey = `xp_rate_${currency}`;
-    await db.execute(
-      `INSERT INTO system_settings (setting_key, setting_value, category, updated_by) 
-       VALUES ($1, $2, 'xp_rates', $3) 
-       ON CONFLICT (setting_key) 
-       DO UPDATE SET setting_value = EXCLUDED.setting_value, 
-                     updated_by = EXCLUDED.updated_by, 
-                     updated_at = NOW()`,
-      [settingKey, rate.toString(), adminId]
-    );
+    const { error: sysError } = await supabase
+      .from('system_settings')
+      .upsert({
+        setting_key: settingKey,
+        setting_value: rate.toString(),
+        category: 'xp_rates',
+        updated_by: adminId,
+        updated_at: new Date().toISOString()
+      }, { onConflict: 'setting_key' });
+
+    if (sysError) throw sysError;
 
     // Log activity
-    await db.execute(
-      `INSERT INTO admin_activity_logs 
-       (admin_id, action_type, description) 
-       VALUES ($1, 'settings_update', 'Updated XP rate for ${currency}')`,
-      [adminId]
-    );
+    await supabase
+      .from('admin_activity_logs')
+      .insert({
+        admin_id: adminId,
+        action_type: 'settings_update',
+        description: `Updated XP rate for ${currency}`
+      });
 
     res.json({
       success: true,
@@ -1427,35 +1558,41 @@ router.post('/settings/xp-rates/:currency', authenticateAdmin, async (req, res) 
 });
 
 // ==================== FRAUD MANAGEMENT ====================
-// ==================== FRAUD MANAGEMENT ====================
-// ==================== FRAUD MANAGEMENT ====================
+
 router.get('/fraud/flags', authenticateAdmin, async (req, res) => {
   try {
     const { status } = req.query;
     console.log('🚨 Fetching fraud flags - Status:', status);
 
-    let query = `
-      SELECT ff.*, u.username, u.email, au.username as assigned_admin_name
-      FROM fraud_flags ff
-      JOIN users u ON ff.user_id = u.id
-      LEFT JOIN admin_users au ON ff.assigned_admin_id = au.id
-      WHERE 1=1
-    `;
-    
-    const params = [];
-    if (status) {
-      query += ' AND ff.status = $1';
-      params.push(status);
-    }
-    
-    query += ' ORDER BY ff.created_at DESC';
+    let query = supabase
+      .from('fraud_flags')
+      .select(`
+        *,
+        users (username, email),
+        admin_users:assigned_admin_id (username)
+      `);
 
-    const result = await db.execute(query, params);
-    const flags = result.rows || result[0] || [];
+    if (status) {
+      query = query.eq('status', status);
+    }
+
+    const { data: flags, error } = await query.order('created_at', { ascending: false });
+
+    if (error) throw error;
+
+    // Format flags
+    const formattedFlags = (flags || []).map(flag => ({
+      ...flag,
+      username: flag.users?.username,
+      email: flag.users?.email,
+      assigned_admin_name: flag.admin_users?.username,
+      users: undefined,
+      admin_users: undefined
+    }));
 
     res.json({
       success: true,
-      flags
+      flags: formattedFlags
     });
 
   } catch (error) {
@@ -1465,69 +1602,92 @@ router.get('/fraud/flags', authenticateAdmin, async (req, res) => {
       message: 'Failed to fetch fraud flags' 
     });
   }
-});// ==================== FRAUD MANAGEMENT ENDPOINTS ====================
+});
 
-// 1. GET /api/admin/fraud/stats - Fraud statistics (MUST WORK)
-// 1. GET /api/admin/fraud/stats - Fraud statistics (MUST WORK)
-// 1. GET /api/admin/fraud/stats - Fraud statistics (MUST WORK)
 router.get('/fraud/stats', authenticateAdmin, async (req, res) => {
   try {
     console.log('📊 Admin: Fetching fraud statistics');
     
     // Get fraud flag stats
-    const flagStatsResult = await db.execute(`
-      SELECT 
-        COUNT(*) as total_flags,
-        COUNT(CASE WHEN status = 'pending' THEN 1 END) as pending_flags,
-        COUNT(CASE WHEN status = 'confirmed' THEN 1 END) as confirmed_flags,
-        COUNT(CASE WHEN status = 'false_positive' THEN 1 END) as false_positive_flags
-      FROM fraud_flags
-    `);
-    const flagStats = flagStatsResult.rows?.[0] || flagStatsResult[0]?.[0] || {};
+    const { data: flags, error: flagError } = await supabase
+      .from('fraud_flags')
+      .select('status');
+
+    if (flagError) throw flagError;
+
+    const flagStats = {
+      total_flags: flags?.length || 0,
+      pending_flags: flags?.filter(f => f.status === 'pending').length || 0,
+      confirmed_flags: flags?.filter(f => f.status === 'confirmed').length || 0,
+      false_positive_flags: flags?.filter(f => f.status === 'false_positive').length || 0
+    };
 
     // Get suspicious activities stats
-    const activityStatsResult = await db.execute(`
-      SELECT 
-        COUNT(*) as total_activities,
-        COUNT(CASE WHEN status = 'pending' THEN 1 END) as pending_activities,
-        COUNT(CASE WHEN severity_level IN ('high', 'critical') THEN 1 END) as high_risk_activities
-      FROM suspicious_activities
-      WHERE created_at >= NOW() - INTERVAL '30 days'
-    `);
-    const activityStats = activityStatsResult.rows?.[0] || activityStatsResult[0]?.[0] || {};
+    const thirtyDaysAgo = new Date();
+    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+    
+    const { data: activities, error: actError } = await supabase
+      .from('suspicious_activities')
+      .select('status, severity_level')
+      .gte('created_at', thirtyDaysAgo.toISOString());
+
+    if (actError) throw actError;
+
+    const activityStats = {
+      total_activities: activities?.length || 0,
+      pending_activities: activities?.filter(a => a.status === 'pending').length || 0,
+      high_risk_activities: activities?.filter(a => a.severity_level === 'high' || a.severity_level === 'critical').length || 0
+    };
 
     // Get user risk stats
-    const userStatsResult = await db.execute(`
-      SELECT 
-        COUNT(*) as total_users,
-        COUNT(CASE WHEN risk_score >= 70 THEN 1 END) as high_risk_users,
-        COUNT(CASE WHEN risk_score BETWEEN 40 AND 69 THEN 1 END) as medium_risk_users,
-        COALESCE(SUM(CASE WHEN risk_score >= 40 THEN balance ELSE 0 END), 0) as amount_at_risk
-      FROM users
-      WHERE account_status = 'active' AND is_banned = false
-    `);
-    const userStats = userStatsResult.rows?.[0] || userStatsResult[0]?.[0] || {};
+    const { data: users, error: userError } = await supabase
+      .from('users')
+      .select('risk_score, balance')
+      .eq('account_status', 'active')
+      .eq('is_banned', false);
+
+    if (userError) throw userError;
+
+    const userStats = {
+      total_users: users?.length || 0,
+      high_risk_users: users?.filter(u => (u.risk_score || 0) >= 70).length || 0,
+      medium_risk_users: users?.filter(u => (u.risk_score || 0) >= 40 && (u.risk_score || 0) < 70).length || 0,
+      amount_at_risk: users?.filter(u => (u.risk_score || 0) >= 40).reduce((sum, u) => sum + parseFloat(u.balance || 0), 0) || 0
+    };
 
     // Get recent scans
-    const recentScansResult = await db.execute(`
-      SELECT COUNT(*) as recent_scans 
-      FROM fraud_detection_logs 
-      WHERE created_at >= NOW() - INTERVAL '7 days'
-    `);
-    const recentScans = recentScansResult.rows?.[0] || recentScansResult[0]?.[0] || {};
+    const sevenDaysAgo = new Date();
+    sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
+    
+    const { count: recentScans, error: scanError } = await supabase
+      .from('fraud_detection_logs')
+      .select('*', { count: 'exact', head: true })
+      .gte('created_at', sevenDaysAgo.toISOString());
+
+    if (scanError) throw scanError;
 
     // Get weekly activity data for chart
-    const weeklyDataResult = await db.execute(`
-      SELECT 
-        DATE(created_at) as date,
-        COUNT(*) as count,
-        'activities' as type
-      FROM suspicious_activities 
-      WHERE created_at >= NOW() - INTERVAL '7 days'
-      GROUP BY DATE(created_at)
-      ORDER BY date
-    `);
-    const weeklyData = weeklyDataResult.rows || weeklyDataResult[0] || [];
+    const { data: weeklyData, error: weeklyError } = await supabase
+      .from('suspicious_activities')
+      .select('created_at')
+      .gte('created_at', sevenDaysAgo.toISOString());
+
+    if (weeklyError) throw weeklyError;
+
+    // Group by date
+    const weeklyGrouped = {};
+    (weeklyData || []).forEach(activity => {
+      const date = activity.created_at?.split('T')[0];
+      if (date) {
+        weeklyGrouped[date] = (weeklyGrouped[date] || 0) + 1;
+      }
+    });
+
+    const formattedWeeklyData = Object.entries(weeklyGrouped).map(([date, count]) => ({
+      date,
+      count,
+      type: 'activities'
+    }));
 
     res.json({
       success: true,
@@ -1535,10 +1695,10 @@ router.get('/fraud/stats', authenticateAdmin, async (req, res) => {
         ...flagStats,
         ...activityStats,
         ...userStats,
-        ...recentScans,
-        amount_at_risk: userStats.amount_at_risk || 0
+        recent_scans: recentScans || 0,
+        amount_at_risk: userStats.amount_at_risk
       },
-      weeklyData: weeklyData,
+      weeklyData: formattedWeeklyData,
       timestamp: new Date().toISOString()
     });
 
@@ -1551,10 +1711,7 @@ router.get('/fraud/stats', authenticateAdmin, async (req, res) => {
     });
   }
 });
-// 2. GET /api/admin/fraud/suspicious-users - Suspicious users (MUST WORK)
-// 2. GET /api/admin/fraud/suspicious-users - Suspicious users (MUST WORK)
-// 2. GET /api/admin/fraud/suspicious-users - Suspicious users (MUST WORK)
-// 2. GET /api/admin/fraud/suspicious-users - Suspicious users (MUST WORK)
+
 router.get('/fraud/suspicious-users', authenticateAdmin, async (req, res) => {
   try {
     const { page = 1, limit = 20, risk_min = 0 } = req.query;
@@ -1562,54 +1719,64 @@ router.get('/fraud/suspicious-users', authenticateAdmin, async (req, res) => {
 
     console.log('🔍 Admin: Fetching suspicious users - Page:', page, 'Risk min:', risk_min);
 
-    // FIX: Check if last_login_at column exists, use COALESCE with last_seen or created_at
-    const usersResult = await db.execute(`
-      SELECT 
-        u.id,
-        u.username,
-        u.email,
-        u.risk_score,
-        u.balance,
-        u.created_at,
-        COALESCE(u.last_login_at, u.last_seen, u.created_at) as last_activity_time,
-        u.account_status,
-        u.is_banned,
-        COUNT(DISTINCT sa.id) as suspicious_activities_count,
-        COUNT(DISTINCT ff.id) as fraud_flags_count,
-        MAX(sa.created_at) as last_suspicious_activity
-      FROM users u
-      LEFT JOIN suspicious_activities sa ON u.id = sa.user_id AND sa.status = 'pending'
-      LEFT JOIN fraud_flags ff ON u.id = ff.user_id AND ff.status IN ('pending', 'confirmed')
-      WHERE u.risk_score >= $1
-      GROUP BY u.id, u.username, u.email, u.risk_score, u.balance, u.created_at, 
-               u.last_login_at, u.last_seen, u.account_status, u.is_banned
-      ORDER BY u.risk_score DESC, last_suspicious_activity DESC
-      LIMIT $2 OFFSET $3
-    `, [risk_min, parseInt(limit), parseInt(offset)]);
-    
-    const users = usersResult.rows || usersResult[0] || [];
+    // Get users with risk scores
+    const { data: users, error, count } = await supabase
+      .from('users')
+      .select(`
+        id,
+        username,
+        email,
+        risk_score,
+        balance,
+        created_at,
+        last_login_at,
+        last_seen,
+        account_status,
+        is_banned
+      `, { count: 'exact' })
+      .gte('risk_score', parseFloat(risk_min))
+      .order('risk_score', { ascending: false })
+      .range(offset, offset + limit - 1);
 
-    // Get total count
-    const countResult = await db.execute(
-      'SELECT COUNT(*) as total FROM users WHERE risk_score >= $1',
-      [risk_min]
-    );
-    const total = countResult.rows?.[0]?.total || countResult[0]?.[0]?.total || 0;
+    if (error) throw error;
 
-    // Format the response
-    const formattedUsers = users.map(user => ({
-      id: user.id,
-      username: user.username,
-      email: user.email,
-      risk_score: user.risk_score || 0,
-      risk_level: (user.risk_score || 0) >= 70 ? 'high' : (user.risk_score || 0) >= 40 ? 'medium' : 'low',
-      balance: user.balance,
-      account_age: Math.floor((new Date() - new Date(user.created_at)) / (1000 * 60 * 60 * 24)),
-      suspicious_activities_count: user.suspicious_activities_count || 0,
-      fraud_flags_count: user.fraud_flags_count || 0,
-      last_activity: user.last_suspicious_activity || user.last_activity_time,
-      account_status: user.account_status,
-      is_banned: user.is_banned
+    // Get suspicious activities and fraud flags counts for each user
+    const formattedUsers = await Promise.all((users || []).map(async (user) => {
+      const { count: suspiciousCount } = await supabase
+        .from('suspicious_activities')
+        .select('*', { count: 'exact', head: true })
+        .eq('user_id', user.id)
+        .eq('status', 'pending');
+
+      const { count: flagsCount } = await supabase
+        .from('fraud_flags')
+        .select('*', { count: 'exact', head: true })
+        .eq('user_id', user.id)
+        .in('status', ['pending', 'confirmed']);
+
+      const { data: lastActivity } = await supabase
+        .from('suspicious_activities')
+        .select('created_at')
+        .eq('user_id', user.id)
+        .order('created_at', { ascending: false })
+        .limit(1);
+
+      const accountAge = Math.floor((new Date() - new Date(user.created_at)) / (1000 * 60 * 60 * 24));
+
+      return {
+        id: user.id,
+        username: user.username,
+        email: user.email,
+        risk_score: user.risk_score || 0,
+        risk_level: (user.risk_score || 0) >= 70 ? 'high' : (user.risk_score || 0) >= 40 ? 'medium' : 'low',
+        balance: user.balance,
+        account_age: accountAge,
+        suspicious_activities_count: suspiciousCount || 0,
+        fraud_flags_count: flagsCount || 0,
+        last_activity: lastActivity?.[0]?.created_at || user.last_login_at || user.last_seen || user.created_at,
+        account_status: user.account_status,
+        is_banned: user.is_banned
+      };
     }));
 
     res.json({
@@ -1618,8 +1785,8 @@ router.get('/fraud/suspicious-users', authenticateAdmin, async (req, res) => {
       pagination: {
         page: parseInt(page),
         limit: parseInt(limit),
-        total: parseInt(total),
-        totalPages: Math.ceil(parseInt(total) / limit)
+        total: count || 0,
+        totalPages: Math.ceil((count || 0) / limit)
       }
     });
 
@@ -1632,27 +1799,25 @@ router.get('/fraud/suspicious-users', authenticateAdmin, async (req, res) => {
     });
   }
 });
-// 3. GET /api/admin/fraud/patterns - Get fraud patterns
-// 3. GET /api/admin/fraud/patterns - Get fraud patterns
-// 3. GET /api/admin/fraud/patterns - Get fraud patterns
-// 3. GET /api/admin/fraud/patterns - Get fraud patterns
+
 router.get('/fraud/patterns', authenticateAdmin, async (req, res) => {
   try {
     console.log('🔄 Admin: Fetching fraud patterns');
     
-    const patternsResult = await db.execute(`
-      SELECT fp.*, au.username as created_by_name
-      FROM fraud_patterns fp
-      LEFT JOIN admin_users au ON fp.created_by = au.id
-      ORDER BY fp.created_at DESC
-    `);
-    
-    const patterns = patternsResult.rows || patternsResult[0] || [];
+    const { data: patterns, error } = await supabase
+      .from('fraud_patterns')
+      .select(`
+        *,
+        admin_users:created_by (username)
+      `)
+      .order('created_at', { ascending: false });
 
-    // FIX: PostgreSQL JSONB returns as object, not string that needs parsing
-    const formattedPatterns = patterns.map(pattern => ({
+    if (error) throw error;
+
+    const formattedPatterns = (patterns || []).map(pattern => ({
       ...pattern,
-      // If rules is already an object, use it directly. If it's a string, parse it.
+      created_by_name: pattern.admin_users?.username,
+      admin_users: undefined,
       rules: typeof pattern.rules === 'object' ? pattern.rules : 
              (pattern.rules ? JSON.parse(pattern.rules) : {})
     }));
@@ -1671,8 +1836,7 @@ router.get('/fraud/patterns', authenticateAdmin, async (req, res) => {
     });
   }
 });
-// 4. POST /api/admin/fraud/scan - Run fraud detection scan
-// 4. POST /api/admin/fraud/scan - Run fraud detection scan
+
 router.post('/fraud/scan', authenticateAdmin, async (req, res) => {
   try {
     const { scanType = 'full' } = req.body;
@@ -1682,11 +1846,17 @@ router.post('/fraud/scan', authenticateAdmin, async (req, res) => {
 
     // Create scan log
     const scanId = uuidv4();
-    await db.execute(
-      `INSERT INTO fraud_detection_logs (id, scan_type, status, initiated_by) 
-       VALUES ($1, $2, 'running', $3)`,
-      [scanId, scanType, adminId]
-    );
+    const { error: logError } = await supabase
+      .from('fraud_detection_logs')
+      .insert({
+        id: scanId,
+        scan_type: scanType,
+        status: 'running',
+        initiated_by: adminId,
+        created_at: new Date().toISOString()
+      });
+
+    if (logError) throw logError;
 
     // Return immediate response and run scan in background
     res.json({
@@ -1715,7 +1885,7 @@ router.post('/fraud/scan', authenticateAdmin, async (req, res) => {
     });
   }
 });
-// 5. POST /api/admin/fraud/suspicious-activities/:id/review - Review suspicious activity
+
 router.post('/fraud/suspicious-activities/:id/review', authenticateAdmin, async (req, res) => {
   try {
     const { id } = req.params;
@@ -1724,7 +1894,6 @@ router.post('/fraud/suspicious-activities/:id/review', authenticateAdmin, async 
 
     console.log('📝 Admin: Reviewing suspicious activity:', { id, status, adminId });
 
-    // Validate status
     if (!['reviewed', 'dismissed', 'confirmed'].includes(status)) {
       return res.status(400).json({ 
         success: false, 
@@ -1733,12 +1902,14 @@ router.post('/fraud/suspicious-activities/:id/review', authenticateAdmin, async 
     }
 
     // Check if activity exists
-    const [activities] = await db.execute(
-      'SELECT * FROM suspicious_activities WHERE id = ?',
-      [id]
-    );
+    const { data: activities, error: actError } = await supabase
+      .from('suspicious_activities')
+      .select('*')
+      .eq('id', id);
 
-    if (activities.length === 0) {
+    if (actError) throw actError;
+
+    if (!activities || activities.length === 0) {
       return res.status(404).json({ 
         success: false, 
         message: 'Suspicious activity not found' 
@@ -1748,36 +1919,48 @@ router.post('/fraud/suspicious-activities/:id/review', authenticateAdmin, async 
     const activity = activities[0];
 
     // Update the activity
-    await db.execute(
-      `UPDATE suspicious_activities 
-       SET status = ?, 
-           reviewed_by = ?, 
-           reviewed_at = NOW(), 
-           review_notes = ?,
-           updated_at = NOW()
-       WHERE id = ?`,
-      [status, adminId, notes || null, id]
-    );
+    const { error: updateError } = await supabase
+      .from('suspicious_activities')
+      .update({
+        status: status,
+        reviewed_by: adminId,
+        reviewed_at: new Date().toISOString(),
+        review_notes: notes || null,
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', id);
+
+    if (updateError) throw updateError;
 
     // If confirmed as fraud, increase user risk score
     if (status === 'confirmed') {
-      await db.execute(
-        `UPDATE users 
-         SET risk_score = LEAST(risk_score + 20, 100),
-             last_risk_assessment = NOW(),
-             updated_at = NOW()
-         WHERE id = ?`,
-        [activity.user_id]
-      );
+      const { data: userData } = await supabase
+        .from('users')
+        .select('risk_score')
+        .eq('id', activity.user_id);
+
+      if (userData && userData[0]) {
+        const newRiskScore = Math.min((userData[0].risk_score || 0) + 20, 100);
+        await supabase
+          .from('users')
+          .update({
+            risk_score: newRiskScore,
+            last_risk_assessment: new Date().toISOString(),
+            updated_at: new Date().toISOString()
+          })
+          .eq('id', activity.user_id);
+      }
     }
 
     // Log activity
-    await db.execute(
-      `INSERT INTO admin_activity_logs 
-       (admin_id, action_type, description, affected_user_id) 
-       VALUES (?, 'fraud_review', ?, ?)`,
-      [adminId, `Reviewed suspicious activity #${id} as ${status}`, activity.user_id]
-    );
+    await supabase
+      .from('admin_activity_logs')
+      .insert({
+        admin_id: adminId,
+        action_type: 'fraud_review',
+        description: `Reviewed suspicious activity #${id} as ${status}`,
+        affected_user_id: activity.user_id
+      });
 
     res.json({
       success: true,
@@ -1795,7 +1978,6 @@ router.post('/fraud/suspicious-activities/:id/review', authenticateAdmin, async 
 });
 
 // Helper function for background fraud scan
-// Helper function for background fraud scan
 async function runFraudScan(scanType, adminId, scanId) {
   const startTime = Date.now();
   
@@ -1807,31 +1989,41 @@ async function runFraudScan(scanType, adminId, scanId) {
     const triggeredPatterns = [];
 
     // Get active fraud patterns
-    const [patterns] = await db.execute(
-      'SELECT * FROM fraud_patterns WHERE is_active = true'
-    );
+    const { data: patterns, error: patternError } = await supabase
+      .from('fraud_patterns')
+      .select('*')
+      .eq('is_active', true);
+
+    if (patternError) throw patternError;
 
     // Determine which users to scan
-    let userQuery = 'SELECT id, username, email, created_at, last_login_at, balance, risk_score FROM users WHERE risk_score < 100';
-    let queryParams = [];
+    let userQuery = supabase
+      .from('users')
+      .select('id, username, email, created_at, last_login_at, balance, risk_score')
+      .lt('risk_score', 100);
 
     if (scanType === 'targeted') {
-      userQuery += ' AND risk_score > 30';
+      userQuery = userQuery.gt('risk_score', 30);
     } else if (scanType === 'recent') {
-      userQuery += ' AND created_at >= NOW() - INTERVAL \'7 days\'';
+      const sevenDaysAgo = new Date();
+      sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
+      userQuery = userQuery.gte('created_at', sevenDaysAgo.toISOString());
     }
 
-    const [users] = await db.execute(userQuery, queryParams);
+    const { data: users, error: userError } = await userQuery;
+
+    if (userError) throw userError;
 
     // Scan each user
-    for (const user of users) {
+    for (const user of (users || [])) {
       usersChecked++;
       let userSuspicious = false;
 
       // Check each pattern
-      for (const pattern of patterns) {
+      for (const pattern of (patterns || [])) {
         try {
-          const rules = pattern.rules ? JSON.parse(pattern.rules) : {};
+          const rules = pattern.rules ? 
+            (typeof pattern.rules === 'string' ? JSON.parse(pattern.rules) : pattern.rules) : {};
           const isMatch = await checkPattern(user, rules);
 
           if (isMatch) {
@@ -1843,17 +2035,15 @@ async function runFraudScan(scanType, adminId, scanId) {
             });
 
             // Record suspicious activity
-            await db.execute(
-              `INSERT INTO suspicious_activities 
-               (user_id, activity_type, severity_level, risk_score, description, metadata) 
-               VALUES ($1, $2, $3, $4, $5, $6)`,
-              [
-                user.id,
-                pattern.pattern_type,
-                'medium',
-                pattern.risk_weight * 10,
-                pattern.description || `Detected pattern: ${pattern.pattern_name}`,
-                JSON.stringify({
+            await supabase
+              .from('suspicious_activities')
+              .insert({
+                user_id: user.id,
+                activity_type: pattern.pattern_type,
+                severity_level: 'medium',
+                risk_score: pattern.risk_weight * 10,
+                description: pattern.description || `Detected pattern: ${pattern.pattern_name}`,
+                metadata: JSON.stringify({
                   pattern: pattern.pattern_name,
                   scan_id: scanId,
                   user_data: {
@@ -1862,17 +2052,17 @@ async function runFraudScan(scanType, adminId, scanId) {
                     account_age_days: Math.floor((new Date() - new Date(user.created_at)) / (1000 * 60 * 60 * 24))
                   }
                 })
-              ]
-            );
+              });
 
             // Update user risk score
-            await db.execute(
-              `UPDATE users 
-               SET risk_score = LEAST(risk_score + $1, 100),
-                   last_risk_assessment = NOW()
-               WHERE id = $2`,
-              [pattern.risk_weight * 5, user.id]
-            );
+            const newRiskScore = Math.min((user.risk_score || 0) + (pattern.risk_weight * 5), 100);
+            await supabase
+              .from('users')
+              .update({
+                risk_score: newRiskScore,
+                last_risk_assessment: new Date().toISOString()
+              })
+              .eq('id', user.id);
           }
         } catch (patternError) {
           console.warn(`⚠️ Error checking pattern ${pattern.pattern_name}:`, patternError.message);
@@ -1887,34 +2077,33 @@ async function runFraudScan(scanType, adminId, scanId) {
     const scanDuration = Date.now() - startTime;
 
     // Update scan log
-    await db.execute(
-      `UPDATE fraud_detection_logs 
-       SET triggered_patterns = $1,
-           users_checked = $2,
-           suspicious_found = $3,
-           scan_duration_ms = $4,
-           status = 'completed'
-       WHERE id = $5`,
-      [JSON.stringify(triggeredPatterns), usersChecked, suspiciousFound, scanDuration, scanId]
-    );
+    await supabase
+      .from('fraud_detection_logs')
+      .update({
+        triggered_patterns: JSON.stringify(triggeredPatterns),
+        users_checked: usersChecked,
+        suspicious_found: suspiciousFound,
+        scan_duration_ms: scanDuration,
+        status: 'completed'
+      })
+      .eq('id', scanId);
 
     console.log(`✅ Fraud scan completed: ${usersChecked} users checked, ${suspiciousFound} suspicious activities found`);
 
   } catch (error) {
     console.error('❌ Fraud scan error:', error);
     
-    // Update scan log as failed
     try {
-      await db.execute(
-        `UPDATE fraud_detection_logs SET status = 'failed' WHERE id = $1`,
-        [scanId]
-      );
+      await supabase
+        .from('fraud_detection_logs')
+        .update({ status: 'failed' })
+        .eq('id', scanId);
     } catch (updateError) {
       console.error('Failed to update scan log:', updateError);
     }
   }
 }
-// Helper function to check pattern rules
+
 // Helper function to check pattern rules
 async function checkPattern(user, rules) {
   if (!rules || typeof rules !== 'object') {
@@ -1924,38 +2113,44 @@ async function checkPattern(user, rules) {
   try {
     // Check for rapid account creation (multiple accounts from same IP)
     if (rules.type === 'multiple_accounts') {
-      const [accounts] = await db.execute(
-        'SELECT COUNT(*) as count FROM users WHERE created_at >= NOW() - INTERVAL $1 HOUR',
-        [rules.timeframe || 24]
-      );
-      return accounts[0].count > (rules.threshold || 3);
+      const { count, error } = await supabase
+        .from('users')
+        .select('*', { count: 'exact', head: true })
+        .gte('created_at', new Date(Date.now() - (rules.timeframe || 24) * 60 * 60 * 1000).toISOString());
+
+      if (error) throw error;
+      return (count || 0) > (rules.threshold || 3);
     }
 
     // Check for unusual transaction patterns
     if (rules.type === 'transaction_anomaly') {
-      const [transactions] = await db.execute(
-        `SELECT COUNT(*) as count, SUM(amount) as total 
-         FROM transactions 
-         WHERE user_id = $1 AND created_at >= NOW() - INTERVAL $2 HOUR AND status = 'completed'`,
-        [user.id, rules.timeframe || 24]
-      );
-      
-      const txCount = transactions[0].count || 0;
-      const totalAmount = Math.abs(transactions[0].total || 0);
-      
+      const { data: transactions, error } = await supabase
+        .from('transactions')
+        .select('amount')
+        .eq('user_id', user.id)
+        .eq('status', 'completed')
+        .gte('created_at', new Date(Date.now() - (rules.timeframe || 24) * 60 * 60 * 1000).toISOString());
+
+      if (error) throw error;
+
+      const txCount = transactions?.length || 0;
+      const totalAmount = transactions?.reduce((sum, tx) => sum + Math.abs(parseFloat(tx.amount)), 0) || 0;
+
       return txCount > (rules.maxTransactions || 10) || totalAmount > (rules.maxAmount || 100000);
     }
 
     // Check for login anomalies
     if (rules.type === 'login_anomaly') {
-      const [logins] = await db.execute(
-        `SELECT COUNT(DISTINCT ip_address) as unique_ips 
-         FROM user_logins 
-         WHERE user_id = $1 AND login_time >= NOW() - INTERVAL $2 HOUR`,
-        [user.id, rules.timeframe || 24]
-      );
-      
-      return logins[0].unique_ips > (rules.maxUniqueIPs || 5);
+      const { data: logins, error } = await supabase
+        .from('user_logins')
+        .select('ip_address')
+        .eq('user_id', user.id)
+        .gte('login_time', new Date(Date.now() - (rules.timeframe || 24) * 60 * 60 * 1000).toISOString());
+
+      if (error) throw error;
+
+      const uniqueIPs = new Set(logins?.map(l => l.ip_address) || []).size;
+      return uniqueIPs > (rules.maxUniqueIPs || 5);
     }
 
     // Check account age and activity
@@ -1963,14 +2158,14 @@ async function checkPattern(user, rules) {
       const accountAgeHours = Math.floor((new Date() - new Date(user.created_at)) / (1000 * 60 * 60));
       
       if (accountAgeHours < (rules.maxAgeHours || 24)) {
-        const [activityCount] = await db.execute(
-          `SELECT COUNT(*) as count 
-           FROM matches 
-           WHERE (player1_id = $1 OR player2_id = $1) AND created_at >= NOW() - INTERVAL '24 HOUR'`,
-          [user.id]
-        );
-        
-        return activityCount[0].count > (rules.minActivities || 10);
+        const { count, error } = await supabase
+          .from('matches')
+          .select('*', { count: 'exact', head: true })
+          .or(`player1_id.eq.${user.id},player2_id.eq.${user.id}`)
+          .gte('created_at', new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString());
+
+        if (error) throw error;
+        return (count || 0) > (rules.minActivities || 10);
       }
     }
 
@@ -1981,7 +2176,9 @@ async function checkPattern(user, rules) {
     return false;
   }
 }
+
 // ==================== TRANSACTIONS MANAGEMENT ====================
+
 router.get('/transactions', authenticateAdmin, async (req, res) => {
   try {
     const { 
@@ -1996,87 +2193,63 @@ router.get('/transactions', authenticateAdmin, async (req, res) => {
     
     console.log('💰 Admin: Fetching transactions - Type:', type, 'Status:', status, 'Page:', page, 'Search:', search);
 
-    let query = `
-      SELECT t.*, u.username, u.email, u.wallet_account_number
-      FROM transactions t
-      JOIN users u ON t.user_id = u.id
-      WHERE 1=1
-    `;
-    
-    let countQuery = `
-      SELECT COUNT(*) as total 
-      FROM transactions t
-      JOIN users u ON t.user_id = u.id
-      WHERE 1=1
-    `;
-    
-    const params = [];
-    const countParams = [];
-    let paramCount = 0;
-    let countParamCount = 0;
+    let query = supabase
+      .from('transactions')
+      .select(`
+        *,
+        users (username, email, wallet_account_number)
+      `, { count: 'exact' });
 
-    // Apply filters
     if (type && type !== '') {
-      paramCount++;
-      countParamCount++;
-      query += ` AND t.type = $${paramCount}`;
-      countQuery += ` AND t.type = $${countParamCount}`;
-      params.push(type);
-      countParams.push(type);
+      query = query.eq('type', type);
     }
     
     if (status && status !== '') {
-      paramCount++;
-      countParamCount++;
-      query += ` AND t.status = $${paramCount}`;
-      countQuery += ` AND t.status = $${countParamCount}`;
-      params.push(status);
-      countParams.push(status);
+      query = query.eq('status', status);
     }
     
-    // Apply search
-    if (search) {
-      const searchTerm = `%${search}%`;
-      paramCount++;
-      countParamCount++;
-      query += ` AND (t.reference ILIKE $${paramCount} OR u.username ILIKE $${paramCount} OR u.email ILIKE $${paramCount} OR u.wallet_account_number ILIKE $${paramCount})`;
-      countQuery += ` AND (t.reference ILIKE $${countParamCount} OR u.username ILIKE $${countParamCount} OR u.email ILIKE $${countParamCount} OR u.wallet_account_number ILIKE $${countParamCount})`;
-      params.push(searchTerm, searchTerm, searchTerm, searchTerm);
-      countParams.push(searchTerm, searchTerm, searchTerm, searchTerm);
+    if (search && search.trim() !== '') {
+      query = query.or(`reference.ilike.%${search}%,users.username.ilike.%${search}%,users.email.ilike.%${search}%,users.wallet_account_number.ilike.%${search}%`);
     }
-    
-    // Order and pagination
-    paramCount++;
-    paramCount++;
-    query += ` ORDER BY t.created_at DESC LIMIT $${paramCount - 1} OFFSET $${paramCount}`;
-    params.push(parseInt(limit), parseInt(offset));
 
-    // Execute queries
-    const [transactions] = await db.execute(query, params);
-    const [countResult] = await db.execute(countQuery, countParams);
+    const { data: transactions, error, count } = await query
+      .order('created_at', { ascending: false })
+      .range(offset, offset + limit - 1);
+
+    if (error) throw error;
+
+    // Format transactions
+    const formattedTransactions = (transactions || []).map(tx => ({
+      ...tx,
+      username: tx.users?.username,
+      email: tx.users?.email,
+      wallet_account_number: tx.users?.wallet_account_number,
+      users: undefined
+    }));
 
     // Log activity
     try {
-      await db.execute(
-        `INSERT INTO admin_activity_logs 
-         (admin_id, action_type, description) 
-         VALUES ($1, 'view', 'Viewed transactions list')`,
-        [req.admin.id]
-      );
+      await supabase
+        .from('admin_activity_logs')
+        .insert({
+          admin_id: req.admin.id,
+          action_type: 'view',
+          description: 'Viewed transactions list'
+        });
     } catch (logError) {
       console.warn('⚠️ Could not log activity:', logError.message);
     }
 
-    console.log('✅ Found', transactions.length, 'transactions');
+    console.log('✅ Found', formattedTransactions.length, 'transactions');
 
     res.json({
       success: true,
-      transactions,
+      transactions: formattedTransactions,
       pagination: {
         page: parseInt(page),
         limit: parseInt(limit),
-        total: parseInt(countResult[0].total),
-        totalPages: Math.ceil(parseInt(countResult[0].total) / limit)
+        total: count || 0,
+        totalPages: Math.ceil((count || 0) / limit)
       }
     });
 
@@ -2094,30 +2267,31 @@ router.get('/transactions/stats', authenticateAdmin, async (req, res) => {
   try {
     console.log('📊 Admin: Fetching transaction statistics');
     
-    const [stats] = await db.execute(`
-      SELECT 
-        (SELECT COUNT(*) FROM transactions) as total,
-        (SELECT SUM(amount) FROM transactions WHERE status = 'completed' AND amount > 0) as totalAmount,
-        (SELECT COUNT(*) FROM transactions WHERE status = 'pending') as pending,
-        (SELECT COUNT(*) FROM transactions WHERE status = 'completed') as completed,
-        (SELECT COUNT(*) FROM transactions WHERE status = 'failed') as failed,
-        (SELECT COUNT(*) FROM transactions WHERE DATE(created_at) = CURRENT_DATE) as todayCount,
-        (SELECT SUM(amount) FROM transactions WHERE DATE(created_at) = CURRENT_DATE AND amount > 0) as todayAmount
-    `);
+    const { data: allTransactions, error } = await supabase
+      .from('transactions')
+      .select('status, amount, type, created_at');
 
-    console.log('✅ Transaction stats fetched:', stats[0]);
+    if (error) throw error;
+
+    const today = new Date().toISOString().split('T')[0];
+    
+    const stats = {
+      total: allTransactions?.length || 0,
+      totalAmount: allTransactions?.filter(tx => tx.status === 'completed' && tx.amount > 0)
+        .reduce((sum, tx) => sum + parseFloat(tx.amount), 0) || 0,
+      pending: allTransactions?.filter(tx => tx.status === 'pending').length || 0,
+      completed: allTransactions?.filter(tx => tx.status === 'completed').length || 0,
+      failed: allTransactions?.filter(tx => tx.status === 'failed').length || 0,
+      todayCount: allTransactions?.filter(tx => tx.created_at?.split('T')[0] === today).length || 0,
+      todayAmount: allTransactions?.filter(tx => tx.created_at?.split('T')[0] === today && tx.amount > 0)
+        .reduce((sum, tx) => sum + parseFloat(tx.amount), 0) || 0
+    };
+
+    console.log('✅ Transaction stats fetched');
 
     res.json({
       success: true,
-      stats: stats[0] || {
-        total: 0,
-        totalAmount: 0,
-        pending: 0,
-        completed: 0,
-        failed: 0,
-        todayCount: 0,
-        todayAmount: 0
-      }
+      stats
     });
 
   } catch (error) {
@@ -2134,17 +2308,17 @@ router.get('/transactions/:id', authenticateAdmin, async (req, res) => {
     const { id } = req.params;
     console.log('🔍 Admin: Fetching transaction details for ID:', id);
 
-    const [transactions] = await db.execute(`
-      SELECT t.*, 
-             u.username, 
-             u.email,
-             u.wallet_account_number
-      FROM transactions t
-      JOIN users u ON t.user_id = u.id
-      WHERE t.id = $1
-    `, [id]);
+    const { data: transactions, error } = await supabase
+      .from('transactions')
+      .select(`
+        *,
+        users (username, email, wallet_account_number)
+      `)
+      .eq('id', id);
 
-    if (transactions.length === 0) {
+    if (error) throw error;
+
+    if (!transactions || transactions.length === 0) {
       console.log('❌ Transaction not found:', id);
       return res.status(404).json({ 
         success: false, 
@@ -2152,16 +2326,25 @@ router.get('/transactions/:id', authenticateAdmin, async (req, res) => {
       });
     }
 
-    const transaction = transactions[0];
+    const transaction = {
+      ...transactions[0],
+      username: transactions[0].users?.username,
+      email: transactions[0].users?.email,
+      wallet_account_number: transactions[0].users?.wallet_account_number,
+      users: undefined
+    };
 
     // Get withdrawal request if exists
     let withdrawalRequest = null;
     if (transaction.type === 'withdrawal') {
-      const [withdrawals] = await db.execute(
-        'SELECT * FROM withdrawal_requests WHERE transaction_id = $1',
-        [id]
-      );
-      withdrawalRequest = withdrawals[0] || null;
+      const { data: withdrawals, error: wError } = await supabase
+        .from('withdrawal_requests')
+        .select('*')
+        .eq('transaction_id', id);
+
+      if (!wError && withdrawals && withdrawals.length > 0) {
+        withdrawalRequest = withdrawals[0];
+      }
     }
 
     console.log('✅ Transaction details fetched:', transaction.reference);
@@ -2201,12 +2384,14 @@ router.put('/transactions/:id/status', authenticateAdmin, async (req, res) => {
     }
 
     // Get current transaction
-    const [transactions] = await db.execute(
-      'SELECT * FROM transactions WHERE id = $1',
-      [id]
-    );
+    const { data: transactions, error: txError } = await supabase
+      .from('transactions')
+      .select('*')
+      .eq('id', id);
 
-    if (transactions.length === 0) {
+    if (txError) throw txError;
+
+    if (!transactions || transactions.length === 0) {
       return res.status(404).json({ 
         success: false, 
         message: 'Transaction not found' 
@@ -2216,72 +2401,67 @@ router.put('/transactions/:id/status', authenticateAdmin, async (req, res) => {
     const transaction = transactions[0];
     const oldStatus = transaction.status;
 
-    // FIXED: Use your withTransaction helper
-    await db.withTransaction(async (connection) => {
-      try {
-        // Update transaction status - PostgreSQL version
-        // FIXED: PostgreSQL IF() function is CASE WHEN
-        await connection.query(
-          `UPDATE transactions SET status = $1, 
-           completed_at = CASE 
-             WHEN status != 'completed' AND $2 = 'completed' THEN NOW() 
-             ELSE completed_at 
-           END, 
-           updated_at = NOW() 
-           WHERE id = $3`,
-          [status, status, id]
-        );
+    // Update transaction status
+    const updateData = {
+      status: status,
+      updated_at: new Date().toISOString()
+    };
 
-        // Also update withdrawal_requests table if it's a withdrawal
-        if (transaction.type === 'withdrawal') {
-          await connection.query(
-            'UPDATE withdrawal_requests SET status = $1, processed_by = $2, processed_at = NOW() WHERE transaction_id = $3',
-            [status === 'completed' ? 'processing' : status, adminId, id]
-          );
-        }
+    if (status === 'completed' && oldStatus !== 'completed') {
+      updateData.completed_at = new Date().toISOString();
+    }
 
-        // Handle balance adjustments
-        if (status === 'completed' && oldStatus !== 'completed') {
-          // For deposits: Add to user balance
-          if (transaction.type === 'deposit' && transaction.amount > 0) {
-            await connection.query(
-              'UPDATE users SET balance = balance + $1 WHERE id = $2',
-              [transaction.amount, transaction.user_id]
-            );
-            console.log(`✅ Added ${transaction.amount} to user ${transaction.user_id} balance`);
-          }
-          // For withdrawals: No balance change needed on completion
-        }
-        
-        // Handle refunds/rejections for withdrawals
-        if (transaction.type === 'withdrawal' && (status === 'failed' || status === 'rejected') && oldStatus === 'pending_approval') {
-          // Refund back to user (withdrawals have negative amounts, so we add back)
-          await connection.query(
-            'UPDATE users SET balance = balance + ABS($1) WHERE id = $2',
-            [transaction.amount, transaction.user_id]
-          );
-          console.log(`✅ Refunded ${Math.abs(transaction.amount)} to user ${transaction.user_id} for failed withdrawal`);
-        }
+    const { error: updateError } = await supabase
+      .from('transactions')
+      .update(updateData)
+      .eq('id', id);
 
-        // Log the status change
-        await connection.query(
-          `INSERT INTO admin_activity_logs 
-           (admin_id, action_type, description, affected_user_id, affected_transaction_id) 
-           VALUES ($1, 'transaction_status', $2, $3, $4)`,
-          [adminId, 
-           `Updated transaction #${id} from ${oldStatus} to ${status}`,
-           transaction.user_id, 
-           id]
-        );
+    if (updateError) throw updateError;
 
-        console.log('💾 Transaction status updated successfully');
-        
-        // Transaction will auto-commit if no error
-      } catch (error) {
-        console.error('❌ Error within transaction:', error);
-        throw error;
+    // Also update withdrawal_requests table if it's a withdrawal
+    if (transaction.type === 'withdrawal') {
+      await supabase
+        .from('withdrawal_requests')
+        .update({
+          status: status === 'completed' ? 'processing' : status,
+          processed_by: adminId,
+          processed_at: new Date().toISOString()
+        })
+        .eq('transaction_id', id);
+    }
+
+    // Handle balance adjustments
+    if (status === 'completed' && oldStatus !== 'completed') {
+      if (transaction.type === 'deposit' && transaction.amount > 0) {
+        await supabase.rpc('increment_user_balance', {
+          user_id: transaction.user_id,
+          amount: transaction.amount
+        });
+        console.log(`✅ Added ${transaction.amount} to user ${transaction.user_id} balance`);
       }
-    });
+    }
+    
+    // Handle refunds/rejections for withdrawals
+    if (transaction.type === 'withdrawal' && (status === 'failed' || status === 'rejected') && oldStatus === 'pending_approval') {
+      await supabase.rpc('increment_user_balance', {
+        user_id: transaction.user_id,
+        amount: Math.abs(transaction.amount)
+      });
+      console.log(`✅ Refunded ${Math.abs(transaction.amount)} to user ${transaction.user_id} for failed withdrawal`);
+    }
+
+    // Log the status change
+    await supabase
+      .from('admin_activity_logs')
+      .insert({
+        admin_id: adminId,
+        action_type: 'transaction_status',
+        description: `Updated transaction #${id} from ${oldStatus} to ${status}`,
+        affected_user_id: transaction.user_id,
+        affected_transaction_id: id
+      });
+
+    console.log('💾 Transaction status updated successfully');
 
     res.json({
       success: true,
@@ -2298,9 +2478,8 @@ router.put('/transactions/:id/status', authenticateAdmin, async (req, res) => {
     });
   }
 });
+
 router.post('/transactions/:id/refund', authenticateAdmin, async (req, res) => {
-  let refundResult, refundReference;
-  
   try {
     const { id } = req.params;
     const { reason } = req.body;
@@ -2309,12 +2488,16 @@ router.post('/transactions/:id/refund', authenticateAdmin, async (req, res) => {
     console.log('💸 Admin: Processing refund for transaction ID:', id);
 
     // Get transaction (must be a completed deposit)
-    const [transactions] = await db.execute(
-      'SELECT * FROM transactions WHERE id = $1 AND type = \'deposit\' AND status = \'completed\'',
-      [id]
-    );
+    const { data: transactions, error: txError } = await supabase
+      .from('transactions')
+      .select('*')
+      .eq('id', id)
+      .eq('type', 'deposit')
+      .eq('status', 'completed');
 
-    if (transactions.length === 0) {
+    if (txError) throw txError;
+
+    if (!transactions || transactions.length === 0) {
       return res.status(404).json({ 
         success: false, 
         message: 'Completed deposit transaction not found' 
@@ -2324,56 +2507,51 @@ router.post('/transactions/:id/refund', authenticateAdmin, async (req, res) => {
     const transaction = transactions[0];
 
     // Generate reference
-    refundReference = `REFUND-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+    const refundReference = `REFUND-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
 
-    // FIXED: Use your withTransaction helper
-    await db.withTransaction(async (connection) => {
-      try {
-        // Create refund transaction
-        const result = await connection.query(
-          `INSERT INTO transactions 
-           (user_id, amount, currency, type, status, reference, description, external_reference) 
-           VALUES ($1, $2, $3, 'refund', 'completed', $4, $5, $6) RETURNING id`,
-          [
-            transaction.user_id,
-            -Math.abs(transaction.amount), // Negative amount for refund
-            transaction.currency,
-            refundReference,
-            reason || 'Admin refund for deposit',
-            transaction.reference
-          ]
-        );
+    // Create refund transaction
+    const refundId = uuidv4();
+    const { data: refundData, error: refundError } = await supabase
+      .from('transactions')
+      .insert({
+        id: refundId,
+        user_id: transaction.user_id,
+        amount: -Math.abs(transaction.amount),
+        currency: transaction.currency,
+        type: 'refund',
+        status: 'completed',
+        reference: refundReference,
+        description: reason || 'Admin refund for deposit',
+        external_reference: transaction.reference,
+        created_at: new Date().toISOString()
+      })
+      .select();
 
-        refundResult = result.rows[0];
+    if (refundError) throw refundError;
 
-        // Deduct from user balance
-        await connection.query(
-          'UPDATE users SET balance = balance - $1 WHERE id = $2',
-          [Math.abs(transaction.amount), transaction.user_id]
-        );
-
-        // Log activity
-        await connection.query(
-          `INSERT INTO admin_activity_logs 
-           (admin_id, action_type, description, affected_user_id, affected_transaction_id) 
-           VALUES ($1, 'transaction_refund', $2, $3, $4)`,
-          [adminId, 
-           `Refunded transaction #${id} - ${transaction.amount} ${transaction.currency}`,
-           transaction.user_id, 
-           id]
-        );
-
-        console.log('✅ Refund processed successfully');
-      } catch (error) {
-        console.error('❌ Error within refund transaction:', error);
-        throw error;
-      }
+    // Deduct from user balance
+    await supabase.rpc('increment_user_balance', {
+      user_id: transaction.user_id,
+      amount: -Math.abs(transaction.amount)
     });
+
+    // Log activity
+    await supabase
+      .from('admin_activity_logs')
+      .insert({
+        admin_id: adminId,
+        action_type: 'transaction_refund',
+        description: `Refunded transaction #${id} - ${transaction.amount} ${transaction.currency}`,
+        affected_user_id: transaction.user_id,
+        affected_transaction_id: id
+      });
+
+    console.log('✅ Refund processed successfully');
 
     res.json({
       success: true,
       message: 'Refund processed successfully',
-      refund_id: refundResult.id,
+      refund_id: refundId,
       refund_reference: refundReference,
       amount: Math.abs(transaction.amount)
     });
@@ -2386,7 +2564,9 @@ router.post('/transactions/:id/refund', authenticateAdmin, async (req, res) => {
     });
   }
 });
+
 // ==================== MATCHES MANAGEMENT ====================
+
 router.get('/matches', authenticateAdmin, async (req, res) => {
   try {
     const { 
@@ -2401,91 +2581,67 @@ router.get('/matches', authenticateAdmin, async (req, res) => {
     
     console.log('🎮 Admin: Fetching matches - Status:', status, 'Game Type:', game_type, 'Page:', page);
 
-    let query = `
-      SELECT m.*, 
-             p1.username as player1_username,
-             p2.username as player2_username,
-             w.username as winner_username
-      FROM matches m
-      LEFT JOIN users p1 ON m.player1_id = p1.id
-      LEFT JOIN users p2 ON m.player2_id = p2.id
-      LEFT JOIN users w ON m.winner_id = w.id
-      WHERE 1=1
-    `;
-    
-    let countQuery = `
-      SELECT COUNT(*) as total 
-      FROM matches m
-      WHERE 1=1
-    `;
-    
-    const params = [];
-    const countParams = [];
-    let paramCount = 0;
-    let countParamCount = 0;
+    let query = supabase
+      .from('matches')
+      .select(`
+        *,
+        player1:player1_id (username),
+        player2:player2_id (username),
+        winner:winner_id (username)
+      `, { count: 'exact' });
 
-    // Apply filters
     if (status && status !== '') {
-      paramCount++;
-      countParamCount++;
-      query += ` AND m.status = $${paramCount}`;
-      countQuery += ` AND m.status = $${countParamCount}`;
-      params.push(status);
-      countParams.push(status);
+      query = query.eq('status', status);
     }
     
     if (game_type && game_type !== '') {
-      paramCount++;
-      countParamCount++;
-      query += ` AND m.game_type = $${paramCount}`;
-      countQuery += ` AND m.game_type = $${countParamCount}`;
-      params.push(game_type);
-      countParams.push(game_type);
+      query = query.eq('game_type', game_type);
     }
     
-    // Apply search
-    if (search) {
-      const searchTerm = `%${search}%`;
-      paramCount++;
-      countParamCount++;
-      query += ` AND (m.id::text ILIKE $${paramCount} OR m.game ILIKE $${paramCount} OR p1.username ILIKE $${paramCount} OR p2.username ILIKE $${paramCount})`;
-      countQuery += ` AND (m.id::text ILIKE $${countParamCount} OR m.game ILIKE $${countParamCount})`;
-      params.push(searchTerm, searchTerm, searchTerm, searchTerm);
-      countParams.push(searchTerm, searchTerm);
+    if (search && search.trim() !== '') {
+      query = query.or(`id::text.ilike.%${search}%,game.ilike.%${search}%,player1.username.ilike.%${search}%,player2.username.ilike.%${search}%`);
     }
-    
-    // Order and pagination
-    paramCount++;
-    paramCount++;
-    query += ` ORDER BY m.created_at DESC LIMIT $${paramCount - 1} OFFSET $${paramCount}`;
-    params.push(parseInt(limit), parseInt(offset));
 
-    // Execute queries
-    const [matches] = await db.execute(query, params);
-    const [countResult] = await db.execute(countQuery, countParams);
+    const { data: matches, error, count } = await query
+      .order('created_at', { ascending: false })
+      .range(offset, offset + limit - 1);
+
+    if (error) throw error;
+
+    // Format matches
+    const formattedMatches = (matches || []).map(m => ({
+      ...m,
+      player1_username: m.player1?.username,
+      player2_username: m.player2?.username,
+      winner_username: m.winner?.username,
+      player1: undefined,
+      player2: undefined,
+      winner: undefined
+    }));
 
     // Log activity
     try {
-      await db.execute(
-        `INSERT INTO admin_activity_logs 
-         (admin_id, action_type, description) 
-         VALUES ($1, 'view', 'Viewed matches list')`,
-        [req.admin.id]
-      );
+      await supabase
+        .from('admin_activity_logs')
+        .insert({
+          admin_id: req.admin.id,
+          action_type: 'view',
+          description: 'Viewed matches list'
+        });
     } catch (logError) {
       console.warn('⚠️ Could not log activity:', logError.message);
     }
 
-    console.log('✅ Found', matches.length, 'matches');
+    console.log('✅ Found', formattedMatches.length, 'matches');
 
     res.json({
       success: true,
-      matches,
+      matches: formattedMatches,
       pagination: {
         page: parseInt(page),
         limit: parseInt(limit),
-        total: parseInt(countResult[0].total),
-        totalPages: Math.ceil(parseInt(countResult[0].total) / limit)
+        total: count || 0,
+        totalPages: Math.ceil((count || 0) / limit)
       }
     });
 
@@ -2503,37 +2659,27 @@ router.get('/matches/stats', authenticateAdmin, async (req, res) => {
   try {
     console.log('📊 Admin: Fetching match statistics');
     
-    const [stats] = await db.execute(`
-      SELECT 
-        COUNT(*) as total,
-        SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) as pending,
-        SUM(CASE WHEN status = 'ongoing' THEN 1 ELSE 0 END) as ongoing,
-        SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed,
-        COALESCE(SUM(stake_amount), 0) as totalStake,
-        SUM(CASE WHEN admin_monitoring = true THEN 1 ELSE 0 END) as adminMonitored,
-        COALESCE(SUM(
-          CASE 
-            WHEN prize_pool_amount > 0 THEN prize_pool_amount
-            WHEN custom_prize_pool > 0 THEN custom_prize_pool
-            ELSE 0 
-          END
-        ), 0) as totalPrize
-      FROM matches
-    `);
+    const { data: matches, error } = await supabase
+      .from('matches')
+      .select('status, stake_amount, admin_monitoring, prize_pool_amount, custom_prize_pool');
 
-    console.log('✅ Match stats fetched:', stats[0]);
+    if (error) throw error;
+
+    const stats = {
+      total: matches?.length || 0,
+      pending: matches?.filter(m => m.status === 'pending').length || 0,
+      ongoing: matches?.filter(m => m.status === 'ongoing').length || 0,
+      completed: matches?.filter(m => m.status === 'completed').length || 0,
+      totalStake: matches?.reduce((sum, m) => sum + (parseFloat(m.stake_amount) || 0), 0) || 0,
+      adminMonitored: matches?.filter(m => m.admin_monitoring === true).length || 0,
+      totalPrize: matches?.reduce((sum, m) => sum + (parseFloat(m.prize_pool_amount || 0) + parseFloat(m.custom_prize_pool || 0)), 0) || 0
+    };
+
+    console.log('✅ Match stats fetched');
 
     res.json({
       success: true,
-      stats: stats[0] || {
-        total: 0,
-        pending: 0,
-        ongoing: 0,
-        completed: 0,
-        totalStake: 0,
-        adminMonitored: 0,
-        totalPrize: 0
-      }
+      stats
     });
 
   } catch (error) {
@@ -2544,26 +2690,25 @@ router.get('/matches/stats', authenticateAdmin, async (req, res) => {
     });
   }
 });
+
 router.get('/matches/:id', authenticateAdmin, async (req, res) => {
   try {
     const { id } = req.params;
     console.log('🔍 Admin: Fetching match details for ID:', id);
 
-    const [matches] = await db.execute(`
-      SELECT m.*, 
-             p1.username as player1_username,
-             p1.email as player1_email,
-             p2.username as player2_username,
-             p2.email as player2_email,
-             w.username as winner_username
-      FROM matches m
-      LEFT JOIN users p1 ON m.player1_id = p1.id
-      LEFT JOIN users p2 ON m.player2_id = p2.id
-      LEFT JOIN users w ON m.winner_id = w.id
-      WHERE m.id = $1
-    `, [id]);
+    const { data: matches, error } = await supabase
+      .from('matches')
+      .select(`
+        *,
+        player1:player1_id (username, email),
+        player2:player2_id (username, email),
+        winner:winner_id (username)
+      `)
+      .eq('id', id);
 
-    if (matches.length === 0) {
+    if (error) throw error;
+
+    if (!matches || matches.length === 0) {
       console.log('❌ Match not found:', id);
       return res.status(404).json({ 
         success: false, 
@@ -2571,20 +2716,31 @@ router.get('/matches/:id', authenticateAdmin, async (req, res) => {
       });
     }
 
-    const match = matches[0];
+    const match = {
+      ...matches[0],
+      player1_username: matches[0].player1?.username,
+      player1_email: matches[0].player1?.email,
+      player2_username: matches[0].player2?.username,
+      player2_email: matches[0].player2?.email,
+      winner_username: matches[0].winner?.username,
+      player1: undefined,
+      player2: undefined,
+      winner: undefined
+    };
 
     // Get disputes if any
-    const [disputes] = await db.execute(
-      'SELECT * FROM match_disputes WHERE match_id = $1 ORDER BY created_at DESC',
-      [id]
-    );
+    const { data: disputes, error: dispError } = await supabase
+      .from('match_disputes')
+      .select('*')
+      .eq('match_id', id)
+      .order('created_at', { ascending: false });
 
     console.log('✅ Match details fetched:', match.id);
 
     res.json({
       success: true,
       match: match,
-      disputes: disputes
+      disputes: disputes || []
     });
 
   } catch (error) {
@@ -2595,6 +2751,7 @@ router.get('/matches/:id', authenticateAdmin, async (req, res) => {
     });
   }
 });
+
 router.post('/matches/:id/cancel', authenticateAdmin, async (req, res) => {
   try {
     const { id } = req.params;
@@ -2608,12 +2765,15 @@ router.post('/matches/:id/cancel', authenticateAdmin, async (req, res) => {
     });
 
     // Get current match
-    const [matches] = await db.execute(
-      'SELECT * FROM matches WHERE id = $1 AND status IN (\'pending\', \'ongoing\')',
-      [id]
-    );
+    const { data: matches, error: mError } = await supabase
+      .from('matches')
+      .select('*')
+      .eq('id', id)
+      .in('status', ['pending', 'ongoing']);
 
-    if (matches.length === 0) {
+    if (mError) throw mError;
+
+    if (!matches || matches.length === 0) {
       return res.status(404).json({ 
         success: false, 
         message: 'Match not found or cannot be cancelled' 
@@ -2622,80 +2782,73 @@ router.post('/matches/:id/cancel', authenticateAdmin, async (req, res) => {
 
     const match = matches[0];
 
-    await db.withTransaction(async (connection) => {
-      try {
-        // Update match status
-        await connection.query(
-          'UPDATE matches SET status = \'completed\', completed_at = NOW() WHERE id = $1',
-          [id]
-        );
+    // Update match status
+    const { error: updateError } = await supabase
+      .from('matches')
+      .update({
+        status: 'completed',
+        completed_at: new Date().toISOString()
+      })
+      .eq('id', id);
 
-        // Refund stake amount to players
-        if (match.stake_amount > 0) {
-          // Refund to player 1
-          await connection.query(
-            'UPDATE users SET balance = balance + $1 WHERE id = $2',
-            [match.stake_amount, match.player1_id]
-          );
-          
-          if (match.player2_id) {
-            // Refund to player 2 if exists
-            await connection.query(
-              'UPDATE users SET balance = balance + $1 WHERE id = $2',
-              [match.stake_amount, match.player2_id]
-            );
-          }
-        }
+    if (updateError) throw updateError;
 
-        // Log admin monitoring activity if admin monitoring was enabled
-        if (match.admin_monitoring === true) {
-          await connection.query(
-            `INSERT INTO admin_monitoring_logs 
-             (tournament_id, match_id, admin_id, action_type, details, ip_address) 
-             VALUES ($1, $2, $3, $4, $5, $6)`,
-            [
-              null, // tournament_id (null for regular matches)
-              id,
-              adminId,
-              'overrode_result',
-              JSON.stringify({
-                reason: reason,
-                action: 'cancelled_by_admin',
-                stake_amount: match.stake_amount,
-                refunded_to_players: [match.player1_id, match.player2_id].filter(Boolean)
-              }),
-              req.ip || 'unknown'
-            ]
-          );
-        }
-
-        // Log admin activity
-        await connection.query(
-          `INSERT INTO admin_activity_logs 
-           (admin_id, action_type, description, details) 
-           VALUES ($1, 'match_cancellation', $2, $3)`,
-          [adminId, 
-           `Cancelled match #${id}`,
-           JSON.stringify({ 
-             reason, 
-             stake_amount: match.stake_amount,
-             admin_monitoring: match.admin_monitoring,
-             final_decision: true // Referee's word is final
-           })]
-        );
-
-        console.log('✅ Match cancelled successfully');
-      } catch (error) {
-        console.error('❌ Error within match cancellation transaction:', error);
-        throw error;
+    // Refund stake amount to players
+    if (match.stake_amount > 0) {
+      await supabase.rpc('increment_user_balance', {
+        user_id: match.player1_id,
+        amount: match.stake_amount
+      });
+      
+      if (match.player2_id) {
+        await supabase.rpc('increment_user_balance', {
+          user_id: match.player2_id,
+          amount: match.stake_amount
+        });
       }
-    });
+    }
+
+    // Log admin monitoring activity if admin monitoring was enabled
+    if (match.admin_monitoring === true) {
+      await supabase
+        .from('admin_monitoring_logs')
+        .insert({
+          tournament_id: null,
+          match_id: id,
+          admin_id: adminId,
+          action_type: 'overrode_result',
+          details: JSON.stringify({
+            reason: reason,
+            action: 'cancelled_by_admin',
+            stake_amount: match.stake_amount,
+            refunded_to_players: [match.player1_id, match.player2_id].filter(Boolean)
+          }),
+          ip_address: req.ip || 'unknown'
+        });
+    }
+
+    // Log admin activity
+    await supabase
+      .from('admin_activity_logs')
+      .insert({
+        admin_id: adminId,
+        action_type: 'match_cancellation',
+        description: `Cancelled match #${id}`,
+        details: JSON.stringify({ 
+          reason, 
+          stake_amount: match.stake_amount,
+          admin_monitoring: match.admin_monitoring,
+          final_decision: true
+        })
+      });
+
+    console.log('✅ Match cancelled successfully');
 
     res.json({
       success: true,
       message: 'Match cancelled successfully',
       admin_monitoring: match.admin_monitoring === true,
-      final_decision: true // Referee's word is final
+      final_decision: true
     });
 
   } catch (error) {
@@ -2707,6 +2860,7 @@ router.post('/matches/:id/cancel', authenticateAdmin, async (req, res) => {
     });
   }
 });
+
 router.post('/matches/:id/resolve', authenticateAdmin, async (req, res) => {
   try {
     const { id } = req.params;
@@ -2727,12 +2881,15 @@ router.post('/matches/:id/resolve', authenticateAdmin, async (req, res) => {
     }
 
     // Get current match
-    const [matches] = await db.execute(
-      'SELECT * FROM matches WHERE id = $1 AND status = \'ongoing\'',
-      [id]
-    );
+    const { data: matches, error: mError } = await supabase
+      .from('matches')
+      .select('*')
+      .eq('id', id)
+      .eq('status', 'ongoing');
 
-    if (matches.length === 0) {
+    if (mError) throw mError;
+
+    if (!matches || matches.length === 0) {
       return res.status(404).json({ 
         success: false, 
         message: 'Match not found or not in ongoing status' 
@@ -2741,86 +2898,79 @@ router.post('/matches/:id/resolve', authenticateAdmin, async (req, res) => {
 
     const match = matches[0];
 
-    await db.withTransaction(async (connection) => {
-      try {
-        // Update match
-        await connection.query(
-          'UPDATE matches SET status = \'completed\', winner_id = $1, completed_at = NOW() WHERE id = $2',
-          [winnerId, id]
-        );
+    // Update match
+    const { error: updateError } = await supabase
+      .from('matches')
+      .update({
+        status: 'completed',
+        winner_id: winnerId,
+        completed_at: new Date().toISOString()
+      })
+      .eq('id', id);
 
-        // Distribute prize if any
-        const prizeAmount = match.prize_pool_amount || match.custom_prize_pool || 0;
-        if (prizeAmount > 0) {
-          // Update user balance
-          await connection.query(
-            'UPDATE users SET balance = balance + $1 WHERE id = $2',
-            [prizeAmount, winnerId]
-          );
-          
-          // Create transaction record
-          const reference = `MATCH_PRIZE_${id}_${Date.now()}`;
-          await connection.query(
-            `INSERT INTO transactions 
-             (user_id, type, amount, status, description, reference, currency) 
-             VALUES ($1, $2, $3, 'completed', $4, $5, $6)`,
-            [
-              winnerId, 
-              'match_prize', 
-              prizeAmount, 
-              `Prize for winning match #${id}`,
-              reference,
-              'NGN'
-            ]
-          );
-          console.log(`✅ Created transaction with reference: ${reference}`);
-        }
+    if (updateError) throw updateError;
 
-        // Log admin monitoring activity if admin monitoring was enabled
-        if (match.admin_monitoring === true) {
-          await connection.query(
-            `INSERT INTO admin_monitoring_logs 
-             (tournament_id, match_id, admin_id, action_type, details, ip_address) 
-             VALUES ($1, $2, $3, $4, $5, $6)`,
-            [
-              null, // tournament_id (null for regular matches)
-              id,
-              adminId,
-              'resolved_dispute',
-              JSON.stringify({
-                winner_id: winnerId,
-                admin_notes: adminNotes,
-                stake_amount: match.stake_amount,
-                prize_amount: prizeAmount
-              }),
-              req.ip || 'unknown'
-            ]
-          );
-          console.log('📝 Admin monitoring log created');
-        }
+    // Distribute prize if any
+    const prizeAmount = match.prize_pool_amount || match.custom_prize_pool || 0;
+    if (prizeAmount > 0) {
+      await supabase.rpc('increment_user_balance', {
+        user_id: winnerId,
+        amount: prizeAmount
+      });
+      
+      // Create transaction record
+      const reference = `MATCH_PRIZE_${id}_${Date.now()}`;
+      await supabase
+        .from('transactions')
+        .insert({
+          user_id: winnerId,
+          type: 'match_prize',
+          amount: prizeAmount,
+          status: 'completed',
+          description: `Prize for winning match #${id}`,
+          reference: reference,
+          currency: 'NGN'
+        });
+      console.log(`✅ Created transaction with reference: ${reference}`);
+    }
 
-        // Log admin activity
-        await connection.query(
-          `INSERT INTO admin_activity_logs 
-           (admin_id, action_type, description, affected_user_id, details) 
-           VALUES ($1, 'match_resolution', $2, $3, $4)`,
-          [adminId, 
-           `Resolved match #${id} - Winner: ${winnerId}`,
-           winnerId, 
-           JSON.stringify({ 
-             adminNotes, 
-             prizeAmount,
-             admin_monitoring: match.admin_monitoring,
-             final_decision: true
-           })]
-        );
+    // Log admin monitoring activity if admin monitoring was enabled
+    if (match.admin_monitoring === true) {
+      await supabase
+        .from('admin_monitoring_logs')
+        .insert({
+          tournament_id: null,
+          match_id: id,
+          admin_id: adminId,
+          action_type: 'resolved_dispute',
+          details: JSON.stringify({
+            winner_id: winnerId,
+            admin_notes: adminNotes,
+            stake_amount: match.stake_amount,
+            prize_amount: prizeAmount
+          }),
+          ip_address: req.ip || 'unknown'
+        });
+      console.log('📝 Admin monitoring log created');
+    }
 
-        console.log('✅ Match resolved successfully');
-      } catch (error) {
-        console.error('❌ Error within match resolution transaction:', error);
-        throw error;
-      }
-    });
+    // Log admin activity
+    await supabase
+      .from('admin_activity_logs')
+      .insert({
+        admin_id: adminId,
+        action_type: 'match_resolution',
+        description: `Resolved match #${id} - Winner: ${winnerId}`,
+        affected_user_id: winnerId,
+        details: JSON.stringify({ 
+          adminNotes, 
+          prizeAmount,
+          admin_monitoring: match.admin_monitoring,
+          final_decision: true
+        })
+      });
+
+    console.log('✅ Match resolved successfully');
 
     res.json({
       success: true,
@@ -2839,7 +2989,9 @@ router.post('/matches/:id/resolve', authenticateAdmin, async (req, res) => {
     });
   }
 });
+
 // ==================== MATCH AUDIT LOGS ====================
+
 router.get('/matches/:id/audit-logs', authenticateAdmin, async (req, res) => {
   try {
     const { id } = req.params;
@@ -2848,91 +3000,94 @@ router.get('/matches/:id/audit-logs', authenticateAdmin, async (req, res) => {
     console.log('📝 Admin: Fetching audit logs for match ID:', id);
 
     // First, verify match exists
-    const [matches] = await db.execute(
-      'SELECT id FROM matches WHERE id = ?',
-      [id]
-    );
+    const { data: matches, error: mError } = await supabase
+      .from('matches')
+      .select('id')
+      .eq('id', id);
 
-    if (matches.length === 0) {
+    if (mError) throw mError;
+
+    if (!matches || matches.length === 0) {
       return res.status(404).json({ 
         success: false, 
         message: 'Match not found' 
       });
     }
 
-    // Get admin monitoring logs from admin_monitoring_logs table
+    // Get admin monitoring logs
     let monitoringLogs = [];
-    try {
-      const [logs] = await db.execute(`
-        SELECT 
-          aml.*,
-          au.username as admin_username,
-          'monitoring' as log_source
-        FROM admin_monitoring_logs aml
-        LEFT JOIN admin_users au ON aml.admin_id = au.id
-        WHERE aml.match_id = ?
-        ORDER BY aml.created_at DESC
-        LIMIT 50
-      `, [id]);
-      monitoringLogs = logs;
-    } catch (error) {
-      console.warn('⚠️ Could not fetch monitoring logs:', error.message);
+    const { data: logs, error: logError } = await supabase
+      .from('admin_monitoring_logs')
+      .select(`
+        *,
+        admin_users (username)
+      `)
+      .eq('match_id', id)
+      .order('created_at', { ascending: false })
+      .limit(50);
+
+    if (!logError && logs) {
+      monitoringLogs = logs.map(log => ({
+        ...log,
+        admin_username: log.admin_users?.username,
+        log_source: 'monitoring'
+      }));
     }
 
     // Get related admin activity logs
     let activityLogs = [];
-    try {
-      const [logs] = await db.execute(`
-        SELECT 
-          al.*,
-          au.username as admin_username,
-          'activity' as log_source
-        FROM admin_activity_logs al
-        LEFT JOIN admin_users au ON al.admin_id = au.id
-        WHERE al.description LIKE ? OR al.description LIKE ?
-        ORDER BY al.created_at DESC
-        LIMIT 50
-      `, [`%match #${id}%`, `%Match #${id}%`]);
-      activityLogs = logs;
-    } catch (error) {
-      console.warn('⚠️ Could not fetch activity logs:', error.message);
+    const { data: activities, error: actError } = await supabase
+      .from('admin_activity_logs')
+      .select(`
+        *,
+        admin_users (username)
+      `)
+      .or(`description.ilike.%match #${id}%,description.ilike.%Match #${id}%`)
+      .order('created_at', { ascending: false })
+      .limit(50);
+
+    if (!actError && activities) {
+      activityLogs = activities.map(act => ({
+        ...act,
+        admin_username: act.admin_users?.username,
+        log_source: 'activity'
+      }));
     }
 
-    // Get match dispute logs if any
+    // Get match dispute logs
     let disputeLogs = [];
-    try {
-      const [logs] = await db.execute(
-        'SELECT * FROM match_disputes WHERE match_id = ? ORDER BY created_at DESC LIMIT 20',
-        [id]
-      );
-      disputeLogs = logs.map(log => ({
-        ...log,
+    const { data: disputes, error: dispError } = await supabase
+      .from('match_disputes')
+      .select('*')
+      .eq('match_id', id)
+      .order('created_at', { ascending: false })
+      .limit(20);
+
+    if (!dispError && disputes) {
+      disputeLogs = disputes.map(dispute => ({
+        ...dispute,
         log_source: 'dispute',
         action_type: 'match_dispute',
-        details: JSON.stringify(log)
+        details: JSON.stringify(dispute)
       }));
-    } catch (error) {
-      console.warn('⚠️ Could not fetch dispute logs:', error.message);
     }
 
     // Get transaction logs for this match
     let transactionLogs = [];
-    try {
-      const [logs] = await db.execute(
-        `SELECT 
-          t.*,
-          'transaction' as log_source,
-          'match_transaction' as action_type,
-          CONCAT('Transaction: ', t.description) as details
-        FROM transactions t
-        WHERE t.description LIKE ? OR t.reference LIKE ?
-        ORDER BY t.created_at DESC
-        LIMIT 20`,
-        [`%match #${id}%`, `%MATCH_${id}_%`]
-      );
-      transactionLogs = logs;
-    } catch (error) {
-      console.warn('⚠️ Could not fetch transaction logs:', error.message);
+    const { data: transactions, error: txError } = await supabase
+      .from('transactions')
+      .select('*')
+      .or(`description.ilike.%match #${id}%,reference.ilike.%MATCH_${id}_%`)
+      .order('created_at', { ascending: false })
+      .limit(20);
+
+    if (!txError && transactions) {
+      transactionLogs = transactions.map(tx => ({
+        ...tx,
+        log_source: 'transaction',
+        action_type: 'match_transaction',
+        details: `Transaction: ${tx.description}`
+      }));
     }
 
     // Combine all logs
@@ -2960,56 +3115,30 @@ router.get('/matches/:id/audit-logs', authenticateAdmin, async (req, res) => {
     });
   }
 });
-router.get('/matches/stats', authenticateAdmin, async (req, res) => {
+// GET /api/admin/verify - Verify admin token
+router.get('/verify', authenticateAdmin, async (req, res) => {
   try {
-    console.log('📊 Admin: Fetching match statistics');
-    
-    const [stats] = await db.execute(`
-      SELECT 
-        COUNT(*) as total,
-        SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) as pending,
-        SUM(CASE WHEN status = 'ongoing' THEN 1 ELSE 0 END) as ongoing,
-        SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed,
-        COALESCE(SUM(stake_amount), 0) as totalStake,
-        SUM(CASE WHEN admin_monitoring = 1 THEN 1 ELSE 0 END) as adminMonitored,
-        COALESCE(SUM(
-          CASE 
-            WHEN prize_pool_amount > 0 THEN prize_pool_amount
-            WHEN custom_prize_pool > 0 THEN custom_prize_pool
-            ELSE 0 
-          END
-        ), 0) as totalPrize
-      FROM matches
-    `);
-
-    console.log('✅ Match stats fetched:', stats[0]);
-
+    console.log('✅ Admin token verification successful for:', req.admin.username);
     res.json({
       success: true,
-      stats: stats[0] || {
-        total: 0,
-        pending: 0,
-        ongoing: 0,
-        completed: 0,
-        totalStake: 0,
-        adminMonitored: 0,
-        totalPrize: 0
+      admin: {
+        id: req.admin.id,
+        username: req.admin.username,
+        email: req.admin.email,
+        role: req.admin.role,
+        permissions: req.admin.permissions || []
       }
     });
-
   } catch (error) {
-    console.error('❌ Get match stats error:', error);
-    res.status(500).json({ 
-      success: false, 
-      message: 'Failed to fetch match statistics'
+    console.error('❌ Admin verification error:', error);
+    res.status(401).json({
+      success: false,
+      message: 'Invalid admin session'
     });
   }
 });
 // ==================== TOURNAMENTS MANAGEMENT ====================
 
-// ==================== TOURNAMENTS MANAGEMENT ====================
-
-// GET /api/admin/tournaments - Get all tournaments with filters
 router.get('/tournaments', authenticateAdmin, async (req, res) => {
   try {
     const { 
@@ -3026,136 +3155,105 @@ router.get('/tournaments', authenticateAdmin, async (req, res) => {
     
     console.log('🎯 Admin: Fetching tournaments - Status:', status, 'Type:', type, 'Monitoring:', monitoring, 'Sort:', sort, 'Page:', page);
 
-    let query = `
-      SELECT t.*, 
-             u.username as creator_name,
-             COUNT(DISTINCT tp.id) as current_participants,
-             COUNT(DISTINCT CASE WHEN t.type = 'squad' THEN tp.group_id ELSE NULL END) as current_squads,
-             COUNT(DISTINCT aml.id) as log_count
-      FROM tournaments t
-      LEFT JOIN users u ON t.creator_id = u.id
-      LEFT JOIN tournament_participants tp ON t.id = tp.tournament_id 
-        AND tp.status = 'joined'
-      LEFT JOIN admin_monitoring_logs aml ON t.id = aml.tournament_id
-      WHERE 1=1
-    `;
-    
-    let countQuery = `
-      SELECT COUNT(DISTINCT t.id) as total 
-      FROM tournaments t
-      LEFT JOIN users u ON t.creator_id = u.id
-      WHERE 1=1
-    `;
-    
-    const params = [];
-    const countParams = [];
-    let paramCount = 0;
-    let countParamCount = 0;
+    let query = supabase
+      .from('tournaments')
+      .select(`
+        *,
+        creator:creator_id (username)
+      `, { count: 'exact' });
 
-    // Apply filters
     if (status && status !== '') {
-      paramCount++;
-      countParamCount++;
-      query += ` AND t.status = $${paramCount}`;
-      countQuery += ` AND t.status = $${countParamCount}`;
-      params.push(status);
-      countParams.push(status);
+      query = query.eq('status', status);
     }
     
     if (type && type !== '') {
-      paramCount++;
-      countParamCount++;
-      query += ` AND t.type = $${paramCount}`;
-      countQuery += ` AND t.type = $${countParamCount}`;
-      params.push(type);
-      countParams.push(type);
+      query = query.eq('type', type);
     }
     
-    // Apply monitoring filter
-    if (monitoring && monitoring !== 'all') {
-      if (monitoring === 'monitored') {
-        query += ` AND t.admin_monitoring = true`;
-        countQuery += ` AND t.admin_monitoring = true`;
-      } else if (monitoring === 'not-monitored') {
-        query += ` AND (t.admin_monitoring = false OR t.admin_monitoring IS NULL)`;
-        countQuery += ` AND (t.admin_monitoring = false OR t.admin_monitoring IS NULL)`;
-      }
+    if (monitoring === 'monitored') {
+      query = query.eq('admin_monitoring', true);
+    } else if (monitoring === 'not-monitored') {
+      query = query.eq('admin_monitoring', false);
     }
     
-    // Apply search
     if (search && search.trim() !== '') {
-      const searchTerm = `%${search.trim()}%`;
-      paramCount++;
-      countParamCount++;
-      query += ` AND (t.name ILIKE $${paramCount} OR t.game ILIKE $${paramCount} OR u.username ILIKE $${paramCount})`;
-      countQuery += ` AND (t.name ILIKE $${countParamCount} OR t.game ILIKE $${countParamCount} OR u.username ILIKE $${countParamCount})`;
-      params.push(searchTerm, searchTerm, searchTerm);
-      countParams.push(searchTerm, searchTerm, searchTerm);
+      query = query.or(`name.ilike.%${search}%,game.ilike.%${search}%,creator.username.ilike.%${search}%`);
     }
-    
-    // Group - PostgreSQL requires all selected non-aggregated columns
-    query += ` GROUP BY t.id, u.username`;
-    
+
     // Apply sorting
     switch(sort) {
       case 'oldest':
-        query += ` ORDER BY t.created_at ASC`;
+        query = query.order('created_at', { ascending: true });
         break;
       case 'prize_high':
-        query += ` ORDER BY (t.prize_pool + t.custom_prize_pool) DESC`;
+        query = query.order('prize_pool', { ascending: false });
         break;
       case 'prize_low':
-        query += ` ORDER BY (t.prize_pool + t.custom_prize_pool) ASC`;
-        break;
-      case 'participants_high':
-        query += ` ORDER BY current_participants DESC`;
-        break;
-      case 'participants_low':
-        query += ` ORDER BY current_participants ASC`;
+        query = query.order('prize_pool', { ascending: true });
         break;
       case 'newest':
       default:
-        query += ` ORDER BY t.created_at DESC`;
+        query = query.order('created_at', { ascending: false });
     }
-    
-    // Add pagination
-    paramCount++;
-    paramCount++;
-    query += ` LIMIT $${paramCount - 1} OFFSET $${paramCount}`;
-    params.push(parseInt(limit), parseInt(offset));
 
-    // Execute queries
-    const [tournaments] = await db.execute(query, params);
-    const [countResult] = await db.execute(countQuery, countParams);
+    const { data: tournaments, error, count } = await query
+      .range(offset, offset + limit - 1);
+
+    if (error) throw error;
+
+    // Get participant counts and log counts for each tournament
+    const tournamentsWithStats = await Promise.all((tournaments || []).map(async (tournament) => {
+      const { count: participantCount } = await supabase
+        .from('tournament_participants')
+        .select('*', { count: 'exact', head: true })
+        .eq('tournament_id', tournament.id)
+        .eq('status', 'joined');
+
+      const { count: squadCount } = await supabase
+        .from('tournament_participants')
+        .select('*', { count: 'exact', head: true })
+        .eq('tournament_id', tournament.id)
+        .eq('type', 'squad')
+        .eq('status', 'joined');
+
+      const { count: logCount } = await supabase
+        .from('admin_monitoring_logs')
+        .select('*', { count: 'exact', head: true })
+        .eq('tournament_id', tournament.id);
+
+      return {
+        ...tournament,
+        creator_name: tournament.creator?.username,
+        current_participants: participantCount || 0,
+        current_squads: squadCount || 0,
+        log_count: logCount || 0,
+        entry_fee: tournament.xp_entry_fee
+      };
+    }));
 
     // Log activity
     try {
-      await db.execute(
-        `INSERT INTO admin_activity_logs 
-         (admin_id, action_type, description) 
-         VALUES ($1, 'view', 'Viewed tournaments list')`,
-        [req.admin.id]
-      );
+      await supabase
+        .from('admin_activity_logs')
+        .insert({
+          admin_id: req.admin.id,
+          action_type: 'view',
+          description: 'Viewed tournaments list'
+        });
     } catch (logError) {
       console.warn('⚠️ Could not log activity:', logError.message);
     }
 
-    console.log('✅ Found', tournaments.length, 'tournaments');
+    console.log('✅ Found', tournamentsWithStats.length, 'tournaments');
 
     res.json({
       success: true,
-      tournaments: tournaments.map(t => ({
-        ...t,
-        entry_fee: t.xp_entry_fee,
-        current_participants: t.current_participants || 0,
-        current_squads: t.current_squads || 0,
-        log_count: t.log_count || 0
-      })),
+      tournaments: tournamentsWithStats,
       pagination: {
         page: parseInt(page),
         limit: parseInt(limit),
-        total: parseInt(countResult[0]?.total || 0),
-        totalPages: Math.ceil(parseInt(countResult[0]?.total || 0) / limit)
+        total: count || 0,
+        totalPages: Math.ceil((count || 0) / limit)
       }
     });
 
@@ -3169,34 +3267,30 @@ router.get('/tournaments', authenticateAdmin, async (req, res) => {
   }
 });
 
-// GET /api/admin/tournaments/stats - Get tournament statistics
 router.get('/tournaments/stats', authenticateAdmin, async (req, res) => {
   try {
     console.log('📊 Admin: Fetching tournament statistics');
     
-    const [stats] = await db.execute(`
-      SELECT 
-        COUNT(*) as totalTournaments,
-        SUM(CASE WHEN status = 'upcoming' THEN 1 ELSE 0 END) as upcomingTournaments,
-        SUM(CASE WHEN status = 'ongoing' THEN 1 ELSE 0 END) as ongoingTournaments,
-        SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completedTournaments,
-        SUM(CASE WHEN status = 'cancelled' THEN 1 ELSE 0 END) as cancelledTournaments,
-        COALESCE(SUM(prize_pool + custom_prize_pool), 0) as totalPrizePool
-      FROM tournaments
-    `);
+    const { data: tournaments, error } = await supabase
+      .from('tournaments')
+      .select('status, prize_pool, custom_prize_pool');
 
-    console.log('✅ Tournament stats fetched:', stats[0]);
+    if (error) throw error;
+
+    const stats = {
+      totalTournaments: tournaments?.length || 0,
+      upcomingTournaments: tournaments?.filter(t => t.status === 'upcoming').length || 0,
+      ongoingTournaments: tournaments?.filter(t => t.status === 'ongoing').length || 0,
+      completedTournaments: tournaments?.filter(t => t.status === 'completed').length || 0,
+      cancelledTournaments: tournaments?.filter(t => t.status === 'cancelled').length || 0,
+      totalPrizePool: tournaments?.reduce((sum, t) => sum + (parseFloat(t.prize_pool || 0) + parseFloat(t.custom_prize_pool || 0)), 0) || 0
+    };
+
+    console.log('✅ Tournament stats fetched');
 
     res.json({
       success: true,
-      stats: stats[0] || {
-        totalTournaments: 0,
-        upcomingTournaments: 0,
-        ongoingTournaments: 0,
-        completedTournaments: 0,
-        cancelledTournaments: 0,
-        totalPrizePool: 0
-      }
+      stats
     });
 
   } catch (error) {
@@ -3208,31 +3302,40 @@ router.get('/tournaments/stats', authenticateAdmin, async (req, res) => {
   }
 });
 
-// GET /api/admin/tournaments/:id/participants - Get tournament participants
 router.get('/tournaments/:id/participants', authenticateAdmin, async (req, res) => {
   try {
     const { id } = req.params;
     console.log('👥 Admin: Fetching participants for tournament:', id);
 
-    const [participants] = await db.execute(`
-      SELECT tp.*, 
-             u.username,
-             u.email,
-             u.rank,
-             u.profile_pic,
-             g.name as group_name
-      FROM tournament_participants tp
-      JOIN users u ON tp.user_id = u.id
-      LEFT JOIN groups g ON tp.group_id = g.id
-      WHERE tp.tournament_id = $1 AND tp.status = 'joined'
-      ORDER BY tp.created_at ASC
-    `, [id]);
+    const { data: participants, error } = await supabase
+      .from('tournament_participants')
+      .select(`
+        *,
+        users (username, email, rank, profile_pic),
+        groups:group_id (name)
+      `)
+      .eq('tournament_id', id)
+      .eq('status', 'joined')
+      .order('created_at', { ascending: true });
 
-    console.log('✅ Found', participants.length, 'participants');
+    if (error) throw error;
+
+    const formattedParticipants = (participants || []).map(p => ({
+      ...p,
+      username: p.users?.username,
+      email: p.users?.email,
+      rank: p.users?.rank,
+      profile_pic: p.users?.profile_pic,
+      group_name: p.groups?.name,
+      users: undefined,
+      groups: undefined
+    }));
+
+    console.log('✅ Found', formattedParticipants.length, 'participants');
 
     res.json({
       success: true,
-      participants: participants || [],
+      participants: formattedParticipants,
       tournament_id: id
     });
 
@@ -3245,7 +3348,6 @@ router.get('/tournaments/:id/participants', authenticateAdmin, async (req, res) 
   }
 });
 
-// POST /api/admin/tournaments/:id/cancel - Cancel tournament
 router.post('/tournaments/:id/cancel', authenticateAdmin, async (req, res) => {
   try {
     const { id } = req.params;
@@ -3259,12 +3361,15 @@ router.post('/tournaments/:id/cancel', authenticateAdmin, async (req, res) => {
     });
 
     // Get tournament details
-    const [tournaments] = await db.execute(
-      'SELECT * FROM tournaments WHERE id = $1 AND status IN (\'upcoming\', \'ongoing\')',
-      [id]
-    );
+    const { data: tournaments, error: tError } = await supabase
+      .from('tournaments')
+      .select('*')
+      .eq('id', id)
+      .in('status', ['upcoming', 'ongoing']);
 
-    if (tournaments.length === 0) {
+    if (tError) throw tError;
+
+    if (!tournaments || tournaments.length === 0) {
       return res.status(404).json({ 
         success: false, 
         message: 'Tournament not found or cannot be cancelled' 
@@ -3273,84 +3378,85 @@ router.post('/tournaments/:id/cancel', authenticateAdmin, async (req, res) => {
 
     const tournament = tournaments[0];
 
-    await db.withTransaction(async (connection) => {
-      try {
-        // Update tournament status
-        await connection.query(
-          'UPDATE tournaments SET status = \'cancelled\', completed_at = NOW() WHERE id = $1',
-          [id]
-        );
+    // Update tournament status
+    const { error: updateError } = await supabase
+      .from('tournaments')
+      .update({
+        status: 'cancelled',
+        completed_at: new Date().toISOString()
+      })
+      .eq('id', id);
 
-        // Refund XP entry fees if any
-        if (tournament.xp_entry_fee > 0) {
-          const { rows: participants } = await connection.query(`
-            SELECT tp.user_id 
-            FROM tournament_participants tp
-            WHERE tp.tournament_id = $1 AND tp.status = 'joined'
-          `, [id]);
+    if (updateError) throw updateError;
 
-          for (const participant of participants) {
-            await connection.query(
-              'UPDATE users SET xp_points = xp_points + $1 WHERE id = $2',
-              [tournament.xp_entry_fee, participant.user_id]
-            );
+    // Refund XP entry fees if any
+    if (tournament.xp_entry_fee > 0) {
+      const { data: participants, error: partError } = await supabase
+        .from('tournament_participants')
+        .select('user_id')
+        .eq('tournament_id', id)
+        .eq('status', 'joined');
 
-            // Record XP refund
-            await connection.query(`
-              INSERT INTO xp_transactions 
-              (user_id, tournament_id, amount, type, description, created_at)
-              VALUES ($1, $2, $3, 'refund', $4, NOW())
-            `, [
-              participant.user_id,
-              id,
-              tournament.xp_entry_fee,
-              `XP refund for cancelled tournament: ${tournament.name}`
-            ]);
-          }
-
-          console.log(`✅ Refunded XP to ${participants.length} participants`);
-        }
-
-        // Notify participants
-        const { rows: participants } = await connection.query(`
-          SELECT DISTINCT user_id FROM tournament_participants 
-          WHERE tournament_id = $1 AND status = 'joined'
-        `, [id]);
-
+      if (!partError && participants) {
         for (const participant of participants) {
-          await connection.query(`
-            INSERT INTO notifications 
-            (user_id, message, type, status, tournament_id, created_at)
-            VALUES ($1, $2, 'system', 'unread', $3, NOW())
-          `, [
-            participant.user_id,
-            `Tournament "${tournament.name}" has been cancelled by admin. ${tournament.xp_entry_fee > 0 ? 'Your entry fee has been refunded.' : ''}`,
-            id
-          ]);
+          await supabase.rpc('increment_user_xp', {
+            user_id: participant.user_id,
+            amount: tournament.xp_entry_fee
+          });
+
+          await supabase
+            .from('xp_transactions')
+            .insert({
+              user_id: participant.user_id,
+              tournament_id: id,
+              amount: tournament.xp_entry_fee,
+              type: 'refund',
+              description: `XP refund for cancelled tournament: ${tournament.name}`,
+              created_at: new Date().toISOString()
+            });
         }
-
-        // Log admin activity
-        await connection.query(`
-          INSERT INTO admin_activity_logs 
-          (admin_id, action_type, description, details) 
-          VALUES ($1, 'tournament_cancellation', $2, $3)
-        `, [
-          adminId,
-          `Cancelled tournament #${id}`,
-          JSON.stringify({
-            reason,
-            tournament_name: tournament.name,
-            entry_fee: tournament.xp_entry_fee,
-            participants_notified: participants.length
-          })
-        ]);
-
-        console.log('✅ Tournament cancelled successfully');
-      } catch (error) {
-        console.error('❌ Error within cancellation transaction:', error);
-        throw error;
+        console.log(`✅ Refunded XP to ${participants.length} participants`);
       }
-    });
+    }
+
+    // Notify participants
+    const { data: participants } = await supabase
+      .from('tournament_participants')
+      .select('user_id')
+      .eq('tournament_id', id)
+      .eq('status', 'joined');
+
+    if (participants) {
+      for (const participant of participants) {
+        await supabase
+          .from('notifications')
+          .insert({
+            user_id: participant.user_id,
+            message: `Tournament "${tournament.name}" has been cancelled by admin. ${tournament.xp_entry_fee > 0 ? 'Your entry fee has been refunded.' : ''}`,
+            type: 'system',
+            status: 'unread',
+            tournament_id: id,
+            created_at: new Date().toISOString()
+          });
+      }
+    }
+
+    // Log admin activity
+    await supabase
+      .from('admin_activity_logs')
+      .insert({
+        admin_id: adminId,
+        action_type: 'tournament_cancellation',
+        description: `Cancelled tournament #${id}`,
+        details: JSON.stringify({
+          reason,
+          tournament_name: tournament.name,
+          entry_fee: tournament.xp_entry_fee,
+          participants_notified: participants?.length || 0
+        })
+      });
+
+    console.log('✅ Tournament cancelled successfully');
 
     res.json({
       success: true,
@@ -3368,7 +3474,6 @@ router.post('/tournaments/:id/cancel', authenticateAdmin, async (req, res) => {
   }
 });
 
-// POST /api/admin/tournaments/:id/distribute-prizes - Distribute tournament prizes
 router.post('/tournaments/:id/distribute-prizes', authenticateAdmin, async (req, res) => {
   try {
     const { id } = req.params;
@@ -3377,12 +3482,15 @@ router.post('/tournaments/:id/distribute-prizes', authenticateAdmin, async (req,
     console.log('💰 Admin: Distributing prizes for tournament:', id);
 
     // Get tournament details
-    const [tournaments] = await db.execute(
-      'SELECT * FROM tournaments WHERE id = $1 AND status = \'completed\'',
-      [id]
-    );
+    const { data: tournaments, error: tError } = await supabase
+      .from('tournaments')
+      .select('*')
+      .eq('id', id)
+      .eq('status', 'completed');
 
-    if (tournaments.length === 0) {
+    if (tError) throw tError;
+
+    if (!tournaments || tournaments.length === 0) {
       return res.status(404).json({ 
         success: false, 
         message: 'Tournament not found or not completed' 
@@ -3399,72 +3507,64 @@ router.post('/tournaments/:id/distribute-prizes', authenticateAdmin, async (req,
     }
 
     // Check if prizes already distributed
-    const { rows: existingPrizes } = await db.execute(`
-      SELECT 1 FROM xp_transactions 
-      WHERE tournament_id = $1 AND type = 'earned' AND description LIKE '%prize%'
-      LIMIT 1
-    `, [id]);
+    const { data: existingPrizes, error: checkError } = await supabase
+      .from('xp_transactions')
+      .select('id')
+      .eq('tournament_id', id)
+      .eq('type', 'earned')
+      .like('description', '%prize%')
+      .limit(1);
 
-    if (existingPrizes.length > 0) {
+    if (!checkError && existingPrizes && existingPrizes.length > 0) {
       return res.status(400).json({ 
         success: false, 
         message: 'Prizes already distributed for this tournament' 
       });
     }
 
-    await db.withTransaction(async (connection) => {
-      try {
-        const totalPrize = tournament.prize_pool || tournament.custom_prize_pool || 0;
-        
-        if (totalPrize > 0) {
-          // Award XP to winner
-          await connection.query(
-            'UPDATE users SET xp_points = xp_points + $1 WHERE id = $2',
-            [totalPrize, tournament.winner_id]
-          );
+    const totalPrize = tournament.prize_pool || tournament.custom_prize_pool || 0;
+    
+    if (totalPrize > 0) {
+      await supabase.rpc('increment_user_xp', {
+        user_id: tournament.winner_id,
+        amount: totalPrize
+      });
 
-          // Record XP prize transaction
-          await connection.query(`
-            INSERT INTO xp_transactions 
-            (user_id, tournament_id, amount, type, description, created_at)
-            VALUES ($1, $2, $3, 'earned', $4, NOW())
-          `, [
-            tournament.winner_id,
-            id,
-            totalPrize,
-            `Tournament prize: ${tournament.name}`
-          ]);
+      await supabase
+        .from('xp_transactions')
+        .insert({
+          user_id: tournament.winner_id,
+          tournament_id: id,
+          amount: totalPrize,
+          type: 'earned',
+          description: `Tournament prize: ${tournament.name}`,
+          created_at: new Date().toISOString()
+        });
 
-          console.log(`💰 Awarded ${totalPrize} XP to winner ${tournament.winner_id}`);
-        }
+      console.log(`💰 Awarded ${totalPrize} XP to winner ${tournament.winner_id}`);
+    }
 
-        // Log admin activity
-        await connection.query(`
-          INSERT INTO admin_activity_logs 
-          (admin_id, action_type, description, details) 
-          VALUES ($1, 'prize_distribution', $2, $3)
-        `, [
-          adminId,
-          `Distributed prizes for tournament #${id}`,
-          JSON.stringify({
-            tournament_name: tournament.name,
-            winner_id: tournament.winner_id,
-            prize_amount: totalPrize,
-            prize_type: tournament.prize_pool_option
-          })
-        ]);
+    // Log admin activity
+    await supabase
+      .from('admin_activity_logs')
+      .insert({
+        admin_id: adminId,
+        action_type: 'prize_distribution',
+        description: `Distributed prizes for tournament #${id}`,
+        details: JSON.stringify({
+          tournament_name: tournament.name,
+          winner_id: tournament.winner_id,
+          prize_amount: totalPrize,
+          prize_type: tournament.prize_pool_option
+        })
+      });
 
-        console.log('✅ Prizes distributed successfully');
-      } catch (error) {
-        console.error('❌ Error within prize distribution transaction:', error);
-        throw error;
-      }
-    });
+    console.log('✅ Prizes distributed successfully');
 
     res.json({
       success: true,
       message: 'Prizes distributed successfully',
-      prize_distributed: tournament.prize_pool || tournament.custom_prize_pool || 0,
+      prize_distributed: totalPrize,
       winner_id: tournament.winner_id
     });
 
@@ -3478,7 +3578,6 @@ router.post('/tournaments/:id/distribute-prizes', authenticateAdmin, async (req,
   }
 });
 
-// DELETE /api/admin/tournaments/:id/participants/:userId - Remove participant
 router.delete('/tournaments/:id/participants/:userId', authenticateAdmin, async (req, res) => {
   try {
     const { id, userId } = req.params;
@@ -3488,12 +3587,15 @@ router.delete('/tournaments/:id/participants/:userId', authenticateAdmin, async 
     console.log('👢 Admin: Removing participant:', { tournamentId: id, userId, adminId });
 
     // Check if tournament exists
-    const [tournaments] = await db.execute(
-      'SELECT * FROM tournaments WHERE id = $1 AND status = \'upcoming\'',
-      [id]
-    );
+    const { data: tournaments, error: tError } = await supabase
+      .from('tournaments')
+      .select('*')
+      .eq('id', id)
+      .eq('status', 'upcoming');
 
-    if (tournaments.length === 0) {
+    if (tError) throw tError;
+
+    if (!tournaments || tournaments.length === 0) {
       return res.status(404).json({ 
         success: false, 
         message: 'Tournament not found or already started' 
@@ -3503,14 +3605,19 @@ router.delete('/tournaments/:id/participants/:userId', authenticateAdmin, async 
     const tournament = tournaments[0];
 
     // Check if participant exists
-    const [participants] = await db.execute(`
-      SELECT tp.*, u.username 
-      FROM tournament_participants tp
-      JOIN users u ON tp.user_id = u.id
-      WHERE tp.tournament_id = $1 AND tp.user_id = $2 AND tp.status = 'joined'
-    `, [id, userId]);
+    const { data: participants, error: pError } = await supabase
+      .from('tournament_participants')
+      .select(`
+        *,
+        users (username)
+      `)
+      .eq('tournament_id', id)
+      .eq('user_id', userId)
+      .eq('status', 'joined');
 
-    if (participants.length === 0) {
+    if (pError) throw pError;
+
+    if (!participants || participants.length === 0) {
       return res.status(404).json({ 
         success: false, 
         message: 'Participant not found in tournament' 
@@ -3519,67 +3626,60 @@ router.delete('/tournaments/:id/participants/:userId', authenticateAdmin, async 
 
     const participant = participants[0];
 
-    await db.withTransaction(async (connection) => {
-      try {
-        // Update participant status
-        await connection.query(
-          'UPDATE tournament_participants SET status = \'declined\' WHERE tournament_id = $1 AND user_id = $2',
-          [id, userId]
-        );
+    // Update participant status
+    await supabase
+      .from('tournament_participants')
+      .update({ status: 'declined' })
+      .eq('tournament_id', id)
+      .eq('user_id', userId);
 
-        // Refund entry fee if any
-        if (tournament.xp_entry_fee > 0) {
-          await connection.query(
-            'UPDATE users SET xp_points = xp_points + $1 WHERE id = $2',
-            [tournament.xp_entry_fee, userId]
-          );
+    // Refund entry fee if any
+    if (tournament.xp_entry_fee > 0) {
+      await supabase.rpc('increment_user_xp', {
+        user_id: userId,
+        amount: tournament.xp_entry_fee
+      });
 
-          // Record XP refund
-          await connection.query(`
-            INSERT INTO xp_transactions 
-            (user_id, tournament_id, amount, type, description, created_at)
-            VALUES ($1, $2, $3, 'refund', $4, NOW())
-          `, [
-            userId,
-            id,
-            tournament.xp_entry_fee,
-            `XP refund for removal from tournament: ${tournament.name}`
-          ]);
-        }
+      await supabase
+        .from('xp_transactions')
+        .insert({
+          user_id: userId,
+          tournament_id: id,
+          amount: tournament.xp_entry_fee,
+          type: 'refund',
+          description: `XP refund for removal from tournament: ${tournament.name}`,
+          created_at: new Date().toISOString()
+        });
+    }
 
-        // Notify user
-        await connection.query(`
-          INSERT INTO notifications 
-          (user_id, message, type, status, tournament_id, created_at)
-          VALUES ($1, $2, 'system', 'unread', $3, NOW())
-        `, [
-          userId,
-          `You have been removed from tournament "${tournament.name}" by admin. ${tournament.xp_entry_fee > 0 ? 'Your entry fee has been refunded.' : ''}`,
-          id
-        ]);
+    // Notify user
+    await supabase
+      .from('notifications')
+      .insert({
+        user_id: userId,
+        message: `You have been removed from tournament "${tournament.name}" by admin. ${tournament.xp_entry_fee > 0 ? 'Your entry fee has been refunded.' : ''}`,
+        type: 'system',
+        status: 'unread',
+        tournament_id: id,
+        created_at: new Date().toISOString()
+      });
 
-        // Log admin activity
-        await connection.query(`
-          INSERT INTO admin_activity_logs 
-          (admin_id, action_type, description, details) 
-          VALUES ($1, 'participant_removal', $2, $3)
-        `, [
-          adminId,
-          `Removed participant ${userId} from tournament #${id}`,
-          JSON.stringify({
-            reason,
-            participant_username: participant.username,
-            tournament_name: tournament.name,
-            entry_fee_refunded: tournament.xp_entry_fee
-          })
-        ]);
+    // Log admin activity
+    await supabase
+      .from('admin_activity_logs')
+      .insert({
+        admin_id: adminId,
+        action_type: 'participant_removal',
+        description: `Removed participant ${userId} from tournament #${id}`,
+        details: JSON.stringify({
+          reason,
+          participant_username: participant.users?.username,
+          tournament_name: tournament.name,
+          entry_fee_refunded: tournament.xp_entry_fee
+        })
+      });
 
-        console.log('✅ Participant removed successfully');
-      } catch (error) {
-        console.error('❌ Error within removal transaction:', error);
-        throw error;
-      }
-    });
+    console.log('✅ Participant removed successfully');
 
     res.json({
       success: true,
@@ -3597,30 +3697,40 @@ router.delete('/tournaments/:id/participants/:userId', authenticateAdmin, async 
   }
 });
 
-// GET /api/admin/tournaments/:id/matches - Get tournament matches
 router.get('/tournaments/:id/matches', authenticateAdmin, async (req, res) => {
   try {
     const { id } = req.params;
     console.log('🎮 Admin: Fetching matches for tournament:', id);
 
-    const [matches] = await db.execute(`
-      SELECT tm.*,
-             p1.username as player1_username,
-             p2.username as player2_username,
-             w.username as winner_username
-      FROM tournament_matches tm
-      LEFT JOIN users p1 ON tm.player1_id = p1.id
-      LEFT JOIN users p2 ON tm.player2_id = p2.id
-      LEFT JOIN users w ON tm.winner_id = w.id
-      WHERE tm.tournament_id = $1
-      ORDER BY tm.round_number ASC, tm.id ASC
-    `, [id]);
+    const { data: matches, error } = await supabase
+      .from('tournament_matches')
+      .select(`
+        *,
+        player1:player1_id (username),
+        player2:player2_id (username),
+        winner:winner_id (username)
+      `)
+      .eq('tournament_id', id)
+      .order('round_number', { ascending: true })
+      .order('id', { ascending: true });
 
-    console.log('✅ Found', matches.length, 'matches');
+    if (error) throw error;
+
+    const formattedMatches = (matches || []).map(m => ({
+      ...m,
+      player1_username: m.player1?.username,
+      player2_username: m.player2?.username,
+      winner_username: m.winner?.username,
+      player1: undefined,
+      player2: undefined,
+      winner: undefined
+    }));
+
+    console.log('✅ Found', formattedMatches.length, 'matches');
 
     res.json({
       success: true,
-      matches: matches || [],
+      matches: formattedMatches,
       tournament_id: id
     });
 
@@ -3635,30 +3745,46 @@ router.get('/tournaments/:id/matches', authenticateAdmin, async (req, res) => {
 
 // ==================== ADMIN MONITORING ====================
 
-// GET /api/admin/monitored-tournaments - Get tournaments with admin monitoring
 router.get('/monitored-tournaments', authenticateAdmin, async (req, res) => {
   try {
     console.log('🛡️ Admin: Fetching monitored tournaments');
 
-    const [tournaments] = await db.execute(`
-      SELECT t.*, 
-             u.username as creator_name,
-             COUNT(DISTINCT tp.id) as participants_count,
-             COUNT(DISTINCT aml.id) as log_count
-      FROM tournaments t
-      JOIN users u ON t.creator_id = u.id
-      LEFT JOIN tournament_participants tp ON t.id = tp.tournament_id 
-        AND tp.status = 'joined'
-      LEFT JOIN admin_monitoring_logs aml ON t.id = aml.tournament_id
-      WHERE t.admin_monitoring = true
-      GROUP BY t.id, u.username
-      ORDER BY t.created_at DESC
-    `);
+    const { data: tournaments, error } = await supabase
+      .from('tournaments')
+      .select(`
+        *,
+        creator:creator_id (username)
+      `)
+      .eq('admin_monitoring', true)
+      .order('created_at', { ascending: false });
+
+    if (error) throw error;
+
+    // Get participant counts and log counts
+    const tournamentsWithStats = await Promise.all((tournaments || []).map(async (tournament) => {
+      const { count: participantsCount } = await supabase
+        .from('tournament_participants')
+        .select('*', { count: 'exact', head: true })
+        .eq('tournament_id', tournament.id)
+        .eq('status', 'joined');
+
+      const { count: logCount } = await supabase
+        .from('admin_monitoring_logs')
+        .select('*', { count: 'exact', head: true })
+        .eq('tournament_id', tournament.id);
+
+      return {
+        ...tournament,
+        creator_name: tournament.creator?.username,
+        participants_count: participantsCount || 0,
+        log_count: logCount || 0
+      };
+    }));
 
     res.json({
       success: true,
-      tournaments: tournaments || [],
-      count: tournaments.length
+      tournaments: tournamentsWithStats,
+      count: tournamentsWithStats.length
     });
 
   } catch (error) {
@@ -3670,29 +3796,35 @@ router.get('/monitored-tournaments', authenticateAdmin, async (req, res) => {
   }
 });
 
-// GET /api/admin/tournaments/:id/monitoring-logs - Get monitoring logs for tournament
 router.get('/tournaments/:id/monitoring-logs', authenticateAdmin, async (req, res) => {
   try {
     const { id } = req.params;
     console.log('📝 Admin: Fetching monitoring logs for tournament:', id);
 
-    const [logs] = await db.execute(`
-      SELECT aml.*, 
-             u.username as admin_name,
-             t.name as tournament_name
-      FROM admin_monitoring_logs aml
-      JOIN users u ON aml.admin_id = u.id
-      JOIN tournaments t ON aml.tournament_id = t.id
-      WHERE aml.tournament_id = $1
-      ORDER BY aml.created_at DESC
-      LIMIT 100
-    `, [id]);
+    const { data: logs, error } = await supabase
+      .from('admin_monitoring_logs')
+      .select(`
+        *,
+        admin_users:admin_id (username),
+        tournaments:tournament_id (name)
+      `)
+      .eq('tournament_id', id)
+      .order('created_at', { ascending: false })
+      .limit(100);
+
+    if (error) throw error;
+
+    const formattedLogs = (logs || []).map(log => ({
+      ...log,
+      admin_name: log.admin_users?.username,
+      tournament_name: log.tournaments?.name
+    }));
 
     res.json({
       success: true,
-      logs: logs || [],
+      logs: formattedLogs,
       tournament_id: id,
-      count: logs.length
+      count: formattedLogs.length
     });
 
   } catch (error) {
@@ -3704,35 +3836,33 @@ router.get('/tournaments/:id/monitoring-logs', authenticateAdmin, async (req, re
   }
 });
 
-// GET /api/admin/tournaments/:id/monitoring-stats - Get monitoring statistics
 router.get('/tournaments/:id/monitoring-stats', authenticateAdmin, async (req, res) => {
   try {
     const { id } = req.params;
 
-    const [stats] = await db.execute(`
-      SELECT 
-        COUNT(*) as total_actions,
-        SUM(CASE WHEN action_type = 'resolved_dispute' THEN 1 ELSE 0 END) as disputes_resolved,
-        SUM(CASE WHEN action_type = 'overrode_result' THEN 1 ELSE 0 END) as results_overridden,
-        SUM(CASE WHEN action_type = 'distributed_prize' THEN 1 ELSE 0 END) as prizes_distributed,
-        SUM(CASE WHEN action_type = 'warned_player' THEN 1 ELSE 0 END) as warnings_issued,
-        COUNT(DISTINCT admin_id) as unique_admins,
-        MIN(created_at) as first_action,
-        MAX(created_at) as last_action
-      FROM admin_monitoring_logs 
-      WHERE tournament_id = $1
-    `, [id]);
+    const { data: logs, error } = await supabase
+      .from('admin_monitoring_logs')
+      .select('action_type, admin_id, created_at')
+      .eq('tournament_id', id);
+
+    if (error) throw error;
+
+    const uniqueAdmins = new Set((logs || []).map(l => l.admin_id)).size;
+    
+    const stats = {
+      total_actions: logs?.length || 0,
+      disputes_resolved: logs?.filter(l => l.action_type === 'resolved_dispute').length || 0,
+      results_overridden: logs?.filter(l => l.action_type === 'overrode_result').length || 0,
+      prizes_distributed: logs?.filter(l => l.action_type === 'distributed_prize').length || 0,
+      warnings_issued: logs?.filter(l => l.action_type === 'warned_player').length || 0,
+      unique_admins: uniqueAdmins,
+      first_action: logs?.length > 0 ? logs[logs.length - 1]?.created_at : null,
+      last_action: logs?.length > 0 ? logs[0]?.created_at : null
+    };
 
     res.json({
       success: true,
-      stats: stats[0] || {
-        total_actions: 0,
-        disputes_resolved: 0,
-        results_overridden: 0,
-        prizes_distributed: 0,
-        warnings_issued: 0,
-        unique_admins: 0
-      },
+      stats,
       tournament_id: id
     });
 
@@ -3744,11 +3874,9 @@ router.get('/tournaments/:id/monitoring-stats', authenticateAdmin, async (req, r
     });
   }
 });
-// Add to admin.js after existing endpoints
 
 // ==================== SYSTEM MAINTENANCE ENDPOINTS ====================
 
-// GET /api/admin/maintenance/health - System health check
 router.get('/maintenance/health', authenticateAdmin, async (req, res) => {
   try {
     console.log('🔧 Checking system health');
@@ -3756,29 +3884,19 @@ router.get('/maintenance/health', authenticateAdmin, async (req, res) => {
     // Check database connection
     let dbStatus = 'disconnected';
     try {
-      await db.execute('SELECT 1');
-      dbStatus = 'connected';
+      const { error } = await supabase.from('users').select('id').limit(1);
+      if (!error) dbStatus = 'connected';
     } catch (dbError) {
       console.error('Database connection error:', dbError);
     }
 
-    // Check API status (simple ping)
-    const apiStatus = 'online'; // Assuming API is running
-    
-    // Check cache status (simplified)
-    const cacheStatus = 'active';
-    
-    // Simulate server load check
-    const loads = ['low', 'normal', 'high'];
-    const serverLoad = loads[Math.floor(Math.random() * loads.length)];
-
     res.json({
       success: true,
       health: {
-        api_status: apiStatus,
+        api_status: 'online',
         database_status: dbStatus,
-        cache_status: cacheStatus,
-        server_load: serverLoad,
+        cache_status: 'active',
+        server_load: 'normal',
         timestamp: new Date().toISOString()
       }
     });
@@ -3807,21 +3925,29 @@ router.post('/broadcast-message', authenticateAdmin, async (req, res) => {
     console.log('📢 Broadcasting in-app message to all users:', message);
 
     // Get all active users
-    const [users] = await db.execute(
-      'SELECT id FROM users WHERE account_status = \'active\' AND is_banned = false'
-    );
+    const { data: users, error: userError } = await supabase
+      .from('users')
+      .select('id')
+      .eq('account_status', 'active')
+      .eq('is_banned', false);
+
+    if (userError) throw userError;
 
     let usersNotified = 0;
     
     // Create notifications for all users
-    for (const user of users) {
+    for (const user of (users || [])) {
       try {
-        await db.execute(
-          `INSERT INTO notifications 
-           (user_id, sender_id, message, type, status, created_at) 
-           VALUES ($1, $2, $3, 'system', 'unread', NOW())`,
-          [user.id, adminId, message]
-        );
+        await supabase
+          .from('notifications')
+          .insert({
+            user_id: user.id,
+            sender_id: adminId,
+            message: message,
+            type: 'system',
+            status: 'unread',
+            created_at: new Date().toISOString()
+          });
         usersNotified++;
       } catch (error) {
         console.warn(`⚠️ Could not notify user ${user.id}:`, error.message);
@@ -3829,12 +3955,13 @@ router.post('/broadcast-message', authenticateAdmin, async (req, res) => {
     }
 
     // Log activity
-    await db.execute(
-      `INSERT INTO admin_activity_logs 
-       (admin_id, action_type, description) 
-       VALUES ($1, 'broadcast', 'Sent in-app message to all users')`,
-      [adminId]
-    );
+    await supabase
+      .from('admin_activity_logs')
+      .insert({
+        admin_id: adminId,
+        action_type: 'broadcast',
+        description: 'Sent in-app message to all users'
+      });
 
     res.json({
       success: true,
@@ -3850,43 +3977,39 @@ router.post('/broadcast-message', authenticateAdmin, async (req, res) => {
     });
   }
 });
-// GET /api/admin/games - Get all games
+
+// ==================== GAMES MANAGEMENT ====================
+
 router.get('/games', authenticateAdmin, async (req, res) => {
   try {
     const { category, is_active, search = '' } = req.query;
     
     console.log('🎮 Admin: Fetching games - Category:', category, 'Search:', search);
 
-    let query = 'SELECT * FROM games WHERE 1=1';
-    const params = [];
-    let paramCount = 0;
+    let query = supabase
+      .from('games')
+      .select('*');
 
     if (category && category !== 'all') {
-      paramCount++;
-      query += ` AND category = $${paramCount}`;
-      params.push(category);
+      query = query.eq('category', category);
     }
     
     if (is_active !== undefined) {
-      paramCount++;
-      query += ` AND is_active = $${paramCount}`;
-      params.push(is_active === 'true');
+      query = query.eq('is_active', is_active === 'true');
     }
     
     if (search.trim() !== '') {
-      paramCount++;
-      query += ` AND name ILIKE $${paramCount}`;
-      params.push(`%${search.trim()}%`);
+      query = query.ilike('name', `%${search.trim()}%`);
     }
-    
-    query += ' ORDER BY name ASC';
 
-    const [games] = await db.execute(query, params);
+    const { data: games, error } = await query.order('name', { ascending: true });
+
+    if (error) throw error;
 
     res.json({
       success: true,
-      games,
-      count: games.length
+      games: games || [],
+      count: games?.length || 0
     });
 
   } catch (error) {
@@ -3897,7 +4020,7 @@ router.get('/games', authenticateAdmin, async (req, res) => {
     });
   }
 });
-// POST /api/admin/games - Add new game
+
 router.post('/games', authenticateAdmin, async (req, res) => {
   try {
     const { 
@@ -3921,12 +4044,14 @@ router.post('/games', authenticateAdmin, async (req, res) => {
     console.log('🎮 Admin: Adding new game:', name);
 
     // Check if game already exists
-    const [existingGames] = await db.execute(
-      'SELECT id FROM games WHERE name = $1',
-      [name.trim()]
-    );
+    const { data: existingGames, error: checkError } = await supabase
+      .from('games')
+      .select('id')
+      .ilike('name', name.trim());
 
-    if (existingGames.length > 0) {
+    if (checkError) throw checkError;
+
+    if (existingGames && existingGames.length > 0) {
       return res.status(400).json({
         success: false,
         message: 'Game already exists'
@@ -3934,33 +4059,34 @@ router.post('/games', authenticateAdmin, async (req, res) => {
     }
 
     // Insert new game
-    const result = await db.execute(
-      `INSERT INTO games 
-       (name, category, min_players, max_players, platforms, description, icon_url) 
-       VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
-      [
-        name.trim(),
-        category,
-        parseInt(min_players),
-        parseInt(max_players),
-        platforms,
-        description,
-        icon_url
-      ]
-    );
+    const { data: newGame, error: insertError } = await supabase
+      .from('games')
+      .insert({
+        name: name.trim(),
+        category: category,
+        min_players: parseInt(min_players),
+        max_players: parseInt(max_players),
+        platforms: platforms,
+        description: description,
+        icon_url: icon_url
+      })
+      .select();
+
+    if (insertError) throw insertError;
 
     // Log activity
-    await db.execute(
-      `INSERT INTO admin_activity_logs 
-       (admin_id, action_type, description) 
-       VALUES ($1, 'game_add', $2)`,
-      [adminId, `Added new game: ${name}`]
-    );
+    await supabase
+      .from('admin_activity_logs')
+      .insert({
+        admin_id: adminId,
+        action_type: 'game_add',
+        description: `Added new game: ${name}`
+      });
 
     res.json({
       success: true,
       message: 'Game added successfully',
-      game_id: result.rows[0].id
+      game_id: newGame?.[0]?.id
     });
 
   } catch (error) {
@@ -3972,7 +4098,6 @@ router.post('/games', authenticateAdmin, async (req, res) => {
   }
 });
 
-// PUT /api/admin/games/:id - Update game
 router.put('/games/:id', authenticateAdmin, async (req, res) => {
   try {
     const { id } = req.params;
@@ -3982,62 +4107,56 @@ router.put('/games/:id', authenticateAdmin, async (req, res) => {
     console.log('🎮 Admin: Updating game ID:', id, 'Data:', gameData);
 
     // Check if game exists
-    const [games] = await db.execute(
-      'SELECT id, name FROM games WHERE id = $1',
-      [id]
-    );
+    const { data: games, error: checkError } = await supabase
+      .from('games')
+      .select('id, name')
+      .eq('id', id);
 
-    if (games.length === 0) {
+    if (checkError) throw checkError;
+
+    if (!games || games.length === 0) {
       return res.status(404).json({
         success: false,
         message: 'Game not found'
       });
     }
 
-    // Build update query dynamically
-    const updateFields = [];
-    const updateValues = [];
-    let paramCount = 0;
-    
     const allowedFields = [
       'name', 'category', 'min_players', 'max_players', 
       'platforms', 'description', 'icon_url', 'is_active'
     ];
 
+    const updateObject = {};
     for (const field of allowedFields) {
       if (field in gameData) {
-        paramCount++;
-        updateFields.push(`${field} = $${paramCount}`);
-        updateValues.push(gameData[field]);
+        updateObject[field] = gameData[field];
       }
     }
 
-    if (updateFields.length === 0) {
+    if (Object.keys(updateObject).length === 0) {
       return res.status(400).json({
         success: false,
         message: 'No valid fields to update'
       });
     }
 
-    paramCount++;
-    updateFields.push('updated_at = NOW()');
-    updateValues.push(id);
+    updateObject.updated_at = new Date().toISOString();
 
-    const updateQuery = `
-      UPDATE games 
-      SET ${updateFields.join(', ')}
-      WHERE id = $${paramCount}
-    `;
+    const { error: updateError } = await supabase
+      .from('games')
+      .update(updateObject)
+      .eq('id', id);
 
-    await db.execute(updateQuery, updateValues);
+    if (updateError) throw updateError;
 
     // Log activity
-    await db.execute(
-      `INSERT INTO admin_activity_logs 
-       (admin_id, action_type, description) 
-       VALUES ($1, 'game_update', $2)`,
-      [adminId, `Updated game #${id}`]
-    );
+    await supabase
+      .from('admin_activity_logs')
+      .insert({
+        admin_id: adminId,
+        action_type: 'game_update',
+        description: `Updated game #${id}`
+      });
 
     res.json({
       success: true,
@@ -4053,7 +4172,6 @@ router.put('/games/:id', authenticateAdmin, async (req, res) => {
   }
 });
 
-// DELETE /api/admin/games/:id - Delete game
 router.delete('/games/:id', authenticateAdmin, async (req, res) => {
   try {
     const { id } = req.params;
@@ -4062,12 +4180,14 @@ router.delete('/games/:id', authenticateAdmin, async (req, res) => {
     console.log('🎮 Admin: Deleting game ID:', id);
 
     // Check if game exists
-    const [games] = await db.execute(
-      'SELECT name FROM games WHERE id = $1',
-      [id]
-    );
+    const { data: games, error: checkError } = await supabase
+      .from('games')
+      .select('name')
+      .eq('id', id);
 
-    if (games.length === 0) {
+    if (checkError) throw checkError;
+
+    if (!games || games.length === 0) {
       return res.status(404).json({
         success: false,
         message: 'Game not found'
@@ -4077,18 +4197,24 @@ router.delete('/games/:id', authenticateAdmin, async (req, res) => {
     const gameName = games[0].name;
 
     // Soft delete (deactivate) instead of hard delete
-    await db.execute(
-      'UPDATE games SET is_active = false, updated_at = NOW() WHERE id = $1',
-      [id]
-    );
+    const { error: updateError } = await supabase
+      .from('games')
+      .update({
+        is_active: false,
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', id);
+
+    if (updateError) throw updateError;
 
     // Log activity
-    await db.execute(
-      `INSERT INTO admin_activity_logs 
-       (admin_id, action_type, description) 
-       VALUES ($1, 'game_delete', $2)`,
-      [adminId, `Deleted game: ${gameName}`]
-    );
+    await supabase
+      .from('admin_activity_logs')
+      .insert({
+        admin_id: adminId,
+        action_type: 'game_delete',
+        description: `Deleted game: ${gameName}`
+      });
 
     res.json({
       success: true,
@@ -4103,7 +4229,9 @@ router.delete('/games/:id', authenticateAdmin, async (req, res) => {
     });
   }
 });
-// POST /api/admin/factory-reset - Reset all settings to defaults
+
+// ==================== FACTORY RESET ====================
+
 router.post('/factory-reset', authenticateAdmin, async (req, res) => {
   try {
     const adminId = req.admin.id;
@@ -4111,98 +4239,111 @@ router.post('/factory-reset', authenticateAdmin, async (req, res) => {
 
     console.log('🏭 Admin performing factory reset', { backup, adminId });
 
-    // Create backup if requested - FIXED: PostgreSQL version
+    // Create backup if requested
     if (backup) {
-      // Get all settings first
-      const [settings] = await db.execute('SELECT setting_key, setting_value FROM system_settings');
-      
-      // Create JSON object manually for PostgreSQL
-      const settingsData = {};
-      settings.forEach(setting => {
-        settingsData[setting.setting_key] = setting.setting_value;
-      });
-      
-      await db.execute(
-        `INSERT INTO settings_backup (admin_id, settings_data) 
-         VALUES ($1, $2)`,
-        [adminId, JSON.stringify(settingsData)]
-      );
-      console.log('✅ Settings backup created');
+      const { data: settings, error: settingsError } = await supabase
+        .from('system_settings')
+        .select('setting_key, setting_value');
+
+      if (!settingsError && settings) {
+        const settingsData = {};
+        settings.forEach(setting => {
+          settingsData[setting.setting_key] = setting.setting_value;
+        });
+
+        await supabase
+          .from('settings_backup')
+          .insert({
+            admin_id: adminId,
+            settings_data: settingsData,
+            created_at: new Date().toISOString()
+          });
+        console.log('✅ Settings backup created');
+      }
     }
 
     // Define default settings
-    const defaultSettings = {
-      'platformName': 'Xperience',
-      'platformCurrency': 'NGN',
-      'sessionTimeout': '15',
-      'minDepositAmount': '500',
-      'maxDepositAmount': '100000',
-      'minWithdrawalAmount': '1000',
-      'maxWithdrawalAmount': '100000',
-      'withdrawalLimitDaily': '1',
-      'withdrawalLimitWeekly': '3',
-      'withdrawalLimitMonthly': '11',
-      'enableUSD': 'false',
-      'enableEUR': 'false',
-      'enableGBP': 'false',
-      'enableRegistration': 'true',
-      'requireEmailVerification': 'false',
-      'defaultUserRank': 'E',
-      'maxLoginAttempts': '5',
-      'requireProfileCompletion': 'true',
-      'allowMultipleDevices': 'false',
-      'minMatchStakePercentage': '15',
-      'emailNotifications': 'true',
-      'pushNotifications': 'true',
-      'adminAlerts': 'true',
-      'systemAnnouncements': 'true',
-      'enable2FA': 'false',
-      'requireTransactionPIN': 'true',
-      'enforceStrongPasswords': 'true',
-      'sessionEncryption': 'true',
-      'ipWhitelisting': 'false',
-      'maintenanceMode': 'false',
-      'backupFrequency': 'daily',
-      'logRetentionDays': '30',
-      'cacheEnabled': 'true'
-    };
+    const defaultSettings = [
+      { setting_key: 'platformName', setting_value: 'Xperience', category: 'general' },
+      { setting_key: 'platformCurrency', setting_value: 'NGN', category: 'general' },
+      { setting_key: 'sessionTimeout', setting_value: '15', category: 'security' },
+      { setting_key: 'minDepositAmount', setting_value: '500', category: 'financial' },
+      { setting_key: 'maxDepositAmount', setting_value: '100000', category: 'financial' },
+      { setting_key: 'minWithdrawalAmount', setting_value: '1000', category: 'financial' },
+      { setting_key: 'maxWithdrawalAmount', setting_value: '100000', category: 'financial' },
+      { setting_key: 'withdrawalLimitDaily', setting_value: '1', category: 'financial' },
+      { setting_key: 'withdrawalLimitWeekly', setting_value: '3', category: 'financial' },
+      { setting_key: 'withdrawalLimitMonthly', setting_value: '11', category: 'financial' },
+      { setting_key: 'enableUSD', setting_value: 'false', category: 'financial' },
+      { setting_key: 'enableEUR', setting_value: 'false', category: 'financial' },
+      { setting_key: 'enableGBP', setting_value: 'false', category: 'financial' },
+      { setting_key: 'enableRegistration', setting_value: 'true', category: 'general' },
+      { setting_key: 'requireEmailVerification', setting_value: 'false', category: 'security' },
+      { setting_key: 'defaultUserRank', setting_value: 'E', category: 'gaming' },
+      { setting_key: 'maxLoginAttempts', setting_value: '5', category: 'security' },
+      { setting_key: 'requireProfileCompletion', setting_value: 'true', category: 'general' },
+      { setting_key: 'allowMultipleDevices', setting_value: 'false', category: 'security' },
+      { setting_key: 'minMatchStakePercentage', setting_value: '15', category: 'gaming' },
+      { setting_key: 'emailNotifications', setting_value: 'true', category: 'notifications' },
+      { setting_key: 'pushNotifications', setting_value: 'true', category: 'notifications' },
+      { setting_key: 'adminAlerts', setting_value: 'true', category: 'notifications' },
+      { setting_key: 'systemAnnouncements', setting_value: 'true', category: 'notifications' },
+      { setting_key: 'enable2FA', setting_value: 'false', category: 'security' },
+      { setting_key: 'requireTransactionPIN', setting_value: 'true', category: 'security' },
+      { setting_key: 'enforceStrongPasswords', setting_value: 'true', category: 'security' },
+      { setting_key: 'sessionEncryption', setting_value: 'true', category: 'security' },
+      { setting_key: 'ipWhitelisting', setting_value: 'false', category: 'security' },
+      { setting_key: 'maintenanceMode', setting_value: 'false', category: 'system' },
+      { setting_key: 'backupFrequency', setting_value: 'daily', category: 'system' },
+      { setting_key: 'logRetentionDays', setting_value: '30', category: 'system' },
+      { setting_key: 'cacheEnabled', setting_value: 'true', category: 'system' }
+    ];
 
     // Clear all existing settings
-    await db.execute('DELETE FROM system_settings');
+    await supabase
+      .from('system_settings')
+      .delete()
+      .neq('setting_key', 'none'); // Delete all
 
     // Insert default settings
-    for (const [key, value] of Object.entries(defaultSettings)) {
-      await db.execute(
-        `INSERT INTO system_settings (setting_key, setting_value, updated_by) 
-         VALUES ($1, $2, $3)`,
-        [key, value, adminId]
-      );
+    for (const setting of defaultSettings) {
+      await supabase
+        .from('system_settings')
+        .insert({
+          ...setting,
+          updated_by: adminId,
+          updated_at: new Date().toISOString()
+        });
     }
 
     // Reset XP rates to defaults
-    await db.execute('DELETE FROM xp_rates');
+    await supabase
+      .from('xp_rates')
+      .delete()
+      .neq('currency', 'none');
+
     const defaultXpRates = [
-      ['NGN', 25, 1000, 1, '25 XP per 1000 NGN'],
-      ['USD', 25, 1.20, 0, '25 XP per 1.2 USD'],
-      ['EUR', 25, 1.10, 0, '25 XP per 1.1 EUR'],
-      ['GBP', 25, 0.90, 0, '25 XP per 0.9 GBP']
+      { currency: 'NGN', xp_per_unit: 25, unit_amount: 1000, is_active: true, description: '25 XP per 1000 NGN' },
+      { currency: 'USD', xp_per_unit: 25, unit_amount: 1.20, is_active: false, description: '25 XP per 1.2 USD' },
+      { currency: 'EUR', xp_per_unit: 25, unit_amount: 1.10, is_active: false, description: '25 XP per 1.1 EUR' },
+      { currency: 'GBP', xp_per_unit: 25, unit_amount: 0.90, is_active: false, description: '25 XP per 0.9 GBP' }
     ];
 
     for (const rate of defaultXpRates) {
-      await db.execute(
-        `INSERT INTO xp_rates (currency, xp_per_unit, unit_amount, is_active, description) 
-         VALUES ($1, $2, $3, $4, $5)`,
-        rate
-      );
+      await supabase
+        .from('xp_rates')
+        .insert(rate);
     }
 
     // Log activity
-    await db.execute(
-      `INSERT INTO admin_activity_logs 
-       (admin_id, action_type, description) 
-       VALUES ($1, 'factory_reset', 'Performed factory reset of all settings')`,
-      [adminId]
-    );
+    await supabase
+      .from('admin_activity_logs')
+      .insert({
+        admin_id: adminId,
+        action_type: 'factory_reset',
+        description: 'Performed factory reset of all settings',
+        created_at: new Date().toISOString()
+      });
 
     console.log('✅ Factory reset completed');
 
@@ -4221,7 +4362,6 @@ router.post('/factory-reset', authenticateAdmin, async (req, res) => {
   }
 });
 
-// POST /api/admin/factory-reset/undo - Restore from last backup
 router.post('/factory-reset/undo', authenticateAdmin, async (req, res) => {
   try {
     const adminId = req.admin.id;
@@ -4229,11 +4369,15 @@ router.post('/factory-reset/undo', authenticateAdmin, async (req, res) => {
     console.log('↩️ Admin undoing factory reset', { adminId });
 
     // Get latest backup
-    const [backups] = await db.execute(
-      'SELECT * FROM settings_backup ORDER BY created_at DESC LIMIT 1'
-    );
+    const { data: backups, error: backupError } = await supabase
+      .from('settings_backup')
+      .select('*')
+      .order('created_at', { ascending: false })
+      .limit(1);
 
-    if (backups.length === 0) {
+    if (backupError) throw backupError;
+
+    if (!backups || backups.length === 0) {
       return res.status(404).json({ 
         success: false, 
         message: 'No backup found' 
@@ -4241,27 +4385,37 @@ router.post('/factory-reset/undo', authenticateAdmin, async (req, res) => {
     }
 
     const backup = backups[0];
-    const settingsData = JSON.parse(backup.settings_data);
+    const settingsData = typeof backup.settings_data === 'string' 
+      ? JSON.parse(backup.settings_data) 
+      : backup.settings_data;
 
     // Clear current settings
-    await db.execute('DELETE FROM system_settings');
+    await supabase
+      .from('system_settings')
+      .delete()
+      .neq('setting_key', 'none');
 
     // Restore from backup
     for (const [key, value] of Object.entries(settingsData)) {
-      await db.execute(
-        `INSERT INTO system_settings (setting_key, setting_value, updated_by) 
-         VALUES (?, ?, ?)`,
-        [key, value, adminId]
-      );
+      await supabase
+        .from('system_settings')
+        .insert({
+          setting_key: key,
+          setting_value: value,
+          updated_by: adminId,
+          updated_at: new Date().toISOString()
+        });
     }
 
     // Log activity
-    await db.execute(
-      `INSERT INTO admin_activity_logs 
-       (admin_id, action_type, description) 
-       VALUES (?, 'factory_reset_undo', 'Restored settings from backup')`,
-      [adminId]
-    );
+    await supabase
+      .from('admin_activity_logs')
+      .insert({
+        admin_id: adminId,
+        action_type: 'factory_reset_undo',
+        description: 'Restored settings from backup',
+        created_at: new Date().toISOString()
+      });
 
     console.log('✅ Factory reset undone');
 
@@ -4278,20 +4432,23 @@ router.post('/factory-reset/undo', authenticateAdmin, async (req, res) => {
     });
   }
 });
+
 // ==================== EMAIL NOTIFICATION SYSTEM ====================
 
-// GET /api/admin/email/templates - Get email templates
 router.get('/email/templates', authenticateAdmin, async (req, res) => {
   try {
     console.log('📧 Fetching email templates');
     
-    const [templates] = await db.execute(
-      'SELECT * FROM email_templates ORDER BY name'
-    );
+    const { data: templates, error } = await supabase
+      .from('email_templates')
+      .select('*')
+      .order('name');
+
+    if (error) throw error;
 
     res.json({
       success: true,
-      templates
+      templates: templates || []
     });
 
   } catch (error) {
@@ -4303,7 +4460,6 @@ router.get('/email/templates', authenticateAdmin, async (req, res) => {
   }
 });
 
-// POST /api/admin/email/templates - Create email template
 router.post('/email/templates', authenticateAdmin, async (req, res) => {
   try {
     const { name, subject, content, variables } = req.body;
@@ -4318,19 +4474,25 @@ router.post('/email/templates', authenticateAdmin, async (req, res) => {
 
     console.log('📧 Creating email template:', name);
 
-    await db.execute(
-      `INSERT INTO email_templates (name, subject, content, variables) 
-       VALUES (?, ?, ?, ?)`,
-      [name, subject, content, variables ? JSON.stringify(variables) : null]
-    );
+    const { error } = await supabase
+      .from('email_templates')
+      .insert({
+        name,
+        subject,
+        content,
+        variables: variables ? JSON.stringify(variables) : null
+      });
+
+    if (error) throw error;
 
     // Log activity
-    await db.execute(
-      `INSERT INTO admin_activity_logs 
-       (admin_id, action_type, description) 
-       VALUES (?, 'email_template_create', ?)`,
-      [adminId, `Created email template: ${name}`]
-    );
+    await supabase
+      .from('admin_activity_logs')
+      .insert({
+        admin_id: adminId,
+        action_type: 'email_template_create',
+        description: `Created email template: ${name}`
+      });
 
     res.json({
       success: true,
@@ -4346,31 +4508,24 @@ router.post('/email/templates', authenticateAdmin, async (req, res) => {
   }
 });
 
-// POST /api/admin/send-email-notification - Send email to users (FIXED VERSION)
 router.post('/send-email-notification', authenticateAdmin, async (req, res) => {
   try {
     const adminId = req.admin.id;
     
-    console.log('📧 BACKEND FIXED: Received email notification request');
-    console.log('📧 BACKEND FIXED: Request body type:', typeof req.body);
-    console.log('📧 BACKEND FIXED: Request body:', req.body);
+    console.log('📧 BACKEND: Received email notification request');
     
-    // Handle both FormData and JSON
     let subject, message, recipientType, filters, recipients;
     
     if (typeof req.body === 'object' && !Array.isArray(req.body)) {
-      // JSON request
       subject = req.body.subject || '';
       message = req.body.message || '';
       recipientType = req.body.recipientType || req.body.sendTo || 'all';
       recipients = Array.isArray(req.body.recipients) ? req.body.recipients : [];
       
-      // Handle filters - could be object or JSON string
       if (typeof req.body.filters === 'string') {
         try {
           filters = JSON.parse(req.body.filters);
         } catch (e) {
-          console.log('⚠️ Could not parse filters as JSON, using empty object');
           filters = {};
         }
       } else if (typeof req.body.filters === 'object') {
@@ -4379,27 +4534,13 @@ router.post('/send-email-notification', authenticateAdmin, async (req, res) => {
         filters = {};
       }
     } else {
-      // Invalid request
-      console.log('❌ Invalid request body type');
       return res.status(400).json({ 
         success: false, 
         message: 'Invalid request format' 
       });
     }
-    
-    console.log('📧 BACKEND FIXED: Parsed fields:', { 
-      subject, 
-      message, 
-      recipientType,
-      hasSubject: !!subject && subject.trim() !== '',
-      hasMessage: !!message && message.trim() !== '',
-      filterCount: Object.keys(filters).length,
-      recipientCount: recipients.length 
-    });
 
-    // Validate required fields
     if (!subject || subject.trim() === '') {
-      console.log('❌ BACKEND: Validation failed: subject is empty');
       return res.status(400).json({ 
         success: false, 
         message: 'Subject is required' 
@@ -4407,70 +4548,72 @@ router.post('/send-email-notification', authenticateAdmin, async (req, res) => {
     }
 
     if (!message || message.trim() === '') {
-      console.log('❌ BACKEND: Validation failed: message is empty');
       return res.status(400).json({ 
         success: false, 
         message: 'Message is required' 
       });
     }
 
-    // Clean the values
     const cleanSubject = subject.trim();
     const cleanMessage = message.trim();
 
     let userEmails = [];
     let userIds = [];
     
-    // Get users based on recipient type
     if (recipientType === 'all') {
-      // Get all active users
-      const [users] = await db.execute(
-        'SELECT id, email FROM users WHERE account_status = "active" AND is_banned = 0'
-      );
-      userEmails = users.map(user => user.email);
-      userIds = users.map(user => user.id);
-      console.log(`📧 BACKEND: Found ${users.length} active users for "all"`);
+      const { data: users, error: userError } = await supabase
+        .from('users')
+        .select('id, email')
+        .eq('account_status', 'active')
+        .eq('is_banned', false);
+
+      if (!userError && users) {
+        userEmails = users.map(user => user.email);
+        userIds = users.map(user => user.id);
+      }
+      console.log(`📧 BACKEND: Found ${userEmails.length} active users for "all"`);
     } else if (recipientType === 'selected' && recipients.length > 0) {
-      // Get selected users
-      const placeholders = recipients.map(() => '?').join(',');
-      const [users] = await db.execute(
-        `SELECT id, email FROM users WHERE id IN (${placeholders})`,
-        recipients
-      );
-      userEmails = users.map(user => user.email);
-      userIds = users.map(user => user.id);
-      console.log(`📧 BACKEND: Found ${users.length} selected users`);
+      const { data: users, error: userError } = await supabase
+        .from('users')
+        .select('id, email')
+        .in('id', recipients);
+
+      if (!userError && users) {
+        userEmails = users.map(user => user.email);
+        userIds = users.map(user => user.id);
+      }
+      console.log(`📧 BACKEND: Found ${userEmails.length} selected users`);
     } else if (recipientType === 'filtered') {
-      // Build query based on filters
-      let query = 'SELECT id, email FROM users WHERE account_status = "active" AND is_banned = 0';
-      const params = [];
+      let query = supabase
+        .from('users')
+        .select('id, email')
+        .eq('account_status', 'active')
+        .eq('is_banned', false);
       
       if (filters.rank && filters.rank.trim() !== '') {
-        query += ' AND rank = ?';
-        params.push(filters.rank.trim());
+        query = query.eq('rank', filters.rank.trim());
       }
       
       if (filters.status && filters.status !== 'active') {
-        query += ' AND account_status = ?';
-        params.push(filters.status);
+        query = query.eq('account_status', filters.status);
       }
       
       if (filters.minBalance) {
-        query += ' AND balance >= ?';
-        params.push(parseFloat(filters.minBalance));
+        query = query.gte('balance', parseFloat(filters.minBalance));
       }
       
       if (filters.maxBalance) {
-        query += ' AND balance <= ?';
-        params.push(parseFloat(filters.maxBalance));
+        query = query.lte('balance', parseFloat(filters.maxBalance));
       }
       
-      const [users] = await db.execute(query, params);
-      userEmails = users.map(user => user.email);
-      userIds = users.map(user => user.id);
-      console.log(`📧 BACKEND: Found ${users.length} filtered users`);
+      const { data: users, error: userError } = await query;
+      
+      if (!userError && users) {
+        userEmails = users.map(user => user.email);
+        userIds = users.map(user => user.id);
+      }
+      console.log(`📧 BACKEND: Found ${userEmails.length} filtered users`);
     } else {
-      console.log('❌ BACKEND: Invalid recipient type or no recipients');
       return res.status(400).json({ 
         success: false, 
         message: 'Invalid recipient selection' 
@@ -4478,7 +4621,6 @@ router.post('/send-email-notification', authenticateAdmin, async (req, res) => {
     }
 
     if (userEmails.length === 0) {
-      console.log('❌ BACKEND: No recipients found');
       return res.status(400).json({ 
         success: false, 
         message: 'No recipients found' 
@@ -4494,57 +4636,55 @@ router.post('/send-email-notification', authenticateAdmin, async (req, res) => {
       cleanMessage
     );
 
-    // Count successful emails
     const sentCount = emailResults.filter(r => r.success).length;
     const failedCount = emailResults.filter(r => !r.success).length;
 
     // Store emails in queue for tracking
     if (userEmails.length > 0) {
-      try {
-        // Insert all emails in batch
-        for (const email of userEmails) {
-          await db.execute(
-            `INSERT INTO email_queue 
-             (recipient_email, subject, content, status, created_at) 
-             VALUES (?, ?, ?, ?, NOW())`,
-            [email, cleanSubject, cleanMessage, sentCount > 0 ? 'sent' : 'failed']
-          );
-        }
-        console.log('📧 BACKEND: Emails logged to queue');
-      } catch (dbError) {
-        console.warn('⚠️ BACKEND: Could not log emails to queue:', dbError.message);
+      for (const email of userEmails) {
+        await supabase
+          .from('email_queue')
+          .insert({
+            recipient_email: email,
+            subject: cleanSubject,
+            content: cleanMessage,
+            status: sentCount > 0 ? 'sent' : 'failed',
+            created_at: new Date().toISOString()
+          });
       }
+      console.log('📧 BACKEND: Emails logged to queue');
     }
 
-    // ============ KEEP BROADCAST MESSAGE FEATURE ============
-    // Create in-app notifications for all users (system broadcast)
+    // Create in-app notifications for all users
     const broadcastMessage = `SYSTEM: ${cleanSubject} - ${cleanMessage.substring(0, 200)}${cleanMessage.length > 200 ? '...' : ''}`;
     let broadcastCount = 0;
     
-    if (userIds.length > 0) {
-      for (const userId of userIds) {
-        try {
-          await db.execute(
-            `INSERT INTO notifications 
-             (user_id, sender_id, message, type, status, created_at) 
-             VALUES (?, ?, ?, 'system', 'unread', NOW())`,
-            [userId, adminId, broadcastMessage]
-          );
-          broadcastCount++;
-        } catch (error) {
-          console.warn(`⚠️ BACKEND: Could not create in-app notification for user ${userId}:`, error.message);
-        }
+    for (const userId of userIds) {
+      try {
+        await supabase
+          .from('notifications')
+          .insert({
+            user_id: userId,
+            sender_id: adminId,
+            message: broadcastMessage,
+            type: 'system',
+            status: 'unread',
+            created_at: new Date().toISOString()
+          });
+        broadcastCount++;
+      } catch (error) {
+        console.warn(`⚠️ BACKEND: Could not create in-app notification for user ${userId}:`, error.message);
       }
     }
-    // ============ END BROADCAST FEATURE ============
 
     // Log activity
-    await db.execute(
-      `INSERT INTO admin_activity_logs 
-       (admin_id, action_type, description) 
-       VALUES (?, 'email_notification', ?)`,
-      [adminId, `Sent email to ${sentCount} users: ${cleanSubject} (${failedCount} failed)`]
-    );
+    await supabase
+      .from('admin_activity_logs')
+      .insert({
+        admin_id: adminId,
+        action_type: 'email_notification',
+        description: `Sent email to ${sentCount} users: ${cleanSubject} (${failedCount} failed)`
+      });
 
     console.log(`✅ BACKEND: Email notification sent to ${sentCount} users`);
     console.log(`✅ BACKEND: In-app broadcast sent to ${broadcastCount} users`);
@@ -4565,7 +4705,6 @@ router.post('/send-email-notification', authenticateAdmin, async (req, res) => {
 
   } catch (error) {
     console.error('❌ BACKEND: Send email notification error:', error);
-    console.error('❌ BACKEND: Error stack:', error.stack);
     res.status(500).json({ 
       success: false, 
       message: 'Failed to send email notification',
@@ -4573,7 +4712,7 @@ router.post('/send-email-notification', authenticateAdmin, async (req, res) => {
     });
   }
 });
-// GET /api/admin/email/queue - Get email queue
+
 router.get('/email/queue', authenticateAdmin, async (req, res) => {
   try {
     const { status, page = 1, limit = 20 } = req.query;
@@ -4581,32 +4720,28 @@ router.get('/email/queue', authenticateAdmin, async (req, res) => {
 
     console.log('📧 Fetching email queue - Status:', status, 'Page:', page);
 
-    let query = 'SELECT * FROM email_queue WHERE 1=1';
-    let countQuery = 'SELECT COUNT(*) as total FROM email_queue WHERE 1=1';
-    const params = [];
-    const countParams = [];
+    let query = supabase
+      .from('email_queue')
+      .select('*', { count: 'exact' });
 
     if (status && status !== 'all') {
-      query += ' AND status = ?';
-      countQuery += ' AND status = ?';
-      params.push(status);
-      countParams.push(status);
+      query = query.eq('status', status);
     }
 
-    query += ' ORDER BY created_at DESC LIMIT ? OFFSET ?';
-    params.push(parseInt(limit), parseInt(offset));
+    const { data: queue, error, count } = await query
+      .order('created_at', { ascending: false })
+      .range(offset, offset + limit - 1);
 
-    const [queue] = await db.execute(query, params);
-    const [countResult] = await db.execute(countQuery, countParams);
+    if (error) throw error;
 
     res.json({
       success: true,
-      queue,
+      queue: queue || [],
       pagination: {
         page: parseInt(page),
         limit: parseInt(limit),
-        total: countResult[0].total,
-        totalPages: Math.ceil(countResult[0].total / limit)
+        total: count || 0,
+        totalPages: Math.ceil((count || 0) / limit)
       }
     });
 
@@ -4619,7 +4754,6 @@ router.get('/email/queue', authenticateAdmin, async (req, res) => {
   }
 });
 
-// POST /api/admin/email/test - Test email configuration
 router.post('/email/test', authenticateAdmin, async (req, res) => {
   try {
     const { email = req.admin.email } = req.body;
@@ -4640,12 +4774,13 @@ router.post('/email/test', authenticateAdmin, async (req, res) => {
     );
 
     // Log activity
-    await db.execute(
-      `INSERT INTO admin_activity_logs 
-       (admin_id, action_type, description) 
-       VALUES (?, 'email_test', 'Tested email configuration')`,
-      [adminId]
-    );
+    await supabase
+      .from('admin_activity_logs')
+      .insert({
+        admin_id: adminId,
+        action_type: 'email_test',
+        description: 'Tested email configuration'
+      });
 
     res.json({
       success: testResult.success,
@@ -4661,38 +4796,40 @@ router.post('/email/test', authenticateAdmin, async (req, res) => {
     });
   }
 });
+
 // ==================== GROUPS MANAGEMENT ENDPOINTS ====================
 
-// GET /api/admin/groups/stats - Get groups statistics
-// GET /api/admin/groups/stats - Get groups statistics
 router.get('/groups/stats', authenticateAdmin, async (req, res) => {
   try {
     console.log('📊 Admin: Fetching groups statistics');
 
-    const result = await db.execute(`
-      SELECT 
-        COUNT(*) as total_groups,
-        COUNT(CASE WHEN visibility = 'public' THEN 1 END) as public_groups,
-        COUNT(CASE WHEN visibility = 'private' THEN 1 END) as private_groups,
-        COALESCE(SUM(
-          (SELECT COUNT(*) FROM group_members gm WHERE gm.group_id = g.id AND gm.status = 'joined')
-        ), 0) as total_members,
-        COUNT(CASE WHEN created_at >= NOW() - INTERVAL '7 days' THEN 1 END) as recent_groups
-      FROM groups g
-    `);
+    const { data: groups, error: gError } = await supabase
+      .from('groups')
+      .select('id, visibility, created_at');
 
-    // Handle result format (rows vs result[0])
-    const stats = result.rows ? result.rows[0] : (result[0] ? result[0][0] : null);
+    if (gError) throw gError;
+
+    const { data: members, error: mError } = await supabase
+      .from('group_members')
+      .select('*')
+      .eq('status', 'joined');
+
+    if (mError) throw mError;
+
+    const sevenDaysAgo = new Date();
+    sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
+
+    const stats = {
+      total_groups: groups?.length || 0,
+      public_groups: groups?.filter(g => g.visibility === 'public').length || 0,
+      private_groups: groups?.filter(g => g.visibility === 'private').length || 0,
+      total_members: members?.length || 0,
+      recent_groups: groups?.filter(g => new Date(g.created_at) >= sevenDaysAgo).length || 0
+    };
 
     res.json({
       success: true,
-      stats: stats || {
-        total_groups: 0,
-        public_groups: 0,
-        private_groups: 0,
-        total_members: 0,
-        recent_groups: 0
-      }
+      stats
     });
 
   } catch (error) {
@@ -4703,7 +4840,7 @@ router.get('/groups/stats', authenticateAdmin, async (req, res) => {
     });
   }
 });
-// GET /api/admin/groups - Get all groups (UPDATED WITH FILTER)
+
 router.get('/groups', authenticateAdmin, async (req, res) => {
   try {
     const { search = '', page = 1, limit = 20, visibility = '' } = req.query;
@@ -4712,99 +4849,75 @@ router.get('/groups', authenticateAdmin, async (req, res) => {
 
     console.log('👥 Admin: Fetching groups - Search:', search, 'Page:', page, 'Visibility:', visibility);
 
-    // Build query with search AND visibility filter
-    let query = `
-      SELECT 
-        g.*,
-        u.username as creator_username,
-        u.email as creator_email,
-        COUNT(DISTINCT gm.user_id) as member_count
-      FROM groups g
-      LEFT JOIN users u ON g.creator_id = u.id
-      LEFT JOIN group_members gm ON g.id = gm.group_id AND gm.status = 'joined'
-      WHERE 1=1
-    `;
-    
-    let countQuery = 'SELECT COUNT(*) as total FROM groups g WHERE 1=1';
-    const params = [];
-    const countParams = [];
-    let paramCount = 0;
-    let countParamCount = 0;
+    let query = supabase
+      .from('groups')
+      .select(`
+        *,
+        creator:creator_id (username, email)
+      `, { count: 'exact' });
 
-    // Search filter
     if (search && search.trim() !== '') {
-      const searchTerm = `%${search.trim()}%`;
-      paramCount++;
-      countParamCount++;
-      query += ` AND (g.name ILIKE $${paramCount} OR g.description ILIKE $${paramCount} OR g.game_specialty ILIKE $${paramCount})`;
-      countQuery += ` AND (g.name ILIKE $${countParamCount} OR g.description ILIKE $${countParamCount} OR g.game_specialty ILIKE $${countParamCount})`;
-      params.push(searchTerm);
-      countParams.push(searchTerm);
+      query = query.or(`name.ilike.%${search.trim()}%,description.ilike.%${search.trim()}%,game_specialty.ilike.%${search.trim()}%`);
     }
 
-    // Visibility filter
     if (visibility && visibility !== '') {
-      paramCount++;
-      countParamCount++;
-      query += ` AND g.visibility = $${paramCount}`;
-      countQuery += ` AND g.visibility = $${countParamCount}`;
-      params.push(visibility);
-      countParams.push(visibility);
+      query = query.eq('visibility', visibility);
     }
 
-    // Group and paginate
-    query += ` GROUP BY g.id, u.username, u.email ORDER BY g.created_at DESC LIMIT $${paramCount + 1}`;
-    params.push(parseInt(limit));
-    
-    query += ` OFFSET $${paramCount + 2}`;
-    params.push(parseInt(offset));
+    const { data: groups, error, count } = await query
+      .order('created_at', { ascending: false })
+      .range(offset, offset + limit - 1);
 
-    // Execute queries using db.execute()
-    const groupsResult = await db.execute(query, params);
-    const countResult = await db.execute(countQuery, countParams);
+    if (error) throw error;
 
-    // Handle result format
-    const groups = groupsResult.rows || groupsResult[0] || [];
-    const totalCount = countResult.rows ? countResult.rows[0]?.total : (countResult[0] ? countResult[0][0]?.total : 0);
+    // Get member counts for each group
+    const groupsWithCounts = await Promise.all((groups || []).map(async (group) => {
+      const { count: memberCount } = await supabase
+        .from('group_members')
+        .select('*', { count: 'exact', head: true })
+        .eq('group_id', group.id)
+        .eq('status', 'joined');
 
-    // Format groups for frontend
-    const formattedGroups = groups.map(group => ({
-      id: group.id,
-      name: group.name,
-      description: group.description || '',
-      game_specialty: group.game_specialty || '',
-      visibility: group.visibility || 'public',
-      max_members: group.max_members || 20,
-      creator_id: group.creator_id,
-      creator: {
-        username: group.creator_username,
-        email: group.creator_email
-      },
-      current_members: group.member_count || 0,
-      created_at: group.created_at,
-      updated_at: group.updated_at
+      return {
+        id: group.id,
+        name: group.name,
+        description: group.description || '',
+        game_specialty: group.game_specialty || '',
+        visibility: group.visibility || 'public',
+        max_members: group.max_members || 20,
+        creator_id: group.creator_id,
+        creator: {
+          username: group.creator?.username,
+          email: group.creator?.email
+        },
+        current_members: memberCount || 0,
+        created_at: group.created_at,
+        updated_at: group.updated_at
+      };
     }));
 
     // Log activity
     try {
-      await db.execute(
-        `INSERT INTO admin_activity_logs 
-         (admin_id, action_type, description, created_at) 
-         VALUES ($1, 'view', 'Viewed groups list', NOW())`,
-        [adminId]
-      );
+      await supabase
+        .from('admin_activity_logs')
+        .insert({
+          admin_id: adminId,
+          action_type: 'view',
+          description: 'Viewed groups list',
+          created_at: new Date().toISOString()
+        });
     } catch (logError) {
       console.warn('⚠️ Could not log activity:', logError.message);
     }
 
     res.json({
       success: true,
-      groups: formattedGroups,
+      groups: groupsWithCounts,
       pagination: {
         page: parseInt(page),
         limit: parseInt(limit),
-        total: parseInt(totalCount) || 0,
-        totalPages: Math.ceil((parseInt(totalCount) || 0) / limit)
+        total: count || 0,
+        totalPages: Math.ceil((count || 0) / limit)
       }
     });
 
@@ -4817,8 +4930,7 @@ router.get('/groups', authenticateAdmin, async (req, res) => {
     });
   }
 });
-// GET /api/admin/groups/:id - Get group details
-// GET /api/admin/groups/:id - Get group details
+
 router.get('/groups/:id', authenticateAdmin, async (req, res) => {
   try {
     const { id } = req.params;
@@ -4826,23 +4938,17 @@ router.get('/groups/:id', authenticateAdmin, async (req, res) => {
 
     console.log('👥 Admin: Fetching group details for ID:', id);
 
-    // Get group details
-    const result = await db.execute(`
-      SELECT 
-        g.*,
-        u.username as creator_username,
-        u.email as creator_email,
-        COUNT(DISTINCT gm.user_id) as member_count
-      FROM groups g
-      LEFT JOIN users u ON g.creator_id = u.id
-      LEFT JOIN group_members gm ON g.id = gm.group_id AND gm.status = 'joined'
-      WHERE g.id = $1
-      GROUP BY g.id, u.username, u.email
-    `, [id]);
+    const { data: groups, error } = await supabase
+      .from('groups')
+      .select(`
+        *,
+        creator:creator_id (username, email)
+      `)
+      .eq('id', id);
 
-    const groups = result.rows || result[0] || [];
+    if (error) throw error;
 
-    if (groups.length === 0) {
+    if (!groups || groups.length === 0) {
       return res.status(404).json({
         success: false,
         message: 'Group not found'
@@ -4851,7 +4957,12 @@ router.get('/groups/:id', authenticateAdmin, async (req, res) => {
 
     const group = groups[0];
 
-    // Format response
+    const { count: memberCount } = await supabase
+      .from('group_members')
+      .select('*', { count: 'exact', head: true })
+      .eq('group_id', id)
+      .eq('status', 'joined');
+
     const formattedGroup = {
       id: group.id,
       name: group.name,
@@ -4861,10 +4972,10 @@ router.get('/groups/:id', authenticateAdmin, async (req, res) => {
       max_members: group.max_members || 20,
       creator_id: group.creator_id,
       creator: {
-        username: group.creator_username,
-        email: group.creator_email
+        username: group.creator?.username,
+        email: group.creator?.email
       },
-      current_members: group.member_count || 0,
+      current_members: memberCount || 0,
       created_at: group.created_at,
       updated_at: group.updated_at
     };
@@ -4882,7 +4993,7 @@ router.get('/groups/:id', authenticateAdmin, async (req, res) => {
     });
   }
 });
-// GET /api/admin/groups/:id/members - Get group members
+
 router.get('/groups/:id/members', authenticateAdmin, async (req, res) => {
   try {
     const { id } = req.params;
@@ -4891,14 +5002,14 @@ router.get('/groups/:id/members', authenticateAdmin, async (req, res) => {
     console.log('👥 Admin: Fetching members for group ID:', id);
 
     // Verify group exists
-    const groupResult = await db.execute(
-      'SELECT id, name FROM groups WHERE id = $1',
-      [id]
-    );
-    
-    const groups = groupResult.rows || groupResult[0] || [];
+    const { data: groups, error: gError } = await supabase
+      .from('groups')
+      .select('id, name')
+      .eq('id', id);
 
-    if (groups.length === 0) {
+    if (gError) throw gError;
+
+    if (!groups || groups.length === 0) {
       return res.status(404).json({
         success: false,
         message: 'Group not found'
@@ -4906,39 +5017,32 @@ router.get('/groups/:id/members', authenticateAdmin, async (req, res) => {
     }
 
     // Get group members
-    const membersResult = await db.execute(`
-      SELECT 
-        gm.*,
-        u.username,
-        u.email,
-        u.profile_pic,
-        u.rank,
-        u.xp_points,
-        u.created_at as user_created_at
-      FROM group_members gm
-      JOIN users u ON gm.user_id = u.id
-      WHERE gm.group_id = $1 AND gm.status = 'joined'
-      ORDER BY 
-        CASE WHEN gm.role = 'admin' THEN 1 ELSE 2 END,
-        gm.joined_at ASC
-    `, [id]);
-    
-    const members = membersResult.rows || membersResult[0] || [];
+    const { data: members, error: mError } = await supabase
+      .from('group_members')
+      .select(`
+        *,
+        users (username, email, profile_pic, rank, xp_points, created_at)
+      `)
+      .eq('group_id', id)
+      .eq('status', 'joined')
+      .order('joined_at', { ascending: true });
 
-    // Format members for frontend
-    const formattedMembers = members.map(member => ({
+    if (mError) throw mError;
+
+    // Format members
+    const formattedMembers = (members || []).map(member => ({
       user_id: member.user_id,
       group_id: member.group_id,
       role: member.role || 'member',
       status: member.status,
       joined_at: member.joined_at,
       user: {
-        username: member.username,
-        email: member.email,
-        profile_pic: member.profile_pic,
-        rank: member.rank,
-        xp_points: member.xp_points,
-        created_at: member.user_created_at
+        username: member.users?.username,
+        email: member.users?.email,
+        profile_pic: member.users?.profile_pic,
+        rank: member.users?.rank,
+        xp_points: member.users?.xp_points,
+        created_at: member.users?.created_at
       }
     }));
 
@@ -4958,10 +5062,8 @@ router.get('/groups/:id/members', authenticateAdmin, async (req, res) => {
     });
   }
 });
-// DELETE /api/admin/groups/:id - Delete group
-// DELETE /api/admin/groups/:id - Delete group
+
 router.delete('/groups/:id', authenticateAdmin, async (req, res) => {
-  let connection;
   try {
     const { id } = req.params;
     const { reason = 'Deleted by admin' } = req.body;
@@ -4970,14 +5072,14 @@ router.delete('/groups/:id', authenticateAdmin, async (req, res) => {
     console.log('🗑️ Admin: Deleting group ID:', id, 'Reason:', reason);
 
     // Verify group exists
-    const groupResult = await db.execute(
-      'SELECT * FROM groups WHERE id = $1',
-      [id]
-    );
-    
-    const groups = groupResult.rows || groupResult[0] || [];
+    const { data: groups, error: gError } = await supabase
+      .from('groups')
+      .select('*')
+      .eq('id', id);
 
-    if (groups.length === 0) {
+    if (gError) throw gError;
+
+    if (!groups || groups.length === 0) {
       return res.status(404).json({
         success: false,
         message: 'Group not found'
@@ -4987,79 +5089,69 @@ router.delete('/groups/:id', authenticateAdmin, async (req, res) => {
     const group = groups[0];
 
     // Check if group has members
-    const memberCountResult = await db.execute(
-      'SELECT COUNT(*) as count FROM group_members WHERE group_id = $1',
-      [id]
-    );
-    
-    const memberCount = memberCountResult.rows ? 
-      memberCountResult.rows[0]?.count : 
-      (memberCountResult[0] ? memberCountResult[0][0]?.count : 0);
+    const { count: memberCount, error: countError } = await supabase
+      .from('group_members')
+      .select('*', { count: 'exact', head: true })
+      .eq('group_id', id);
 
-    // Use your database's transaction helper or direct connection
-    // Since you're using db.execute, let's assume it handles transactions
-    await db.execute('BEGIN');
-    
-    try {
-      // 1. Remove all group members (if any)
-      if (parseInt(memberCount) > 0) {
-        await db.execute(
-          'DELETE FROM group_members WHERE group_id = $1',
-          [id]
-        );
-      }
+    if (countError) throw countError;
 
-      // 2. Delete group
-      await db.execute(
-        'DELETE FROM groups WHERE id = $1',
-        [id]
-      );
+    // Remove all group members
+    if (memberCount && memberCount > 0) {
+      const { error: deleteError } = await supabase
+        .from('group_members')
+        .delete()
+        .eq('group_id', id);
 
-      // 3. Notify creator that group was deleted
-      try {
-        await db.execute(
-          `INSERT INTO notifications 
-           (user_id, message, type, status, created_at) 
-           VALUES ($1, $2, 'system', 'unread', NOW())`,
-          [
-            group.creator_id,
-            `Your group "${group.name}" has been deleted by admin. Reason: ${reason}`
-          ]
-        );
-      } catch (notifyError) {
-        console.warn('⚠️ Could not notify group creator:', notifyError.message);
-      }
-
-      // 4. Log admin activity
-      await db.execute(
-        `INSERT INTO admin_activity_logs 
-         (admin_id, action_type, description, details, created_at) 
-         VALUES ($1, 'group_delete', $2, $3, NOW())`,
-        [
-          adminId,
-          `Deleted group: ${group.name}`,
-          JSON.stringify({
-            group_id: id,
-            group_name: group.name,
-            members_removed: parseInt(memberCount),
-            reason: reason
-          })
-        ]
-      );
-
-      await db.execute('COMMIT');
-      console.log('✅ Group deleted successfully');
-    } catch (error) {
-      await db.execute('ROLLBACK');
-      console.error('❌ Error within delete transaction:', error);
-      throw error;
+      if (deleteError) throw deleteError;
     }
+
+    // Delete group
+    const { error: deleteGroupError } = await supabase
+      .from('groups')
+      .delete()
+      .eq('id', id);
+
+    if (deleteGroupError) throw deleteGroupError;
+
+    // Notify creator that group was deleted
+    try {
+      await supabase
+        .from('notifications')
+        .insert({
+          user_id: group.creator_id,
+          message: `Your group "${group.name}" has been deleted by admin. Reason: ${reason}`,
+          type: 'system',
+          status: 'unread',
+          created_at: new Date().toISOString()
+        });
+    } catch (notifyError) {
+      console.warn('⚠️ Could not notify group creator:', notifyError.message);
+    }
+
+    // Log admin activity
+    await supabase
+      .from('admin_activity_logs')
+      .insert({
+        admin_id: adminId,
+        action_type: 'group_delete',
+        description: `Deleted group: ${group.name}`,
+        details: JSON.stringify({
+          group_id: id,
+          group_name: group.name,
+          members_removed: memberCount || 0,
+          reason: reason
+        }),
+        created_at: new Date().toISOString()
+      });
+
+    console.log('✅ Group deleted successfully');
 
     res.json({
       success: true,
       message: 'Group deleted successfully',
       group_name: group.name,
-      members_removed: parseInt(memberCount)
+      members_removed: memberCount || 0
     });
 
   } catch (error) {
@@ -5071,120 +5163,7 @@ router.delete('/groups/:id', authenticateAdmin, async (req, res) => {
     });
   }
 });
-// PUT /api/admin/groups/:id - Update group
-// DELETE /api/admin/groups/:id - Delete group
-router.delete('/groups/:id', authenticateAdmin, async (req, res) => {
-  let connection;
-  try {
-    const { id } = req.params;
-    const { reason = 'Deleted by admin' } = req.body;
-    const adminId = req.admin.id;
 
-    console.log('🗑️ Admin: Deleting group ID:', id, 'Reason:', reason);
-
-    // Verify group exists
-    const groupResult = await db.execute(
-      'SELECT * FROM groups WHERE id = $1',
-      [id]
-    );
-    
-    const groups = groupResult.rows || groupResult[0] || [];
-
-    if (groups.length === 0) {
-      return res.status(404).json({
-        success: false,
-        message: 'Group not found'
-      });
-    }
-
-    const group = groups[0];
-
-    // Check if group has members
-    const memberCountResult = await db.execute(
-      'SELECT COUNT(*) as count FROM group_members WHERE group_id = $1',
-      [id]
-    );
-    
-    const memberCount = memberCountResult.rows ? 
-      memberCountResult.rows[0]?.count : 
-      (memberCountResult[0] ? memberCountResult[0][0]?.count : 0);
-
-    // Use your database's transaction helper or direct connection
-    // Since you're using db.execute, let's assume it handles transactions
-    await db.execute('BEGIN');
-    
-    try {
-      // 1. Remove all group members (if any)
-      if (parseInt(memberCount) > 0) {
-        await db.execute(
-          'DELETE FROM group_members WHERE group_id = $1',
-          [id]
-        );
-      }
-
-      // 2. Delete group
-      await db.execute(
-        'DELETE FROM groups WHERE id = $1',
-        [id]
-      );
-
-      // 3. Notify creator that group was deleted
-      try {
-        await db.execute(
-          `INSERT INTO notifications 
-           (user_id, message, type, status, created_at) 
-           VALUES ($1, $2, 'system', 'unread', NOW())`,
-          [
-            group.creator_id,
-            `Your group "${group.name}" has been deleted by admin. Reason: ${reason}`
-          ]
-        );
-      } catch (notifyError) {
-        console.warn('⚠️ Could not notify group creator:', notifyError.message);
-      }
-
-      // 4. Log admin activity
-      await db.execute(
-        `INSERT INTO admin_activity_logs 
-         (admin_id, action_type, description, details, created_at) 
-         VALUES ($1, 'group_delete', $2, $3, NOW())`,
-        [
-          adminId,
-          `Deleted group: ${group.name}`,
-          JSON.stringify({
-            group_id: id,
-            group_name: group.name,
-            members_removed: parseInt(memberCount),
-            reason: reason
-          })
-        ]
-      );
-
-      await db.execute('COMMIT');
-      console.log('✅ Group deleted successfully');
-    } catch (error) {
-      await db.execute('ROLLBACK');
-      console.error('❌ Error within delete transaction:', error);
-      throw error;
-    }
-
-    res.json({
-      success: true,
-      message: 'Group deleted successfully',
-      group_name: group.name,
-      members_removed: parseInt(memberCount)
-    });
-
-  } catch (error) {
-    console.error('❌ Delete group error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Failed to delete group',
-      error: process.env.NODE_ENV === 'development' ? error.message : undefined
-    });
-  }
-});
-// DELETE /api/admin/groups/:groupId/members/:userId - Remove member from group
 router.delete('/groups/:groupId/members/:userId', authenticateAdmin, async (req, res) => {
   try {
     const { groupId, userId } = req.params;
@@ -5194,17 +5173,19 @@ router.delete('/groups/:groupId/members/:userId', authenticateAdmin, async (req,
     console.log('👥 Admin: Removing member', userId, 'from group', groupId);
 
     // Check if member exists
-    const membersResult = await db.execute(`
-      SELECT gm.*, u.username, g.name as group_name
-      FROM group_members gm
-      JOIN users u ON gm.user_id = u.id
-      JOIN groups g ON gm.group_id = g.id
-      WHERE gm.group_id = $1 AND gm.user_id = $2
-    `, [groupId, userId]);
-    
-    const members = membersResult.rows || membersResult[0] || [];
+    const { data: members, error: mError } = await supabase
+      .from('group_members')
+      .select(`
+        *,
+        users (username),
+        groups (name)
+      `)
+      .eq('group_id', groupId)
+      .eq('user_id', userId);
 
-    if (members.length === 0) {
+    if (mError) throw mError;
+
+    if (!members || members.length === 0) {
       return res.status(404).json({
         success: false,
         message: 'Member not found in group'
@@ -5214,71 +5195,62 @@ router.delete('/groups/:groupId/members/:userId', authenticateAdmin, async (req,
     const member = members[0];
 
     // Don't allow removing the creator
-    const groupInfoResult = await db.execute(
-      'SELECT creator_id FROM groups WHERE id = $1',
-      [groupId]
-    );
-    
-    const groupInfo = groupInfoResult.rows ? 
-      groupInfoResult.rows[0] : 
-      (groupInfoResult[0] ? groupInfoResult[0][0] : null);
+    const { data: groupInfo, error: infoError } = await supabase
+      .from('groups')
+      .select('creator_id')
+      .eq('id', groupId);
 
-    if (parseInt(groupInfo.creator_id) === parseInt(userId)) {
+    if (infoError) throw infoError;
+
+    if (groupInfo && groupInfo[0] && parseInt(groupInfo[0].creator_id) === parseInt(userId)) {
       return res.status(400).json({
         success: false,
         message: 'Cannot remove group creator'
       });
     }
 
-    await db.execute('BEGIN');
-    
+    // Remove member
+    const { error: deleteError } = await supabase
+      .from('group_members')
+      .delete()
+      .eq('group_id', groupId)
+      .eq('user_id', userId);
+
+    if (deleteError) throw deleteError;
+
+    // Notify the removed user
     try {
-      // Remove member
-      await db.execute(
-        'DELETE FROM group_members WHERE group_id = $1 AND user_id = $2',
-        [groupId, userId]
-      );
-
-      // Notify the removed user
-      try {
-        await db.execute(
-          `INSERT INTO notifications 
-           (user_id, message, type, status, created_at) 
-           VALUES ($1, $2, 'system', 'unread', NOW())`,
-          [
-            userId,
-            `You have been removed from group "${member.group_name}" by admin. Reason: ${reason}`
-          ]
-        );
-      } catch (notifyError) {
-        console.warn('⚠️ Could not notify removed member:', notifyError.message);
-      }
-
-      // Log activity
-      await db.execute(
-        `INSERT INTO admin_activity_logs 
-         (admin_id, action_type, description, affected_user_id, details, created_at) 
-         VALUES ($1, $2, $3, $4, $5, NOW())`,
-        [
-          adminId,
-          'group_member_remove',
-          `Removed member from group: ${member.group_name}`,
-          userId,
-          JSON.stringify({
-            group_id: groupId,
-            group_name: member.group_name,
-            member_username: member.username,
-            reason: reason
-          })
-        ]
-      );
-
-      await db.execute('COMMIT');
-    } catch (error) {
-      await db.execute('ROLLBACK');
-      console.error('❌ Error within remove member transaction:', error);
-      throw error;
+      await supabase
+        .from('notifications')
+        .insert({
+          user_id: userId,
+          message: `You have been removed from group "${member.groups?.name}" by admin. Reason: ${reason}`,
+          type: 'system',
+          status: 'unread',
+          created_at: new Date().toISOString()
+        });
+    } catch (notifyError) {
+      console.warn('⚠️ Could not notify removed member:', notifyError.message);
     }
+
+    // Log activity
+    await supabase
+      .from('admin_activity_logs')
+      .insert({
+        admin_id: adminId,
+        action_type: 'group_member_remove',
+        description: `Removed member from group: ${member.groups?.name}`,
+        affected_user_id: userId,
+        details: JSON.stringify({
+          group_id: groupId,
+          group_name: member.groups?.name,
+          member_username: member.users?.username,
+          reason: reason
+        }),
+        created_at: new Date().toISOString()
+      });
+
+    console.log('✅ Member removed successfully');
 
     res.json({
       success: true,
@@ -5294,19 +5266,24 @@ router.delete('/groups/:groupId/members/:userId', authenticateAdmin, async (req,
     });
   }
 });
-// GET /api/admin/groups/test - Test endpoint
+
 router.get('/groups/test', authenticateAdmin, async (req, res) => {
   try {
-    // Test database connection
-    const { rows: groupsCount } = await db.query('SELECT COUNT(*) as count FROM groups');
-    const { rows: membersCount } = await db.query('SELECT COUNT(*) as count FROM group_members WHERE status = \'joined\'');
-    
+    const { count: groupsCount, error: gError } = await supabase
+      .from('groups')
+      .select('*', { count: 'exact', head: true });
+
+    const { count: membersCount, error: mError } = await supabase
+      .from('group_members')
+      .select('*', { count: 'exact', head: true })
+      .eq('status', 'joined');
+
     res.json({
       success: true,
       message: 'Groups API is working',
       test_data: {
-        groups_count: parseInt(groupsCount[0].count),
-        members_count: parseInt(membersCount[0].count),
+        groups_count: groupsCount || 0,
+        members_count: membersCount || 0,
         timestamp: new Date().toISOString()
       }
     });
@@ -5321,310 +5298,161 @@ router.get('/groups/test', authenticateAdmin, async (req, res) => {
 
 // ==================== ANALYTICS & REPORTS ENDPOINTS ====================
 
-// GET /api/admin/analytics - Get analytics data (FIXED for your database)
-// GET /api/admin/analytics - Get analytics data (FIXED for your database)
 router.get('/analytics', authenticateAdmin, async (req, res) => {
   try {
     const { period = '30d' } = req.query;
     console.log('📈 Admin: Fetching analytics for period:', period);
 
     // Calculate date range
-    let intervalValue = '';
-    let format = 'YYYY-MM-DD';
-    
+    let intervalDays = 30;
     switch(period) {
-      case '7d':
-        intervalValue = '7 days';
-        break;
-      case '30d':
-        intervalValue = '30 days';
-        break;
-      case '90d':
-        intervalValue = '90 days';
-        format = 'IYYY-IW'; // Weekly format (ISO year and week)
-        break;
-      case '1y':
-        intervalValue = '1 year';
-        format = 'YYYY-MM'; // Monthly format
-        break;
-      case 'all':
-        intervalValue = '100 years'; // All time
-        break;
-      default:
-        intervalValue = '30 days';
+      case '7d': intervalDays = 7; break;
+      case '30d': intervalDays = 30; break;
+      case '90d': intervalDays = 90; break;
+      case '1y': intervalDays = 365; break;
+      case 'all': intervalDays = 3650; break;
+      default: intervalDays = 30;
     }
 
-    // ==================== 1. FINANCIAL ANALYTICS ====================
+    const startDate = new Date();
+    startDate.setDate(startDate.getDate() - intervalDays);
 
-    // Get Total Deposits (Revenue)
-    let totalDeposits = 0;
-    try {
-      const depositsResult = await db.execute(`
-        SELECT COALESCE(SUM(amount), 0) as total_deposits
-        FROM transactions 
-        WHERE type = 'deposit' 
-          AND status = 'completed'
-          AND created_at >= NOW() - INTERVAL '${intervalValue}'
-      `);
-      const deposits = depositsResult.rows ? depositsResult.rows[0] : (depositsResult[0] ? depositsResult[0][0] : {});
-      totalDeposits = parseFloat(deposits.total_deposits) || 0;
-    } catch (error) {
-      console.warn('⚠️ Deposits query error:', error.message);
-    }
+    // Get all transactions in period
+    const { data: transactions, error: txError } = await supabase
+      .from('transactions')
+      .select('amount, type, status, created_at')
+      .gte('created_at', startDate.toISOString())
+      .eq('status', 'completed');
 
-    // Get Total Withdrawals
-    let totalWithdrawals = 0;
-    try {
-      const withdrawalsResult = await db.execute(`
-        SELECT COALESCE(SUM(amount), 0) as total_withdrawals
-        FROM transactions 
-        WHERE type = 'withdrawal' 
-          AND status = 'completed'
-          AND created_at >= NOW() - INTERVAL '${intervalValue}'
-      `);
-      const withdrawals = withdrawalsResult.rows ? withdrawalsResult.rows[0] : (withdrawalsResult[0] ? withdrawalsResult[0][0] : {});
-      totalWithdrawals = parseFloat(withdrawals.total_withdrawals) || 0;
-    } catch (error) {
-      console.warn('⚠️ Withdrawals query error:', error.message);
-    }
+    if (txError) throw txError;
 
-    // ==================== 2. PLATFORM FEES (15%) ====================
+    // Get matches in period
+    const { data: matches, error: matchError } = await supabase
+      .from('matches')
+      .select('stake_amount, status, created_at')
+      .gte('created_at', startDate.toISOString());
 
-    // Get Match Stakes (for platform fee calculation - 15%)
-    let matchStakes = 0;
-    let matchPlatformFees = 0;
-    try {
-      const matchStakesResult = await db.execute(`
-        SELECT COALESCE(SUM(stake_amount), 0) as total_stake
-        FROM matches 
-        WHERE status = 'completed'
-          AND created_at >= NOW() - INTERVAL '${intervalValue}'
-          AND stake_amount > 0
-      `);
-      const stakes = matchStakesResult.rows ? matchStakesResult.rows[0] : (matchStakesResult[0] ? matchStakesResult[0][0] : {});
-      matchStakes = parseFloat(stakes.total_stake) || 0;
-      matchPlatformFees = matchStakes * 0.15;
-    } catch (error) {
-      console.warn('⚠️ Match stakes query error:', error.message);
-    }
+    if (matchError) throw matchError;
 
-    // Get Tournament Entry Fees (for platform fee calculation - 15%)
-    let tournamentFees = 0;
-    let tournamentPlatformFees = 0;
-    try {
-      const tournamentFeesResult = await db.execute(`
-        SELECT COALESCE(SUM(xp_entry_fee), 0) as total_entry_fees
-        FROM tournaments 
-        WHERE status IN ('ongoing', 'completed')
-          AND created_at >= NOW() - INTERVAL '${intervalValue}'
-          AND xp_entry_fee > 0
-      `);
-      const fees = tournamentFeesResult.rows ? tournamentFeesResult.rows[0] : (tournamentFeesResult[0] ? tournamentFeesResult[0][0] : {});
-      tournamentFees = parseFloat(fees.total_entry_fees) || 0;
-      tournamentPlatformFees = tournamentFees * 0.15;
-    } catch (error) {
-      console.warn('⚠️ Tournament fees query error:', error.message);
-    }
+    // Get tournaments in period
+    const { data: tournaments, error: tourError } = await supabase
+      .from('tournaments')
+      .select('xp_entry_fee, status, created_at')
+      .gte('created_at', startDate.toISOString())
+      .in('status', ['ongoing', 'completed']);
 
-    // Calculate Total Platform Fees
+    if (tourError) throw tourError;
+
+    // Get users in period
+    const { data: users, error: userError } = await supabase
+      .from('users')
+      .select('created_at')
+      .gte('created_at', startDate.toISOString());
+
+    if (userError) throw userError;
+
+    // Get active users (last 7 days)
+    const sevenDaysAgo = new Date();
+    sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
+    
+    const { data: activeUsersData, error: activeError } = await supabase
+      .from('matches')
+      .select('player1_id, player2_id')
+      .gte('created_at', sevenDaysAgo.toISOString());
+
+    if (activeError) throw activeError;
+
+    const activeUserIds = new Set();
+    (activeUsersData || []).forEach(match => {
+      activeUserIds.add(match.player1_id);
+      if (match.player2_id) activeUserIds.add(match.player2_id);
+    });
+
+    // Calculate totals
+    const deposits = transactions?.filter(tx => tx.type === 'deposit') || [];
+    const withdrawals = transactions?.filter(tx => tx.type === 'withdrawal') || [];
+    
+    const totalDeposits = deposits.reduce((sum, tx) => sum + parseFloat(tx.amount), 0);
+    const totalWithdrawals = withdrawals.reduce((sum, tx) => sum + parseFloat(tx.amount), 0);
+
+    // Calculate platform fees
+    const completedMatches = matches?.filter(m => m.status === 'completed') || [];
+    const matchStakes = completedMatches.reduce((sum, m) => sum + (parseFloat(m.stake_amount) || 0), 0);
+    const matchPlatformFees = matchStakes * 0.15;
+    
+    const tournamentFees = tournaments?.reduce((sum, t) => sum + (parseFloat(t.xp_entry_fee) || 0), 0) || 0;
+    const tournamentPlatformFees = tournamentFees * 0.15;
+    
     const totalPlatformFees = matchPlatformFees + tournamentPlatformFees;
 
-    // ==================== 3. USER STATISTICS ====================
-
-    let userStats = { total_users: 0, active_users_7d: 0 };
-    try {
-      // Get total users (created in period)
-      const totalUsersResult = await db.execute(`
-        SELECT COUNT(*) as total_users
-        FROM users 
-        WHERE created_at >= NOW() - INTERVAL '${intervalValue}'
-      `);
-      const totalUsers = totalUsersResult.rows ? totalUsersResult.rows[0] : (totalUsersResult[0] ? totalUsersResult[0][0] : {});
-
-      // Get active users (users with any activity in last 7 days)
-      const activeUsersResult = await db.execute(`
-        SELECT COUNT(DISTINCT user_id) as active_users
-        FROM (
-          SELECT player1_id as user_id FROM matches WHERE created_at >= NOW() - INTERVAL '7 days'
-          UNION
-          SELECT player2_id as user_id FROM matches WHERE created_at >= NOW() - INTERVAL '7 days' AND player2_id IS NOT NULL
-          UNION
-          SELECT user_id FROM transactions WHERE created_at >= NOW() - INTERVAL '7 days'
-          UNION
-          SELECT creator_id as user_id FROM tournaments WHERE created_at >= NOW() - INTERVAL '7 days'
-          UNION
-          SELECT user_id FROM group_members WHERE created_at >= NOW() - INTERVAL '7 days'
-        ) as recent_activity
-      `);
-      const activeUsers = activeUsersResult.rows ? activeUsersResult.rows[0] : (activeUsersResult[0] ? activeUsersResult[0][0] : {});
-
-      userStats = {
-        total_users: parseInt(totalUsers.total_users) || 0,
-        active_users_7d: parseInt(activeUsers.active_users) || 0
-      };
-    } catch (error) {
-      console.warn('⚠️ User stats query error:', error.message);
+    // Get revenue trend
+    const revenueTrend = [];
+    const days = intervalDays > 90 ? 7 : 1;
+    let currentDate = new Date(startDate);
+    
+    while (currentDate <= new Date()) {
+      const dateStr = currentDate.toISOString().split('T')[0];
+      const dayDeposits = deposits.filter(tx => tx.created_at?.split('T')[0] === dateStr)
+        .reduce((sum, tx) => sum + parseFloat(tx.amount), 0);
+      const dayWithdrawals = withdrawals.filter(tx => tx.created_at?.split('T')[0] === dateStr)
+        .reduce((sum, tx) => sum + parseFloat(tx.amount), 0);
+      
+      revenueTrend.push({
+        period: dateStr,
+        deposits: dayDeposits,
+        withdrawals: dayWithdrawals
+      });
+      
+      currentDate.setDate(currentDate.getDate() + days);
     }
 
-    // ==================== 4. MATCH STATISTICS ====================
+    // Get top games
+    const { data: gameStats, error: gameError } = await supabase
+      .from('matches')
+      .select('game, stake_amount')
+      .gte('created_at', startDate.toISOString())
+      .not('game', 'is', null);
 
-    let matchStats = { total_matches: 0, unique_players: 0 };
-    try {
-      const matchStatsResult = await db.execute(`
-        SELECT 
-          COUNT(*) as total_matches,
-          COUNT(DISTINCT player1_id) + COUNT(DISTINCT player2_id) as unique_players
-        FROM matches 
-        WHERE created_at >= NOW() - INTERVAL '${intervalValue}'
-      `);
-      const stats = matchStatsResult.rows ? matchStatsResult.rows[0] : (matchStatsResult[0] ? matchStatsResult[0][0] : {});
-      matchStats = {
-        total_matches: parseInt(stats.total_matches) || 0,
-        unique_players: parseInt(stats.unique_players) || 0
-      };
-    } catch (error) {
-      console.warn('⚠️ Match stats query error:', error.message);
-    }
+    const gameMap = new Map();
+    (gameStats || []).forEach(match => {
+      if (!gameMap.has(match.game)) {
+        gameMap.set(match.game, { count: 0, total_stake: 0 });
+      }
+      const stats = gameMap.get(match.game);
+      stats.count++;
+      stats.total_stake += parseFloat(match.stake_amount) || 0;
+    });
 
-    // ==================== 5. TOURNAMENT STATISTICS ====================
-
-    let tournamentStats = { total_tournaments: 0, ongoing_tournaments: 0 };
-    try {
-      const tournamentStatsResult = await db.execute(`
-        SELECT 
-          COUNT(*) as total_tournaments,
-          COUNT(CASE WHEN status = 'ongoing' THEN 1 END) as ongoing_tournaments
-        FROM tournaments 
-        WHERE created_at >= NOW() - INTERVAL '${intervalValue}'
-      `);
-      const stats = tournamentStatsResult.rows ? tournamentStatsResult.rows[0] : (tournamentStatsResult[0] ? tournamentStatsResult[0][0] : {});
-      tournamentStats = {
-        total_tournaments: parseInt(stats.total_tournaments) || 0,
-        ongoing_tournaments: parseInt(stats.ongoing_tournaments) || 0
-      };
-    } catch (error) {
-      console.warn('⚠️ Tournament stats query error:', error.message);
-    }
-
-    // ==================== 6. PENDING WITHDRAWALS ====================
-
-    let pendingWithdrawals = { count: 0, total_amount: 0 };
-    try {
-      const pendingResult = await db.execute(`
-        SELECT COUNT(*) as count, COALESCE(SUM(amount), 0) as total_amount
-        FROM withdrawal_requests 
-        WHERE status = 'pending'
-          AND created_at >= NOW() - INTERVAL '${intervalValue}'
-      `);
-      const pending = pendingResult.rows ? pendingResult.rows[0] : (pendingResult[0] ? pendingResult[0][0] : {});
-      pendingWithdrawals = {
-        count: parseInt(pending.count) || 0,
-        total_amount: parseFloat(pending.total_amount) || 0
-      };
-    } catch (error) {
-      console.warn('⚠️ Pending withdrawals query error:', error.message);
-    }
-
-    // ==================== 7. REVENUE TREND ====================
-
-    let revenueTrend = [];
-    try {
-      const trendResult = await db.execute(`
-        SELECT 
-          TO_CHAR(created_at, $1) as period,
-          SUM(CASE WHEN type = 'deposit' THEN amount ELSE 0 END) as deposits,
-          SUM(CASE WHEN type = 'withdrawal' THEN amount ELSE 0 END) as withdrawals
-        FROM transactions 
-        WHERE status = 'completed'
-          AND created_at >= NOW() - INTERVAL '${intervalValue}'
-        GROUP BY TO_CHAR(created_at, $1)
-        ORDER BY period
-      `, [format]);
-      revenueTrend = trendResult.rows || trendResult[0] || [];
-    } catch (error) {
-      console.warn('⚠️ Revenue trend query error:', error.message);
-    }
-
-    // ==================== 8. TOP GAMES ====================
-
-    let topGames = [];
-    try {
-      const gamesResult = await db.execute(`
-        SELECT 
-          COALESCE(game, 'Unknown') as game,
-          COUNT(*) as match_count,
-          COALESCE(SUM(stake_amount), 0) as total_stake
-        FROM matches 
-        WHERE created_at >= NOW() - INTERVAL '${intervalValue}'
-        GROUP BY COALESCE(game, 'Unknown')
-        ORDER BY match_count DESC
-        LIMIT 5
-      `);
-      topGames = gamesResult.rows || gamesResult[0] || [];
-    } catch (error) {
-      console.warn('⚠️ Top games query error:', error.message);
-    }
-
-    // ==================== 9. CALCULATE NET REVENUE ====================
-
-    const netRevenue = totalDeposits - totalWithdrawals + totalPlatformFees;
-
-    // ==================== 10. GROUP STATISTICS ====================
-
-    let groupStats = { total_groups: 0, active_groups: 0 };
-    try {
-      const groupsResult = await db.execute(`
-        SELECT 
-          COUNT(*) as total_groups,
-          COUNT(DISTINCT gm.group_id) as active_groups
-        FROM groups g
-        LEFT JOIN group_members gm ON g.id = gm.group_id 
-          AND gm.created_at >= NOW() - INTERVAL '7 days'
-        WHERE g.created_at >= NOW() - INTERVAL '${intervalValue}'
-      `);
-      const groups = groupsResult.rows ? groupsResult.rows[0] : (groupsResult[0] ? groupsResult[0][0] : {});
-      groupStats = {
-        total_groups: parseInt(groups.total_groups) || 0,
-        active_groups: parseInt(groups.active_groups) || 0
-      };
-    } catch (error) {
-      console.warn('⚠️ Group stats query error:', error.message);
-    }
-
-    // ==================== 11. RESPONSE ====================
+    const topGames = Array.from(gameMap.entries())
+      .map(([game, stats]) => ({
+        game,
+        match_count: stats.count,
+        total_stake: stats.total_stake
+      }))
+      .sort((a, b) => b.match_count - a.match_count)
+      .slice(0, 5);
 
     res.json({
       success: true,
       analytics: {
         period,
         summary: {
-          // Financial
           total_deposits: totalDeposits,
           total_withdrawals: totalWithdrawals,
-          net_revenue: netRevenue,
-          
-          // Platform Fees
+          net_revenue: totalDeposits - totalWithdrawals + totalPlatformFees,
           platform_fees: totalPlatformFees,
           match_stakes: matchStakes,
           tournament_fees: tournamentFees,
-          
-          // User Statistics
-          total_users: userStats.total_users,
-          active_users: userStats.active_users_7d,
-          
-          // Activity Statistics
-          total_matches: matchStats.total_matches,
-          total_tournaments: tournamentStats.total_tournaments,
-          ongoing_tournaments: tournamentStats.ongoing_tournaments,
-          total_groups: groupStats.total_groups,
-          active_groups: groupStats.active_groups,
-          
-          // Withdrawals
-          pending_withdrawals: pendingWithdrawals.count,
-          pending_withdrawal_amount: pendingWithdrawals.total_amount,
-          
-          // Other
-          unique_players: matchStats.unique_players
+          total_users: users?.length || 0,
+          active_users: activeUserIds.size,
+          total_matches: matches?.length || 0,
+          total_tournaments: tournaments?.length || 0,
+          ongoing_tournaments: tournaments?.filter(t => t.status === 'ongoing').length || 0,
+          total_groups: 0,
+          active_groups: 0,
+          pending_withdrawals: 0,
+          pending_withdrawal_amount: 0,
+          unique_players: 0
         },
         revenue_trend: revenueTrend,
         top_games: topGames,
@@ -5647,9 +5475,9 @@ router.get('/analytics', authenticateAdmin, async (req, res) => {
     });
   }
 });
-// GET /api/admin/reports/history - Get report history
-// GET /api/admin/reports/history - Get report history
-// GET /api/admin/reports/history - Get report history (FIXED VERSION)
+
+// ==================== REPORTS ENDPOINTS ====================
+
 router.get('/reports/history', authenticateAdmin, async (req, res) => {
   try {
     const { page = 1, limit = 20 } = req.query;
@@ -5657,124 +5485,52 @@ router.get('/reports/history', authenticateAdmin, async (req, res) => {
 
     console.log('📋 Admin: Fetching report history - Page:', page, 'Limit:', limit);
 
-    // Try to get real reports from database
-    try {
-      // First check if table exists by getting total count
-      const totalResult = await db.execute(`
-        SELECT COUNT(*) as total_count
-        FROM admin_reports
-      `);
-      
-      const total = totalResult.rows ? parseInt(totalResult.rows[0]?.total_count) : 
-                   (totalResult[0] ? parseInt(totalResult[0][0]?.total_count) : 0);
+    // Check if admin_reports table exists
+    const { data: reports, error, count } = await supabase
+      .from('admin_reports')
+      .select('*', { count: 'exact' })
+      .order('created_at', { ascending: false })
+      .range(offset, offset + limit - 1);
 
-      // Get paginated reports
-      const reportsResult = await db.execute(`
-        SELECT 
-          id,
-          admin_id,
-          report_type,
-          start_date,
-          end_date,
-          format,
-          filename,
-          record_count,
-          COALESCE(download_count, 0) as download_count,
-          COALESCE(status, 'completed') as status,
-          created_at
-        FROM admin_reports 
-        ORDER BY created_at DESC 
-        LIMIT $1 OFFSET $2
-      `, [limit, offset]);
-
-      const reports = reportsResult.rows || reportsResult[0] || [];
-
-      // Format dates properly
-      const formattedReports = reports.map(report => ({
-        id: report.id,
-        name: report.filename?.replace(/_/g, ' ') || `${report.report_type} Report`,
-        type: report.report_type,
-        created_at: report.created_at,
-        start_date: report.start_date,
-        end_date: report.end_date,
-        format: report.format,
-        filename: report.filename,
-        record_count: report.record_count,
-        download_count: report.download_count,
-        status: report.status
-      }));
-
-      res.json({
+    if (error) {
+      // Table might not exist, create it
+      console.warn('Reports table might not exist:', error.message);
+      return res.json({
         success: true,
-        reports: formattedReports,
+        reports: [],
         pagination: {
           page: parseInt(page),
           limit: parseInt(limit),
-          total: total,
-          totalPages: Math.ceil(total / limit)
+          total: 0,
+          totalPages: 0
         }
       });
-
-    } catch (dbError) {
-      console.warn('⚠️ Reports table might not exist, creating it...:', dbError.message);
-      
-      // If table doesn't exist, create it
-      try {
-        await db.execute(`
-          CREATE TABLE IF NOT EXISTS admin_reports (
-            id VARCHAR(100) PRIMARY KEY,
-            admin_id VARCHAR(100),
-            report_type VARCHAR(50),
-            start_date DATE,
-            end_date DATE,
-            format VARCHAR(10),
-            filename VARCHAR(255),
-            record_count INTEGER,
-            download_count INTEGER DEFAULT 0,
-            status VARCHAR(20) DEFAULT 'completed',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-          )
-        `);
-
-        // Also create activity logs table
-        await db.execute(`
-          CREATE TABLE IF NOT EXISTS admin_activity_logs (
-            id SERIAL PRIMARY KEY,
-            admin_id VARCHAR(100),
-            action_type VARCHAR(50),
-            description TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-          )
-        `);
-
-        // Return empty array for now
-        res.json({
-          success: true,
-          reports: [],
-          pagination: {
-            page: parseInt(page),
-            limit: parseInt(limit),
-            total: 0,
-            totalPages: 0
-          }
-        });
-
-      } catch (createError) {
-        console.error('❌ Failed to create tables:', createError.message);
-        
-        // Return empty array as fallback
-        res.json({
-          success: true,
-          reports: [],
-          pagination: {
-            page: parseInt(page),
-            limit: parseInt(limit),
-            total: 0,
-            totalPages: 0
-          }
-        });
-      }
     }
+
+    const formattedReports = (reports || []).map(report => ({
+      id: report.id,
+      name: report.filename?.replace(/_/g, ' ') || `${report.report_type} Report`,
+      type: report.report_type,
+      created_at: report.created_at,
+      start_date: report.start_date,
+      end_date: report.end_date,
+      format: report.format,
+      filename: report.filename,
+      record_count: report.record_count,
+      download_count: report.download_count,
+      status: report.status
+    }));
+
+    res.json({
+      success: true,
+      reports: formattedReports,
+      pagination: {
+        page: parseInt(page),
+        limit: parseInt(limit),
+        total: count || 0,
+        totalPages: Math.ceil((count || 0) / limit)
+      }
+    });
 
   } catch (error) {
     console.error('❌ Get report history error:', error);
@@ -5784,7 +5540,8 @@ router.get('/reports/history', authenticateAdmin, async (req, res) => {
       error: process.env.NODE_ENV === 'development' ? error.message : undefined
     });
   }
-});// POST /api/admin/reports/generate - Generate report
+});
+
 router.post('/reports/generate', authenticateAdmin, async (req, res) => {
   try {
     const { type, startDate, endDate, format = 'json' } = req.body;
@@ -5799,177 +5556,196 @@ router.post('/reports/generate', authenticateAdmin, async (req, res) => {
       });
     }
 
-    // Generate report based on type
     let reportData = [];
     let filename = '';
 
     switch(type) {
       case 'users':
-        const usersResult = await db.execute(`
-          SELECT 
-            u.*,
-            COUNT(DISTINCT m.id) as total_matches,
-            COUNT(DISTINCT tp.tournament_id) as total_tournaments,
-            COUNT(DISTINCT gm.group_id) as total_groups,
-            COALESCE(SUM(CASE WHEN t.type = 'deposit' THEN t.amount ELSE 0 END), 0) as total_deposits,
-            COALESCE(SUM(CASE WHEN t.type = 'withdrawal' THEN t.amount ELSE 0 END), 0) as total_withdrawals
-          FROM users u
-          LEFT JOIN matches m ON (m.player1_id = u.id OR m.player2_id = u.id) AND m.created_at BETWEEN $1 AND $2
-          LEFT JOIN tournament_participants tp ON tp.user_id = u.id AND tp.created_at BETWEEN $1 AND $2
-          LEFT JOIN group_members gm ON gm.user_id = u.id AND gm.created_at BETWEEN $1 AND $2
-          LEFT JOIN transactions t ON t.user_id = u.id AND t.created_at BETWEEN $1 AND $2
-          WHERE u.created_at BETWEEN $1 AND $2
-          GROUP BY u.id
-          ORDER BY u.created_at DESC
-        `, [startDate, endDate]);
+        const { data: users, error: uError } = await supabase
+          .from('users')
+          .select(`
+            *,
+            matches:matches!matches_player1_id_fkey (id),
+            tournament_participants (tournament_id),
+            group_members (group_id),
+            transactions (amount, type)
+          `)
+          .gte('created_at', startDate)
+          .lte('created_at', endDate);
+
+        if (uError) throw uError;
         
-        reportData = usersResult.rows || usersResult[0] || [];
+        reportData = (users || []).map(u => ({
+          ...u,
+          total_matches: u.matches?.length || 0,
+          total_tournaments: u.tournament_participants?.length || 0,
+          total_groups: u.group_members?.length || 0,
+          total_deposits: u.transactions?.filter(tx => tx.type === 'deposit').reduce((sum, tx) => sum + parseFloat(tx.amount), 0) || 0,
+          total_withdrawals: u.transactions?.filter(tx => tx.type === 'withdrawal').reduce((sum, tx) => sum + parseFloat(tx.amount), 0) || 0
+        }));
         filename = `users_report_${startDate}_to_${endDate}`;
         break;
 
       case 'transactions':
-        const transactionsResult = await db.execute(`
-          SELECT 
-            t.*,
-            u.username,
-            u.email,
-            u.wallet_account_number
-          FROM transactions t
-          JOIN users u ON t.user_id = u.id
-          WHERE t.created_at BETWEEN $1 AND $2
-          ORDER BY t.created_at DESC
-        `, [startDate, endDate]);
-        
-        reportData = transactionsResult.rows || transactionsResult[0] || [];
+        const { data: transactions, error: tError } = await supabase
+          .from('transactions')
+          .select(`
+            *,
+            users (username, email, wallet_account_number)
+          `)
+          .gte('created_at', startDate)
+          .lte('created_at', endDate)
+          .order('created_at', { ascending: false });
+
+        if (tError) throw tError;
+        reportData = transactions || [];
         filename = `transactions_report_${startDate}_to_${endDate}`;
         break;
 
       case 'tournaments':
-        const tournamentsResult = await db.execute(`
-          SELECT 
-            t.*,
-            u.username as creator_username,
-            COUNT(DISTINCT tp.id) as participants_count,
-            COUNT(DISTINCT tm.id) as matches_count
-          FROM tournaments t
-          LEFT JOIN users u ON t.creator_id = u.id
-          LEFT JOIN tournament_participants tp ON t.id = tp.tournament_id
-          LEFT JOIN tournament_matches tm ON t.id = tm.tournament_id
-          WHERE t.created_at BETWEEN $1 AND $2
-          GROUP BY t.id, u.username
-          ORDER BY t.created_at DESC
-        `, [startDate, endDate]);
+        const { data: tournaments, error: tourError } = await supabase
+          .from('tournaments')
+          .select(`
+            *,
+            creator:creator_id (username),
+            tournament_participants (id),
+            tournament_matches (id)
+          `)
+          .gte('created_at', startDate)
+          .lte('created_at', endDate)
+          .order('created_at', { ascending: false });
+
+        if (tourError) throw tourError;
         
-        reportData = tournamentsResult.rows || tournamentsResult[0] || [];
+        reportData = (tournaments || []).map(t => ({
+          ...t,
+          creator_username: t.creator?.username,
+          participants_count: t.tournament_participants?.length || 0,
+          matches_count: t.tournament_matches?.length || 0
+        }));
         filename = `tournaments_report_${startDate}_to_${endDate}`;
         break;
 
       case 'groups':
-        const groupsResult = await db.execute(`
-          SELECT 
-            g.*,
-            u.username as creator_username,
-            COUNT(DISTINCT gm.user_id) as members_count
-          FROM groups g
-          LEFT JOIN users u ON g.creator_id = u.id
-          LEFT JOIN group_members gm ON g.id = gm.group_id
-          WHERE g.created_at BETWEEN $1 AND $2
-          GROUP BY g.id, u.username
-          ORDER BY g.created_at DESC
-        `, [startDate, endDate]);
+        const { data: groups, error: gError } = await supabase
+          .from('groups')
+          .select(`
+            *,
+            creator:creator_id (username),
+            group_members (user_id)
+          `)
+          .gte('created_at', startDate)
+          .lte('created_at', endDate)
+          .order('created_at', { ascending: false });
+
+        if (gError) throw gError;
         
-        reportData = groupsResult.rows || groupsResult[0] || [];
+        reportData = (groups || []).map(g => ({
+          ...g,
+          creator_username: g.creator?.username,
+          members_count: g.group_members?.length || 0
+        }));
         filename = `groups_report_${startDate}_to_${endDate}`;
         break;
 
-      case 'financial': // ADD THIS NEW CASE
-    const financialResult = await db.execute(`
-      SELECT 
-        t.*,
-        u.username,
-        u.email,
-        u.wallet_account_number,
-        CASE 
-          WHEN t.type = 'deposit' THEN 'Revenue'
-          WHEN t.type = 'withdrawal' THEN 'Payout'
-          ELSE t.type
-        END as category,
-        CASE 
-          WHEN t.type = 'deposit' THEN t.amount
-          WHEN t.type = 'withdrawal' THEN -t.amount
-          ELSE t.amount
-        END as net_amount
-      FROM transactions t
-      JOIN users u ON t.user_id = u.id
-      WHERE t.created_at BETWEEN $1 AND $2
-        AND t.status = 'completed'
-      ORDER BY t.created_at DESC
-    `, [startDate, endDate]);
-    
-    // Also get platform fees
-    const platformFeesResult = await db.execute(`
-      SELECT 
-        'Platform Fee' as category,
-        m.stake_amount * 0.15 as amount,
-        m.created_at,
-        'Match' as source_type,
-        m.id as source_id
-      FROM matches m
-      WHERE m.created_at BETWEEN $1 AND $2
-        AND m.status = 'completed'
-        AND m.stake_amount > 0
-      
-      UNION ALL
-      
-      SELECT 
-        'Tournament Fee' as category,
-        t.xp_entry_fee * 0.15 as amount,
-        t.created_at,
-        'Tournament' as source_type,
-        t.id as source_id
-      FROM tournaments t
-      WHERE t.created_at BETWEEN $1 AND $2
-        AND t.status IN ('ongoing', 'completed')
-        AND t.xp_entry_fee > 0
-    `, [startDate, endDate]);
-    
-    reportData = [...(financialResult.rows || financialResult[0] || []), 
-                  ...(platformFeesResult.rows || platformFeesResult[0] || [])];
-    filename = `financial_report_${startDate}_to_${endDate}`;
-    break;
+      case 'financial':
+        const { data: financialTx, error: fError } = await supabase
+          .from('transactions')
+          .select(`
+            *,
+            users (username, email, wallet_account_number)
+          `)
+          .gte('created_at', startDate)
+          .lte('created_at', endDate)
+          .eq('status', 'completed');
 
-  default:
-    return res.status(400).json({
-      success: false,
-      message: 'Invalid report type. Available: users, transactions, tournaments, groups, financial' // Updated
-    });
-}
+        if (fError) throw fError;
 
-    // Save report to database (if table exists)
+        const financialData = (financialTx || []).map(tx => ({
+          ...tx,
+          category: tx.type === 'deposit' ? 'Revenue' : tx.type === 'withdrawal' ? 'Payout' : tx.type,
+          net_amount: tx.type === 'deposit' ? tx.amount : tx.type === 'withdrawal' ? -tx.amount : tx.amount
+        }));
+
+        // Get platform fees
+        const { data: platformFeesMatches, error: pfError } = await supabase
+          .from('matches')
+          .select('stake_amount, created_at, id')
+          .gte('created_at', startDate)
+          .lte('created_at', endDate)
+          .eq('status', 'completed')
+          .gt('stake_amount', 0);
+
+        const { data: platformFeesTournaments, error: pftError } = await supabase
+          .from('tournaments')
+          .select('xp_entry_fee, created_at, id')
+          .gte('created_at', startDate)
+          .lte('created_at', endDate)
+          .in('status', ['ongoing', 'completed'])
+          .gt('xp_entry_fee', 0);
+
+        const feesData = [
+          ...(platformFeesMatches || []).map(m => ({
+            category: 'Platform Fee',
+            amount: m.stake_amount * 0.15,
+            created_at: m.created_at,
+            source_type: 'Match',
+            source_id: m.id
+          })),
+          ...(platformFeesTournaments || []).map(t => ({
+            category: 'Tournament Fee',
+            amount: t.xp_entry_fee * 0.15,
+            created_at: t.created_at,
+            source_type: 'Tournament',
+            source_id: t.id
+          }))
+        ];
+
+        reportData = [...financialData, ...feesData];
+        filename = `financial_report_${startDate}_to_${endDate}`;
+        break;
+
+      default:
+        return res.status(400).json({
+          success: false,
+          message: 'Invalid report type. Available: users, transactions, tournaments, groups, financial'
+        });
+    }
+
+    // Save report to database
     const reportId = `report_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
     
     try {
-      await db.execute(
-        `INSERT INTO admin_reports 
-         (id, admin_id, report_type, start_date, end_date, format, filename, record_count, created_at) 
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())`,
-        [reportId, adminId, type, startDate, endDate, format, filename, reportData.length]
-      );
+      await supabase
+        .from('admin_reports')
+        .insert({
+          id: reportId,
+          admin_id: adminId,
+          report_type: type,
+          start_date: startDate,
+          end_date: endDate,
+          format: format,
+          filename: filename,
+          record_count: reportData.length,
+          status: 'completed',
+          created_at: new Date().toISOString()
+        });
     } catch (saveError) {
       console.warn('⚠️ Could not save report to database:', saveError.message);
     }
 
     // Log activity
-    await db.execute(
-      `INSERT INTO admin_activity_logs 
-       (admin_id, action_type, description, created_at) 
-       VALUES ($1, 'report_generate', $2, NOW())`,
-      [adminId, `Generated ${type} report from ${startDate} to ${endDate}`]
-    );
+    await supabase
+      .from('admin_activity_logs')
+      .insert({
+        admin_id: adminId,
+        action_type: 'report_generate',
+        description: `Generated ${type} report from ${startDate} to ${endDate}`,
+        created_at: new Date().toISOString()
+      });
 
     // Return report data
     if (format === 'csv') {
-      // Convert to CSV (simplified)
       const csv = convertToCSV(reportData);
       res.setHeader('Content-Type', 'text/csv');
       res.setHeader('Content-Disposition', `attachment; filename="${filename}.csv"`);
@@ -5999,55 +5775,26 @@ router.post('/reports/generate', authenticateAdmin, async (req, res) => {
     });
   }
 });
-// Helper function to convert data to CSV
-function convertToCSV(data) {
-  if (!data || data.length === 0) return '';
-  
-  const headers = Object.keys(data[0]);
-  const csvRows = [];
-  
-  // Add headers
-  csvRows.push(headers.join(','));
-  
-  // Add data rows
-  for (const row of data) {
-    const values = headers.map(header => {
-      const value = row[header];
-      // Escape commas and quotes
-      if (value === null || value === undefined) return '';
-      const escaped = String(value).replace(/"/g, '""');
-      return `"${escaped}"`;
-    });
-    csvRows.push(values.join(','));
-  }
-  
-  return csvRows.join('\n');
-}
 
-// GET /api/admin/reports/:id - Get report by ID
 router.get('/reports/:id', authenticateAdmin, async (req, res) => {
   try {
     const { id } = req.params;
 
     console.log('📋 Admin: Fetching report:', id);
 
-    // Check if reports table exists
-    let report = null;
-    
-    try {
-      const { rows: reports } = await db.query(
-        'SELECT * FROM admin_reports WHERE id = $1',
-        [id]
-      );
-      
-      if (reports.length > 0) {
-        report = reports[0];
-      }
-    } catch (tableError) {
-      console.warn('⚠️ Reports table not found:', tableError.message);
+    const { data: reports, error } = await supabase
+      .from('admin_reports')
+      .select('*')
+      .eq('id', id);
+
+    if (error) {
+      return res.status(404).json({
+        success: false,
+        message: 'Report not found'
+      });
     }
 
-    if (!report) {
+    if (!reports || reports.length === 0) {
       return res.status(404).json({
         success: false,
         message: 'Report not found'
@@ -6056,7 +5803,7 @@ router.get('/reports/:id', authenticateAdmin, async (req, res) => {
 
     res.json({
       success: true,
-      report
+      report: reports[0]
     });
 
   } catch (error) {
@@ -6068,7 +5815,6 @@ router.get('/reports/:id', authenticateAdmin, async (req, res) => {
   }
 });
 
-// GET /api/admin/reports/types - Get available report types
 router.get('/reports/types', authenticateAdmin, async (req, res) => {
   try {
     console.log('📋 Admin: Fetching report types');
@@ -6097,6 +5843,12 @@ router.get('/reports/types', authenticateAdmin, async (req, res) => {
         name: 'Groups Report',
         description: 'Group information and membership',
         fields: ['id', 'name', 'visibility', 'creator_id', 'members_count', 'game_specialty', 'created_at']
+      },
+      {
+        id: 'financial',
+        name: 'Financial Report',
+        description: 'Revenue, payouts, and platform fees',
+        fields: ['id', 'type', 'amount', 'category', 'net_amount', 'created_at', 'user_id']
       }
     ];
 
@@ -6114,53 +5866,6 @@ router.get('/reports/types', authenticateAdmin, async (req, res) => {
   }
 });
 
-// Add these routes to your existing admin routes:
-
-// GET /api/admin/reports/:id - Get report details
-router.get('/reports/:id', authenticateAdmin, async (req, res) => {
-  try {
-    const { id } = req.params;
-
-    console.log('📋 Admin: Fetching report details:', id);
-
-    // Try to get report from database
-    let report = null;
-    try {
-      const reportResult = await db.execute(
-        'SELECT * FROM admin_reports WHERE id = $1',
-        [id]
-      );
-      
-      const reports = reportResult.rows || reportResult[0] || [];
-      report = reports[0];
-    } catch (dbError) {
-      console.warn('⚠️ Could not fetch report from database:', dbError.message);
-    }
-
-    if (!report) {
-      // Return report not found but still success
-      return res.json({
-        success: true,
-        message: 'Report details retrieved from history',
-        report: null
-      });
-    }
-
-    res.json({
-      success: true,
-      report
-    });
-
-  } catch (error) {
-    console.error('❌ Get report error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Failed to fetch report details'
-    });
-  }
-});
-
-// GET /api/admin/reports/:id/download - Download report
 router.get('/reports/:id/download', authenticateAdmin, async (req, res) => {
   try {
     const { id } = req.params;
@@ -6170,12 +5875,12 @@ router.get('/reports/:id/download', authenticateAdmin, async (req, res) => {
     console.log('📥 Admin: Downloading report:', id, 'Format:', format);
 
     // Get report from database
-    const [reports] = await db.execute(
-      'SELECT * FROM admin_reports WHERE id = $1',
-      [id]
-    );
+    const { data: reports, error: reportError } = await supabase
+      .from('admin_reports')
+      .select('*')
+      .eq('id', id);
 
-    if (reports.length === 0) {
+    if (reportError || !reports || reports.length === 0) {
       return res.status(404).json({
         success: false,
         message: 'Report not found'
@@ -6185,102 +5890,130 @@ router.get('/reports/:id/download', authenticateAdmin, async (req, res) => {
     const report = reports[0];
 
     // Update download count
-    await db.execute(
-      'UPDATE admin_reports SET download_count = download_count + 1 WHERE id = $1',
-      [id]
-    );
+    await supabase
+      .from('admin_reports')
+      .update({ download_count: (report.download_count || 0) + 1 })
+      .eq('id', id);
 
-    // Generate report data (same logic as POST /reports/generate)
+    // Generate report data
     let reportData = [];
-    let query = '';
 
     switch(report.report_type) {
       case 'users':
-        query = `
-          SELECT 
-            u.*,
-            COUNT(DISTINCT m.id) as total_matches,
-            COUNT(DISTINCT tp.tournament_id) as total_tournaments,
-            COUNT(DISTINCT gm.group_id) as total_groups,
-            COALESCE(SUM(CASE WHEN t.type = 'deposit' THEN t.amount ELSE 0 END), 0) as total_deposits,
-            COALESCE(SUM(CASE WHEN t.type = 'withdrawal' THEN t.amount ELSE 0 END), 0) as total_withdrawals
-          FROM users u
-          LEFT JOIN matches m ON (m.player1_id = u.id OR m.player2_id = u.id) AND m.created_at BETWEEN $1 AND $2
-          LEFT JOIN tournament_participants tp ON tp.user_id = u.id AND tp.created_at BETWEEN $1 AND $2
-          LEFT JOIN group_members gm ON gm.user_id = u.id AND gm.created_at BETWEEN $1 AND $2
-          LEFT JOIN transactions t ON t.user_id = u.id AND t.created_at BETWEEN $1 AND $2
-          WHERE u.created_at BETWEEN $1 AND $2
-          GROUP BY u.id
-          ORDER BY u.created_at DESC
-        `;
+        const { data: users, error: uError } = await supabase
+          .from('users')
+          .select(`
+            *,
+            matches:matches!matches_player1_id_fkey (id),
+            tournament_participants (tournament_id),
+            group_members (group_id),
+            transactions (amount, type)
+          `)
+          .gte('created_at', report.start_date)
+          .lte('created_at', report.end_date);
+
+        if (!uError && users) {
+          reportData = users.map(u => ({
+            ...u,
+            total_matches: u.matches?.length || 0,
+            total_tournaments: u.tournament_participants?.length || 0,
+            total_groups: u.group_members?.length || 0,
+            total_deposits: u.transactions?.filter(tx => tx.type === 'deposit').reduce((sum, tx) => sum + parseFloat(tx.amount), 0) || 0,
+            total_withdrawals: u.transactions?.filter(tx => tx.type === 'withdrawal').reduce((sum, tx) => sum + parseFloat(tx.amount), 0) || 0
+          }));
+        }
         break;
 
       case 'transactions':
-        query = `
-          SELECT 
-            t.*,
-            u.username,
-            u.email,
-            u.wallet_account_number
-          FROM transactions t
-          JOIN users u ON t.user_id = u.id
-          WHERE t.created_at BETWEEN $1 AND $2
-          ORDER BY t.created_at DESC
-        `;
+        const { data: transactions, error: tError } = await supabase
+          .from('transactions')
+          .select(`
+            *,
+            users (username, email, wallet_account_number)
+          `)
+          .gte('created_at', report.start_date)
+          .lte('created_at', report.end_date)
+          .order('created_at', { ascending: false });
+
+        if (!tError && transactions) {
+          reportData = transactions;
+        }
         break;
 
       case 'tournaments':
-        query = `
-          SELECT 
-            t.*,
-            u.username as creator_username,
-            COUNT(DISTINCT tp.id) as participants_count,
-            COUNT(DISTINCT tm.id) as matches_count
-          FROM tournaments t
-          LEFT JOIN users u ON t.creator_id = u.id
-          LEFT JOIN tournament_participants tp ON t.id = tp.tournament_id
-          LEFT JOIN tournament_matches tm ON t.id = tm.tournament_id
-          WHERE t.created_at BETWEEN $1 AND $2
-          GROUP BY t.id, u.username
-          ORDER BY t.created_at DESC
-        `;
+        const { data: tournaments, error: tourError } = await supabase
+          .from('tournaments')
+          .select(`
+            *,
+            creator:creator_id (username),
+            tournament_participants (id),
+            tournament_matches (id)
+          `)
+          .gte('created_at', report.start_date)
+          .lte('created_at', report.end_date);
+
+        if (!tourError && tournaments) {
+          reportData = tournaments.map(t => ({
+            ...t,
+            creator_username: t.creator?.username,
+            participants_count: t.tournament_participants?.length || 0,
+            matches_count: t.tournament_matches?.length || 0
+          }));
+        }
         break;
 
       case 'groups':
-        query = `
-          SELECT 
-            g.*,
-            u.username as creator_username,
-            COUNT(DISTINCT gm.user_id) as members_count
-          FROM groups g
-          LEFT JOIN users u ON g.creator_id = u.id
-          LEFT JOIN group_members gm ON g.id = gm.group_id
-          WHERE g.created_at BETWEEN $1 AND $2
-          GROUP BY g.id, u.username
-          ORDER BY g.created_at DESC
-        `;
+        const { data: groups, error: gError } = await supabase
+          .from('groups')
+          .select(`
+            *,
+            creator:creator_id (username),
+            group_members (user_id)
+          `)
+          .gte('created_at', report.start_date)
+          .lte('created_at', report.end_date);
+
+        if (!gError && groups) {
+          reportData = groups.map(g => ({
+            ...g,
+            creator_username: g.creator?.username,
+            members_count: g.group_members?.length || 0
+          }));
+        }
         break;
 
-      default:
-        return res.status(400).json({
-          success: false,
-          message: 'Invalid report type'
-        });
+      case 'financial':
+        const { data: financialTx, error: fError } = await supabase
+          .from('transactions')
+          .select(`
+            *,
+            users (username, email, wallet_account_number)
+          `)
+          .gte('created_at', report.start_date)
+          .lte('created_at', report.end_date)
+          .eq('status', 'completed');
+
+        if (!fError && financialTx) {
+          reportData = financialTx.map(tx => ({
+            ...tx,
+            category: tx.type === 'deposit' ? 'Revenue' : tx.type === 'withdrawal' ? 'Payout' : tx.type,
+            net_amount: tx.type === 'deposit' ? tx.amount : tx.type === 'withdrawal' ? -tx.amount : tx.amount
+          }));
+        }
+        break;
     }
 
-    const [data] = await db.execute(query, [report.start_date, report.end_date]);
-    reportData = data;
-
     // Log activity
-    await db.execute(
-      `INSERT INTO admin_activity_logs 
-       (admin_id, action_type, description, created_at) 
-       VALUES ($1, 'report_download', $2, NOW())`,
-      [adminId, `Downloaded ${report.report_type} report ${id}`]
-    );
+    await supabase
+      .from('admin_activity_logs')
+      .insert({
+        admin_id: adminId,
+        action_type: 'report_download',
+        description: `Downloaded ${report.report_type} report ${id}`,
+        created_at: new Date().toISOString()
+      });
 
     if (format === 'csv') {
-      // Convert to CSV
       const csv = convertToCSV(reportData);
       res.setHeader('Content-Type', 'text/csv');
       res.setHeader('Content-Disposition', `attachment; filename="${report.filename || 'report'}.csv"`);
@@ -6311,14 +6044,11 @@ function convertToCSV(data) {
   const headers = Object.keys(data[0]);
   const csvRows = [];
   
-  // Add headers
   csvRows.push(headers.join(','));
   
-  // Add data rows
   for (const row of data) {
     const values = headers.map(header => {
       const value = row[header];
-      // Escape commas and quotes
       if (value === null || value === undefined) return '';
       const escaped = String(value).replace(/"/g, '""');
       return `"${escaped}"`;
@@ -6328,126 +6058,22 @@ function convertToCSV(data) {
   
   return csvRows.join('\n');
 }
-// Helper function to generate report data
-async function generateReportData(type, startDate, endDate) {
-  let query = '';
-  let params = [startDate, endDate];
 
-  switch(type) {
-    case 'users':
-      query = `
-        SELECT 
-          u.*,
-          COUNT(DISTINCT m.id) as total_matches,
-          COUNT(DISTINCT tp.tournament_id) as total_tournaments,
-          COUNT(DISTINCT gm.group_id) as total_groups,
-          COALESCE(SUM(CASE WHEN t.type = 'deposit' THEN t.amount ELSE 0 END), 0) as total_deposits,
-          COALESCE(SUM(CASE WHEN t.type = 'withdrawal' THEN t.amount ELSE 0 END), 0) as total_withdrawals
-        FROM users u
-        LEFT JOIN matches m ON (m.player1_id = u.id OR m.player2_id = u.id) AND m.created_at BETWEEN $1 AND $2
-        LEFT JOIN tournament_participants tp ON tp.user_id = u.id AND tp.created_at BETWEEN $1 AND $2
-        LEFT JOIN group_members gm ON gm.user_id = u.id AND gm.created_at BETWEEN $1 AND $2
-        LEFT JOIN transactions t ON t.user_id = u.id AND t.created_at BETWEEN $1 AND $2
-        WHERE u.created_at BETWEEN $1 AND $2
-        GROUP BY u.id
-        ORDER BY u.created_at DESC
-      `;
-      break;
+// ==================== ADMIN MANAGEMENT ENDPOINTS ====================
 
-    case 'transactions':
-      query = `
-        SELECT 
-          t.*,
-          u.username,
-          u.email,
-          u.wallet_account_number
-        FROM transactions t
-        JOIN users u ON t.user_id = u.id
-        WHERE t.created_at BETWEEN $1 AND $2
-        ORDER BY t.created_at DESC
-      `;
-      break;
-
-    case 'tournaments':
-      query = `
-        SELECT 
-          t.*,
-          u.username as creator_username,
-          COUNT(DISTINCT tp.id) as participants_count,
-          COUNT(DISTINCT tm.id) as matches_count
-        FROM tournaments t
-        LEFT JOIN users u ON t.creator_id = u.id
-        LEFT JOIN tournament_participants tp ON t.id = tp.tournament_id
-        LEFT JOIN tournament_matches tm ON t.id = tm.tournament_id
-        WHERE t.created_at BETWEEN $1 AND $2
-        GROUP BY t.id, u.username
-        ORDER BY t.created_at DESC
-      `;
-      break;
-
-    case 'groups':
-      query = `
-        SELECT 
-          g.*,
-          u.username as creator_username,
-          COUNT(DISTINCT gm.user_id) as members_count
-        FROM groups g
-        LEFT JOIN users u ON g.creator_id = u.id
-        LEFT JOIN group_members gm ON g.id = gm.group_id
-        WHERE g.created_at BETWEEN $1 AND $2
-        GROUP BY g.id, u.username
-        ORDER BY g.created_at DESC
-      `;
-      break;
-
-    default:
-      return [];
-  }
-
-  try {
-    const result = await db.execute(query, params);
-    return result.rows || result[0] || [];
-  } catch (error) {
-    console.error('Error generating report data:', error);
-    return [];
-  }
-}
-
-// ==================== ADMIN MANAGEMENT ENDPOINTS = FIXED FOR POSTGRESQL ====================
-
-// GET /api/admin/admins - Get all admin users (FIXED)
 router.get('/admins', authenticateAdmin, async (req, res) => {
   try {
     const adminId = req.admin.id;
     console.log('👑 Admin: Fetching all admins - Requested by:', adminId);
 
-    // FIXED: PostgreSQL query with proper syntax
-    const result = await db.execute(`
-      SELECT 
-        id,
-        username,
-        email,
-        role,
-        is_active,
-        last_login,
-        created_at,
-        updated_at,
-        permissions
-      FROM admin_users 
-      ORDER BY 
-        CASE role 
-          WHEN 'super_admin' THEN 1
-          WHEN 'admin' THEN 2
-          ELSE 3 
-        END,
-        created_at DESC
-    `);
+    const { data: admins, error } = await supabase
+      .from('admin_users')
+      .select('id, username, email, role, is_active, last_login, created_at, updated_at, permissions')
+      .order('created_at', { ascending: false });
 
-    // Handle result format
-    const admins = result.rows || result[0] || [];
+    if (error) throw error;
 
-    // Parse permissions if they exist
-    const formattedAdmins = admins.map(admin => ({
+    const formattedAdmins = (admins || []).map(admin => ({
       ...admin,
       permissions: admin.permissions ? 
         (typeof admin.permissions === 'string' ? JSON.parse(admin.permissions) : admin.permissions) 
@@ -6457,7 +6083,7 @@ router.get('/admins', authenticateAdmin, async (req, res) => {
     res.json({
       success: true,
       admins: formattedAdmins,
-      count: admins.length
+      count: formattedAdmins.length
     });
 
   } catch (error) {
@@ -6470,68 +6096,41 @@ router.get('/admins', authenticateAdmin, async (req, res) => {
   }
 });
 
-// GET /api/admin/logs - Get admin activity logs (FIXED)
 router.get('/logs', authenticateAdmin, async (req, res) => {
   try {
     const { adminId = '', page = 1, limit = 50, action_type = '' } = req.query;
     const offset = (page - 1) * limit;
-    const requestingAdminId = req.admin.id;
 
     console.log('📝 Admin: Fetching admin logs - Page:', page, 'AdminId:', adminId);
 
-    // FIXED: PostgreSQL query with parameter placeholders
-    let query = `
-      SELECT 
-        al.*,
-        au.username as admin_username,
-        u.username as affected_user_username
-      FROM admin_activity_logs al
-      LEFT JOIN admin_users au ON al.admin_id = au.id
-      LEFT JOIN users u ON al.affected_user_id = u.id::text
-      WHERE 1=1
-    `;
-    
-    let countQuery = 'SELECT COUNT(*) as total FROM admin_activity_logs al WHERE 1=1';
-    const params = [];
-    const countParams = [];
-    let paramCount = 1;
+    let query = supabase
+      .from('admin_activity_logs')
+      .select(`
+        *,
+        admin_users (username),
+        users:affected_user_id (username)
+      `, { count: 'exact' });
 
     if (adminId && adminId !== '') {
-      query += ` AND al.admin_id = $${paramCount}`;
-      countQuery += ` AND al.admin_id = $${paramCount}`;
-      params.push(adminId);
-      countParams.push(adminId);
-      paramCount++;
+      query = query.eq('admin_id', adminId);
     }
 
     if (action_type && action_type !== '') {
-      query += ` AND al.action_type = $${paramCount}`;
-      countQuery += ` AND al.action_type = $${paramCount}`;
-      params.push(action_type);
-      countParams.push(action_type);
-      paramCount++;
+      query = query.eq('action_type', action_type);
     }
 
-    // Order and paginate
-    query += ` ORDER BY al.created_at DESC LIMIT $${paramCount}`;
-    params.push(parseInt(limit));
-    
-    paramCount++;
-    query += ` OFFSET $${paramCount}`;
-    params.push(parseInt(offset));
+    const { data: logs, error, count } = await query
+      .order('created_at', { ascending: false })
+      .range(offset, offset + limit - 1);
 
-    // Execute queries
-    const logsResult = await db.execute(query, params);
-    const countResult = await db.execute(countQuery, countParams);
+    if (error) throw error;
 
-    // Handle result format
-    const logs = logsResult.rows || logsResult[0] || [];
-    const countData = countResult.rows ? countResult.rows[0] : (countResult[0] ? countResult[0][0] : null);
-    const total = countData ? parseInt(countData.total) : 0;
-
-    // Parse details if they exist
-    const formattedLogs = logs.map(log => ({
+    const formattedLogs = (logs || []).map(log => ({
       ...log,
+      admin_username: log.admin_users?.username,
+      affected_user_username: log.users?.username,
+      admin_users: undefined,
+      users: undefined,
       details: log.details ? 
         (typeof log.details === 'string' ? JSON.parse(log.details) : log.details) 
         : null
@@ -6543,8 +6142,8 @@ router.get('/logs', authenticateAdmin, async (req, res) => {
       pagination: {
         page: parseInt(page),
         limit: parseInt(limit),
-        total: total,
-        totalPages: Math.ceil(total / limit)
+        total: count || 0,
+        totalPages: Math.ceil((count || 0) / limit)
       }
     });
 
@@ -6558,7 +6157,6 @@ router.get('/logs', authenticateAdmin, async (req, res) => {
   }
 });
 
-// POST /api/admin/admins - Create new admin (UPDATED TO STORE PROPER JSON)
 router.post('/admins', authenticateAdmin, async (req, res) => {
   try {
     const { username, email, password, role = 'admin', permissions = [] } = req.body;
@@ -6581,14 +6179,14 @@ router.post('/admins', authenticateAdmin, async (req, res) => {
     }
 
     // Check if username already exists
-    const existingUsernameResult = await db.execute(
-      'SELECT id FROM admin_users WHERE username = $1',
-      [username]
-    );
-    
-    const existingUsername = existingUsernameResult.rows || existingUsernameResult[0] || [];
+    const { data: existingUsername, error: uError } = await supabase
+      .from('admin_users')
+      .select('id')
+      .eq('username', username);
 
-    if (existingUsername.length > 0) {
+    if (uError) throw uError;
+
+    if (existingUsername && existingUsername.length > 0) {
       return res.status(400).json({
         success: false,
         message: 'Username already exists'
@@ -6596,14 +6194,14 @@ router.post('/admins', authenticateAdmin, async (req, res) => {
     }
 
     // Check if email already exists
-    const existingEmailResult = await db.execute(
-      'SELECT id FROM admin_users WHERE email = $1',
-      [email]
-    );
-    
-    const existingEmail = existingEmailResult.rows || existingEmailResult[0] || [];
+    const { data: existingEmail, error: eError } = await supabase
+      .from('admin_users')
+      .select('id')
+      .eq('email', email);
 
-    if (existingEmail.length > 0) {
+    if (eError) throw eError;
+
+    if (existingEmail && existingEmail.length > 0) {
       return res.status(400).json({
         success: false,
         message: 'Email already exists'
@@ -6613,58 +6211,58 @@ router.post('/admins', authenticateAdmin, async (req, res) => {
     // Hash password
     const hashedPassword = await bcrypt.hash(password, 10);
 
-    // ============ FIX: Ensure permissions is valid JSON ============
+    // Ensure permissions is valid JSON
     let permissionsJson = '[]';
     try {
       if (Array.isArray(permissions)) {
         permissionsJson = JSON.stringify(permissions);
       } else if (permissions && typeof permissions === 'string') {
-        // Try to parse it first
         const parsed = JSON.parse(permissions);
         permissionsJson = JSON.stringify(parsed);
-      } else {
-        permissionsJson = JSON.stringify([]);
       }
     } catch (error) {
       console.warn('⚠️ Could not parse permissions, using empty array:', error.message);
       permissionsJson = '[]';
     }
-    // ============ END FIX ============
-
-    console.log('🔧 Storing permissions as:', permissionsJson);
 
     // Create admin
-    const createResult = await db.execute(
-      `INSERT INTO admin_users 
-       (username, email, password_hash, role, permissions, is_active, created_at, updated_at) 
-       VALUES ($1, $2, $3, $4, $5, true, NOW(), NOW()) RETURNING id, username, email, role`,
-      [username, email, hashedPassword, role, permissionsJson]
-    );
+    const { data: newAdmin, error: createError } = await supabase
+      .from('admin_users')
+      .insert({
+        username,
+        email,
+        password_hash: hashedPassword,
+        role,
+        permissions: permissionsJson,
+        is_active: true,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString()
+      })
+      .select('id, username, email, role');
 
-    const newAdmin = createResult.rows ? createResult.rows[0] : (createResult[0] ? createResult[0][0] : null);
+    if (createError) throw createError;
 
     // Log activity
-    await db.execute(
-      `INSERT INTO admin_activity_logs 
-       (admin_id, action_type, description, details, created_at) 
-       VALUES ($1, 'admin_create', $2, $3, NOW())`,
-      [
-        adminId,
-        `Created new admin user: ${username}`,
-        JSON.stringify({
+    await supabase
+      .from('admin_activity_logs')
+      .insert({
+        admin_id: adminId,
+        action_type: 'admin_create',
+        description: `Created new admin user: ${username}`,
+        details: JSON.stringify({
           created_username: username,
           created_email: email,
           role: role,
           permissions: permissions
-        })
-      ]
-    );
+        }),
+        created_at: new Date().toISOString()
+      });
 
     res.json({
       success: true,
       message: 'Admin user created successfully',
       admin: {
-        ...newAdmin,
+        ...newAdmin?.[0],
         permissions: Array.isArray(permissions) ? permissions : []
       }
     });
@@ -6678,7 +6276,7 @@ router.post('/admins', authenticateAdmin, async (req, res) => {
     });
   }
 });
-// PUT /api/admin/admins/:id - Update admin (FIXED)
+
 router.put('/admins/:id', authenticateAdmin, async (req, res) => {
   try {
     const { id } = req.params;
@@ -6688,14 +6286,14 @@ router.put('/admins/:id', authenticateAdmin, async (req, res) => {
     console.log('👑 Admin: Updating admin:', id, 'Requested by:', adminId);
 
     // Check if admin exists
-    const adminResult = await db.execute(
-      'SELECT id, username FROM admin_users WHERE id = $1',
-      [id]
-    );
-    
-    const admins = adminResult.rows || adminResult[0] || [];
+    const { data: admins, error: checkError } = await supabase
+      .from('admin_users')
+      .select('id, username')
+      .eq('id', id);
 
-    if (admins.length === 0) {
+    if (checkError) throw checkError;
+
+    if (!admins || admins.length === 0) {
       return res.status(404).json({
         success: false,
         message: 'Admin not found'
@@ -6703,104 +6301,77 @@ router.put('/admins/:id', authenticateAdmin, async (req, res) => {
     }
 
     const admin = admins[0];
-
-    // Build update query
-    const updateFields = [];
-    const updateValues = [];
-    let paramCount = 1;
+    const updateObject = { updated_at: new Date().toISOString() };
 
     if (username !== undefined) {
-      // Check if new username already exists (excluding current admin)
-      const existingUsernameResult = await db.execute(
-        'SELECT id FROM admin_users WHERE username = $1 AND id != $2',
-        [username, id]
-      );
-      
-      const existingUsername = existingUsernameResult.rows || existingUsernameResult[0] || [];
+      const { data: existing, error: uError } = await supabase
+        .from('admin_users')
+        .select('id')
+        .eq('username', username)
+        .neq('id', id);
 
-      if (existingUsername.length > 0) {
+      if (uError) throw uError;
+
+      if (existing && existing.length > 0) {
         return res.status(400).json({
           success: false,
           message: 'Username already exists'
         });
       }
-      updateFields.push(`username = $${paramCount}`);
-      updateValues.push(username);
-      paramCount++;
+      updateObject.username = username;
     }
 
     if (email !== undefined) {
-      // Check if new email already exists (excluding current admin)
-      const existingEmailResult = await db.execute(
-        'SELECT id FROM admin_users WHERE email = $1 AND id != $2',
-        [email, id]
-      );
-      
-      const existingEmail = existingEmailResult.rows || existingEmailResult[0] || [];
+      const { data: existing, error: eError } = await supabase
+        .from('admin_users')
+        .select('id')
+        .eq('email', email)
+        .neq('id', id);
 
-      if (existingEmail.length > 0) {
+      if (eError) throw eError;
+
+      if (existing && existing.length > 0) {
         return res.status(400).json({
           success: false,
           message: 'Email already exists'
         });
       }
-      updateFields.push(`email = $${paramCount}`);
-      updateValues.push(email);
-      paramCount++;
+      updateObject.email = email;
     }
 
     if (role !== undefined) {
-      updateFields.push(`role = $${paramCount}`);
-      updateValues.push(role);
-      paramCount++;
+      updateObject.role = role;
     }
 
     if (permissions !== undefined) {
-      updateFields.push(`permissions = $${paramCount}`);
-      updateValues.push(JSON.stringify(permissions));
-      paramCount++;
+      updateObject.permissions = JSON.stringify(permissions);
     }
 
     if (is_active !== undefined) {
-      updateFields.push(`is_active = $${paramCount}`);
-      updateValues.push(is_active);
-      paramCount++;
+      updateObject.is_active = is_active;
     }
 
-    if (updateFields.length === 0) {
-      return res.status(400).json({
-        success: false,
-        message: 'No fields to update'
-      });
-    }
+    const { error: updateError } = await supabase
+      .from('admin_users')
+      .update(updateObject)
+      .eq('id', id);
 
-    updateFields.push('updated_at = NOW()');
-    updateValues.push(id);
-
-    const updateQuery = `
-      UPDATE admin_users 
-      SET ${updateFields.join(', ')} 
-      WHERE id = $${paramCount}
-    `;
-
-    await db.execute(updateQuery, updateValues);
+    if (updateError) throw updateError;
 
     // Log activity
-    await db.execute(
-      `INSERT INTO admin_activity_logs 
-       (admin_id, action_type, description, affected_user_id, details, created_at) 
-       VALUES ($1, $2, $3, $4, $5, NOW())`,
-      [
-        adminId,
-        'admin_update',
-        `Updated admin user: ${admin.username}`,
-        id,
-        JSON.stringify({
+    await supabase
+      .from('admin_activity_logs')
+      .insert({
+        admin_id: adminId,
+        action_type: 'admin_update',
+        description: `Updated admin user: ${admin.username}`,
+        affected_user_id: id,
+        details: JSON.stringify({
           updated_fields: Object.keys(req.body),
           new_values: req.body
-        })
-      ]
-    );
+        }),
+        created_at: new Date().toISOString()
+      });
 
     res.json({
       success: true,
@@ -6817,7 +6388,6 @@ router.put('/admins/:id', authenticateAdmin, async (req, res) => {
   }
 });
 
-// PUT /api/admin/admins/:id/password - Update admin password (FIXED)
 router.put('/admins/:id/password', authenticateAdmin, async (req, res) => {
   try {
     const { id } = req.params;
@@ -6834,14 +6404,14 @@ router.put('/admins/:id/password', authenticateAdmin, async (req, res) => {
     }
 
     // Check if admin exists
-    const adminResult = await db.execute(
-      'SELECT id, username FROM admin_users WHERE id = $1',
-      [id]
-    );
-    
-    const admins = adminResult.rows || adminResult[0] || [];
+    const { data: admins, error: checkError } = await supabase
+      .from('admin_users')
+      .select('id, username')
+      .eq('id', id);
 
-    if (admins.length === 0) {
+    if (checkError) throw checkError;
+
+    if (!admins || admins.length === 0) {
       return res.status(404).json({
         success: false,
         message: 'Admin not found'
@@ -6854,18 +6424,26 @@ router.put('/admins/:id/password', authenticateAdmin, async (req, res) => {
     const hashedPassword = await bcrypt.hash(newPassword, 10);
 
     // Update password
-    await db.execute(
-      'UPDATE admin_users SET password_hash = $1, updated_at = NOW() WHERE id = $2',
-      [hashedPassword, id]
-    );
+    const { error: updateError } = await supabase
+      .from('admin_users')
+      .update({
+        password_hash: hashedPassword,
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', id);
+
+    if (updateError) throw updateError;
 
     // Log activity
-    await db.execute(
-      `INSERT INTO admin_activity_logs 
-       (admin_id, action_type, description, affected_user_id, created_at) 
-       VALUES ($1, $2, $3, $4, NOW())`,
-      [adminId, 'admin_password_reset', `Reset password for admin: ${admin.username}`, id]
-    );
+    await supabase
+      .from('admin_activity_logs')
+      .insert({
+        admin_id: adminId,
+        action_type: 'admin_password_reset',
+        description: `Reset password for admin: ${admin.username}`,
+        affected_user_id: id,
+        created_at: new Date().toISOString()
+      });
 
     res.json({
       success: true,
@@ -6882,7 +6460,6 @@ router.put('/admins/:id/password', authenticateAdmin, async (req, res) => {
   }
 });
 
-// DELETE /api/admin/admins/:id - Delete admin (FIXED)
 router.delete('/admins/:id', authenticateAdmin, async (req, res) => {
   try {
     const { id } = req.params;
@@ -6899,14 +6476,14 @@ router.delete('/admins/:id', authenticateAdmin, async (req, res) => {
     }
 
     // Check if admin exists
-    const adminResult = await db.execute(
-      'SELECT id, username, role FROM admin_users WHERE id = $1',
-      [id]
-    );
-    
-    const admins = adminResult.rows || adminResult[0] || [];
+    const { data: admins, error: checkError } = await supabase
+      .from('admin_users')
+      .select('id, username, role')
+      .eq('id', id);
 
-    if (admins.length === 0) {
+    if (checkError) throw checkError;
+
+    if (!admins || admins.length === 0) {
       return res.status(404).json({
         success: false,
         message: 'Admin not found'
@@ -6915,15 +6492,17 @@ router.delete('/admins/:id', authenticateAdmin, async (req, res) => {
 
     const admin = admins[0];
 
-    // Cannot delete super_admin unless you are super_admin
-    const requesterResult = await db.execute(
-      'SELECT role FROM admin_users WHERE id = $1',
-      [adminId]
-    );
-    
-    const requester = requesterResult.rows ? requesterResult.rows[0] : (requesterResult[0] ? requesterResult[0][0] : null);
+    // Get requester role
+    const { data: requesterData, error: reqError } = await supabase
+      .from('admin_users')
+      .select('role')
+      .eq('id', adminId);
 
-    if (admin.role === 'super_admin' && requester.role !== 'super_admin') {
+    if (reqError) throw reqError;
+
+    const requester = requesterData?.[0];
+
+    if (admin.role === 'super_admin' && requester?.role !== 'super_admin') {
       return res.status(403).json({
         success: false,
         message: 'Only super admin can delete other super admins'
@@ -6931,27 +6510,30 @@ router.delete('/admins/:id', authenticateAdmin, async (req, res) => {
     }
 
     // Soft delete (deactivate) instead of hard delete
-    await db.execute(
-      'UPDATE admin_users SET is_active = false, updated_at = NOW() WHERE id = $1',
-      [id]
-    );
+    const { error: updateError } = await supabase
+      .from('admin_users')
+      .update({
+        is_active: false,
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', id);
+
+    if (updateError) throw updateError;
 
     // Log activity
-    await db.execute(
-      `INSERT INTO admin_activity_logs 
-       (admin_id, action_type, description, affected_user_id, details, created_at) 
-       VALUES ($1, $2, $3, $4, $5, NOW())`,
-      [
-        adminId,
-        'admin_delete',
-        `Deleted admin user: ${admin.username}`,
-        id,
-        JSON.stringify({
+    await supabase
+      .from('admin_activity_logs')
+      .insert({
+        admin_id: adminId,
+        action_type: 'admin_delete',
+        description: `Deleted admin user: ${admin.username}`,
+        affected_user_id: id,
+        details: JSON.stringify({
           admin_username: admin.username,
           admin_role: admin.role
-        })
-      ]
-    );
+        }),
+        created_at: new Date().toISOString()
+      });
 
     res.json({
       success: true,
@@ -6968,7 +6550,6 @@ router.delete('/admins/:id', authenticateAdmin, async (req, res) => {
   }
 });
 
-// POST /api/admin/admins/:id/toggle-active - Toggle admin active status (FIXED)
 router.post('/admins/:id/toggle-active', authenticateAdmin, async (req, res) => {
   try {
     const { id } = req.params;
@@ -6986,14 +6567,14 @@ router.post('/admins/:id/toggle-active', authenticateAdmin, async (req, res) => 
     }
 
     // Check if admin exists
-    const adminResult = await db.execute(
-      'SELECT id, username FROM admin_users WHERE id = $1',
-      [id]
-    );
-    
-    const admins = adminResult.rows || adminResult[0] || [];
+    const { data: admins, error: checkError } = await supabase
+      .from('admin_users')
+      .select('id, username')
+      .eq('id', id);
 
-    if (admins.length === 0) {
+    if (checkError) throw checkError;
+
+    if (!admins || admins.length === 0) {
       return res.status(404).json({
         success: false,
         message: 'Admin not found'
@@ -7003,27 +6584,30 @@ router.post('/admins/:id/toggle-active', authenticateAdmin, async (req, res) => 
     const admin = admins[0];
 
     // Update active status
-    await db.execute(
-      'UPDATE admin_users SET is_active = $1, updated_at = NOW() WHERE id = $2',
-      [is_active, id]
-    );
+    const { error: updateError } = await supabase
+      .from('admin_users')
+      .update({
+        is_active: is_active,
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', id);
+
+    if (updateError) throw updateError;
 
     // Log activity
-    await db.execute(
-      `INSERT INTO admin_activity_logs 
-       (admin_id, action_type, description, affected_user_id, details, created_at) 
-       VALUES ($1, $2, $3, $4, $5, NOW())`,
-      [
-        adminId,
-        'admin_status_change',
-        `${is_active ? 'Activated' : 'Deactivated'} admin: ${admin.username}`,
-        id,
-        JSON.stringify({
+    await supabase
+      .from('admin_activity_logs')
+      .insert({
+        admin_id: adminId,
+        action_type: 'admin_status_change',
+        description: `${is_active ? 'Activated' : 'Deactivated'} admin: ${admin.username}`,
+        affected_user_id: id,
+        details: JSON.stringify({
           new_status: is_active ? 'active' : 'inactive',
           admin_username: admin.username
-        })
-      ]
-    );
+        }),
+        created_at: new Date().toISOString()
+      });
 
     res.json({
       success: true,
@@ -7040,19 +6624,18 @@ router.post('/admins/:id/toggle-active', authenticateAdmin, async (req, res) => 
   }
 });
 
-// GET /api/admin/activity-types - Get available activity types (FIXED)
 router.get('/activity-types', authenticateAdmin, async (req, res) => {
   try {
     console.log('📝 Admin: Fetching activity types');
 
-    const result = await db.execute(`
-      SELECT DISTINCT action_type 
-      FROM admin_activity_logs 
-      ORDER BY action_type
-    `);
-    
-    const activityTypes = result.rows || result[0] || [];
-    const types = activityTypes.map(type => type.action_type);
+    const { data: logs, error } = await supabase
+      .from('admin_activity_logs')
+      .select('action_type')
+      .order('action_type');
+
+    if (error) throw error;
+
+    const types = [...new Set((logs || []).map(log => log.action_type))];
 
     res.json({
       success: true,
@@ -7069,11 +6652,10 @@ router.get('/activity-types', authenticateAdmin, async (req, res) => {
   }
 });
 
-// POST /api/admin/admins/:id/promote - Promote admin to super admin (NEW FEATURE)
 router.post('/admins/:id/promote', authenticateAdmin, async (req, res) => {
   try {
     const { id } = req.params;
-    const { promote_to } = req.body; // 'super_admin' or 'admin'
+    const { promote_to } = req.body;
     const adminId = req.admin.id;
 
     console.log('👑 Admin: Promoting admin:', id, 'to:', promote_to);
@@ -7087,14 +6669,16 @@ router.post('/admins/:id/promote', authenticateAdmin, async (req, res) => {
 
     // Only super admin can promote to super_admin
     if (promote_to === 'super_admin') {
-      const requesterResult = await db.execute(
-        'SELECT role FROM admin_users WHERE id = $1',
-        [adminId]
-      );
-      
-      const requester = requesterResult.rows ? requesterResult.rows[0] : (requesterResult[0] ? requesterResult[0][0] : null);
+      const { data: requesterData, error: reqError } = await supabase
+        .from('admin_users')
+        .select('role')
+        .eq('id', adminId);
 
-      if (requester.role !== 'super_admin') {
+      if (reqError) throw reqError;
+
+      const requester = requesterData?.[0];
+
+      if (requester?.role !== 'super_admin') {
         return res.status(403).json({
           success: false,
           message: 'Only super admin can promote to super_admin'
@@ -7103,14 +6687,14 @@ router.post('/admins/:id/promote', authenticateAdmin, async (req, res) => {
     }
 
     // Check if admin exists
-    const adminResult = await db.execute(
-      'SELECT id, username, role FROM admin_users WHERE id = $1',
-      [id]
-    );
-    
-    const admins = adminResult.rows || adminResult[0] || [];
+    const { data: admins, error: checkError } = await supabase
+      .from('admin_users')
+      .select('id, username, role')
+      .eq('id', id);
 
-    if (admins.length === 0) {
+    if (checkError) throw checkError;
+
+    if (!admins || admins.length === 0) {
       return res.status(404).json({
         success: false,
         message: 'Admin not found'
@@ -7121,28 +6705,31 @@ router.post('/admins/:id/promote', authenticateAdmin, async (req, res) => {
     const oldRole = admin.role;
 
     // Update role
-    await db.execute(
-      'UPDATE admin_users SET role = $1, updated_at = NOW() WHERE id = $2',
-      [promote_to, id]
-    );
+    const { error: updateError } = await supabase
+      .from('admin_users')
+      .update({
+        role: promote_to,
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', id);
+
+    if (updateError) throw updateError;
 
     // Log activity
-    await db.execute(
-      `INSERT INTO admin_activity_logs 
-       (admin_id, action_type, description, affected_user_id, details, created_at) 
-       VALUES ($1, $2, $3, $4, $5, NOW())`,
-      [
-        adminId,
-        'admin_promotion',
-        `Promoted admin ${admin.username} from ${oldRole} to ${promote_to}`,
-        id,
-        JSON.stringify({
+    await supabase
+      .from('admin_activity_logs')
+      .insert({
+        admin_id: adminId,
+        action_type: 'admin_promotion',
+        description: `Promoted admin ${admin.username} from ${oldRole} to ${promote_to}`,
+        affected_user_id: id,
+        details: JSON.stringify({
           old_role: oldRole,
           new_role: promote_to,
           admin_username: admin.username
-        })
-      ]
-    );
+        }),
+        created_at: new Date().toISOString()
+      });
 
     res.json({
       success: true,
@@ -7158,4 +6745,5 @@ router.post('/admins/:id/promote', authenticateAdmin, async (req, res) => {
     });
   }
 });
+
 module.exports = router;
