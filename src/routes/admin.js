@@ -381,7 +381,30 @@ router.post('/login', async (req, res) => {
     });
   }
 });
+// ==================== VERIFY TOKEN ENDPOINT ====================
 
+// GET /api/admin/verify - Verify admin token
+router.get('/verify', authenticateAdmin, async (req, res) => {
+  try {
+    console.log('✅ Admin token verification successful for:', req.admin.username);
+    res.json({
+      success: true,
+      admin: {
+        id: req.admin.id,
+        username: req.admin.username,
+        email: req.admin.email,
+        role: req.admin.role,
+        permissions: req.admin.permissions || []
+      }
+    });
+  } catch (error) {
+    console.error('❌ Admin verification error:', error);
+    res.status(401).json({
+      success: false,
+      message: 'Invalid admin session'
+    });
+  }
+});
 // ==================== DASHBOARD STATS ====================
 
 router.get('/dashboard/stats', authenticateAdmin, async (req, res) => {
