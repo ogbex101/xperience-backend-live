@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const supabase = require('../config/supabase'); // Assuming you have supabase client configured
+const { supabaseAdmin, supabase, isSupabase } = require('../config/database');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const { v4: uuidv4 } = require('uuid');
@@ -106,7 +106,7 @@ const authenticateAdmin = async (req, res, next) => {
       role: decoded.role 
     });
     
-    // Check if user is admin
+    // Check if user is admin using Supabase
     const { data: adminRows, error: adminError } = await supabase
       .from('admin_users')
       .select('id, username, role, is_active')
@@ -257,7 +257,6 @@ router.post('/login', async (req, res) => {
 
     const admin = admins[0];
     console.log('✅ Admin found:', admin.username);
-    console.log('Password hash type:', admin.password_hash?.substring(0, 10));
     
     let validPassword = false;
     
@@ -318,42 +317,20 @@ router.post('/login', async (req, res) => {
     let permissions = [];
     try {
       if (admin.permissions) {
-        console.log('🔧 Admin permissions raw:', admin.permissions);
-        console.log('🔧 Admin permissions type:', typeof admin.permissions);
-        
         if (typeof admin.permissions === 'string') {
           try {
             permissions = JSON.parse(admin.permissions);
-            console.log('✅ Parsed permissions as JSON:', permissions);
           } catch (jsonError) {
-            console.warn('⚠️ Could not parse permissions as JSON:', jsonError.message);
-            
-            if (admin.permissions.startsWith('[') && admin.permissions.endsWith(']')) {
-              try {
-                const cleaned = admin.permissions
-                  .replace(/'/g, '"')
-                  .replace(/\[|\]/g, '')
-                  .split(',')
-                  .map(item => item.trim().replace(/"/g, ''));
-                permissions = cleaned;
-                console.log('✅ Extracted permissions from string:', permissions);
-              } catch (cleanError) {
-                console.warn('⚠️ Could not extract permissions from string:', cleanError.message);
-              }
-            } else if (admin.permissions.includes(',')) {
+            if (admin.permissions.includes(',')) {
               permissions = admin.permissions.split(',').map(item => item.trim());
-              console.log('✅ Split permissions from comma-separated string:', permissions);
             } else {
               permissions = [admin.permissions.trim()];
-              console.log('✅ Single permission:', permissions);
             }
           }
         } else if (Array.isArray(admin.permissions)) {
           permissions = admin.permissions;
-          console.log('✅ Permissions already an array:', permissions);
         } else if (admin.permissions && typeof admin.permissions === 'object') {
           permissions = Object.keys(admin.permissions);
-          console.log('✅ Converted object to permissions array:', permissions);
         }
       }
     } catch (permError) {
@@ -364,8 +341,6 @@ router.post('/login', async (req, res) => {
     if (!Array.isArray(permissions)) {
       permissions = [];
     }
-    
-    console.log('🔧 Final permissions:', permissions);
     
     res.json({
       success: true,
@@ -399,13 +374,12 @@ router.get('/dashboard/stats', authenticateAdmin, async (req, res) => {
     // Get tournament stats
     const { data: tournamentStats, error: tournamentError } = await supabase
       .from('tournaments')
-      .select('*', { count: 'exact' });
+      .select('*');
 
     if (tournamentError) {
       console.error('Tournament stats error:', tournamentError);
     }
 
-    // Calculate tournament stats
     const tournamentStatsCalc = {
       totalTournaments: tournamentStats?.length || 0,
       upcomingTournaments: tournamentStats?.filter(t => t.status === 'upcoming').length || 0,
@@ -515,7 +489,6 @@ router.get('/dashboard/stats', authenticateAdmin, async (req, res) => {
       .order('created_at', { ascending: false })
       .limit(5);
 
-    // Format ongoing matches
     const formattedMatches = ongoingMatchesData?.map(m => ({
       ...m,
       player1_username: m.player1?.username,
@@ -551,7 +524,6 @@ router.get('/dashboard/stats', authenticateAdmin, async (req, res) => {
       .order('created_at', { ascending: false })
       .limit(5);
 
-    // Get member counts for groups
     const groupsWithCounts = await Promise.all((recentGroups || []).map(async (group) => {
       const { count } = await supabase
         .from('group_members')
@@ -604,26 +576,18 @@ router.get('/withdrawals', authenticateAdmin, async (req, res) => {
           email,
           wallet_account_number
         )
-      `);
+      `, { count: 'exact' });
 
     if (status && status.trim() !== '') {
       query = query.eq('status', status);
     }
 
-    query = query.order('created_at', { ascending: false });
-
     const { data: withdrawals, error, count } = await query
-      .range(offset, offset + limit - 1)
-      .select('*', { count: 'exact' });
+      .order('created_at', { ascending: false })
+      .range(offset, offset + limit - 1);
 
-    if (error) {
-      console.error('Withdrawals query error:', error);
-      throw error;
-    }
+    if (error) throw error;
 
-    console.log('✅ Found', withdrawals?.length || 0, 'withdrawals out of', count || 0, 'total');
-
-    // Format withdrawals
     const formattedWithdrawals = (withdrawals || []).map(withdrawal => {
       let accountDetails = {};
       try {
@@ -692,7 +656,6 @@ router.get('/withdrawals/:id', authenticateAdmin, async (req, res) => {
 
     const withdrawal = withdrawals[0];
     
-    // Parse account details
     let accountDetails = {};
     try {
       if (withdrawal.account_details) {
@@ -780,93 +743,80 @@ router.post('/withdrawals/:id/action', authenticateAdmin, async (req, res) => {
     const oldStatus = withdrawal.status;
     let newStatus = withdrawal.status;
 
-    console.log('📝 Withdrawal current status:', oldStatus);
-
     switch (action) {
       case 'approve':
         newStatus = 'processing';
-        console.log('✅ Approving withdrawal, new status: processing');
         break;
       case 'reject':
         newStatus = 'rejected';
-        console.log('❌ Rejecting withdrawal, refunding money');
-        // Refund money back to user
-        const { error: balanceError } = await supabase.rpc('increment_user_balance', {
+        // Refund money back to user using RPC
+        await supabase.rpc('increment_user_balance', {
           user_id: withdrawal.user_id,
           amount: withdrawal.amount
         });
-        if (balanceError) throw balanceError;
         break;
       case 'processing':
         newStatus = 'processing';
         break;
       case 'completed':
         newStatus = 'completed';
-        console.log('🏁 Marking withdrawal as completed');
         break;
     }
 
-    // Start a transaction using RPC or multiple operations
-    try {
-      // Update withdrawal status
-      const { error: updateError } = await supabase
-        .from('withdrawal_requests')
-        .update({
-          status: newStatus,
-          processed_by: adminId,
-          processed_at: new Date().toISOString()
-        })
-        .eq('id', id);
+    // Update withdrawal status
+    const { error: updateError } = await supabase
+      .from('withdrawal_requests')
+      .update({
+        status: newStatus,
+        processed_by: adminId,
+        processed_at: new Date().toISOString()
+      })
+      .eq('id', id);
 
-      if (updateError) throw updateError;
+    if (updateError) throw updateError;
 
-      // Update transaction status
-      const { error: txUpdateError } = await supabase
-        .from('transactions')
-        .update({ status: newStatus })
-        .eq('id', withdrawal.transaction_id);
+    // Update transaction status
+    const { error: txUpdateError } = await supabase
+      .from('transactions')
+      .update({ status: newStatus })
+      .eq('id', withdrawal.transaction_id);
 
-      if (txUpdateError) throw txUpdateError;
+    if (txUpdateError) throw txUpdateError;
 
-      // Record approval
-      const { error: approvalError } = await supabase
-        .from('withdrawal_approvals')
-        .insert({
-          withdrawal_request_id: id,
-          admin_id: adminId,
-          old_status: oldStatus,
-          new_status: newStatus,
-          notes: notes || null,
-          proof_document: proof_document || null
-        });
-
-      if (approvalError) throw approvalError;
-
-      // Log activity
-      const { error: logError } = await supabase
-        .from('admin_activity_logs')
-        .insert({
-          admin_id: adminId,
-          action_type: 'withdrawal_action',
-          description: `${action} withdrawal #${id}`,
-          affected_user_id: withdrawal.user_id,
-          affected_transaction_id: withdrawal.transaction_id
-        });
-
-      if (logError) throw logError;
-
-      console.log('💾 All operations completed successfully');
-
-      res.json({
-        success: true,
-        message: `Withdrawal ${action}d successfully`,
-        new_status: newStatus
+    // Record approval
+    const { error: approvalError } = await supabase
+      .from('withdrawal_approvals')
+      .insert({
+        withdrawal_request_id: id,
+        admin_id: adminId,
+        old_status: oldStatus,
+        new_status: newStatus,
+        notes: notes || null,
+        proof_document: proof_document || null
       });
 
-    } catch (error) {
-      console.error('❌ Operation error:', error);
-      throw error;
-    }
+    if (approvalError) throw approvalError;
+
+    // Log activity
+    const { error: logError } = await supabase
+      .from('admin_activity_logs')
+      .insert({
+        admin_id: adminId,
+        action_type: 'withdrawal_action',
+        description: `${action} withdrawal #${id}`,
+        affected_user_id: withdrawal.user_id,
+        affected_transaction_id: withdrawal.transaction_id
+      });
+
+    if (logError) throw logError;
+
+    console.log('💾 All operations completed successfully');
+
+    res.json({
+      success: true,
+      message: `Withdrawal ${action}d successfully`,
+      new_status: newStatus
+    });
 
   } catch (error) {
     console.error('❌ Withdrawal action error:', error);
@@ -1005,9 +955,6 @@ router.put('/users/:id', authenticateAdmin, async (req, res) => {
       });
     }
 
-    const currentUser = users[0];
-
-    // Define allowed fields to update
     const allowedFields = [
       'username', 'email', 'firstname', 'lastname', 'rank',
       'account_status', 'xp_points', 'is_admin', 'is_banned',
@@ -1170,16 +1117,11 @@ router.post('/users/:id/balance', authenticateAdmin, async (req, res) => {
     const currentUser = users[0];
     const newBalance = parseFloat(currentUser.balance) + parseFloat(amount);
 
-    // Update balance
-    const { error: updateError } = await supabase
-      .from('users')
-      .update({
-        balance: newBalance,
-        updated_at: new Date().toISOString()
-      })
-      .eq('id', id);
-
-    if (updateError) throw updateError;
+    // Update balance using RPC for atomic operation
+    await supabase.rpc('increment_user_balance', {
+      user_id: id,
+      amount: parseFloat(amount)
+    });
 
     // Create transaction record
     const transactionId = uuidv4();
@@ -1311,7 +1253,6 @@ router.get('/users/:id/stats', authenticateAdmin, async (req, res) => {
 
     console.log('📊 Fetching stats for user ID:', id);
 
-    // Get user info
     const { data: users, error: userError } = await supabase
       .from('users')
       .select('*')
@@ -1580,7 +1521,6 @@ router.get('/fraud/flags', authenticateAdmin, async (req, res) => {
 
     if (error) throw error;
 
-    // Format flags
     const formattedFlags = (flags || []).map(flag => ({
       ...flag,
       username: flag.users?.username,
@@ -1674,7 +1614,6 @@ router.get('/fraud/stats', authenticateAdmin, async (req, res) => {
 
     if (weeklyError) throw weeklyError;
 
-    // Group by date
     const weeklyGrouped = {};
     (weeklyData || []).forEach(activity => {
       const date = activity.created_at?.split('T')[0];
@@ -1719,7 +1658,6 @@ router.get('/fraud/suspicious-users', authenticateAdmin, async (req, res) => {
 
     console.log('🔍 Admin: Fetching suspicious users - Page:', page, 'Risk min:', risk_min);
 
-    // Get users with risk scores
     const { data: users, error, count } = await supabase
       .from('users')
       .select(`
@@ -1740,7 +1678,6 @@ router.get('/fraud/suspicious-users', authenticateAdmin, async (req, res) => {
 
     if (error) throw error;
 
-    // Get suspicious activities and fraud flags counts for each user
     const formattedUsers = await Promise.all((users || []).map(async (user) => {
       const { count: suspiciousCount } = await supabase
         .from('suspicious_activities')
@@ -1844,7 +1781,6 @@ router.post('/fraud/scan', authenticateAdmin, async (req, res) => {
 
     console.log('🔍 Admin: Initiating fraud scan - Type:', scanType, 'Admin:', adminId);
 
-    // Create scan log
     const scanId = uuidv4();
     const { error: logError } = await supabase
       .from('fraud_detection_logs')
@@ -1858,7 +1794,6 @@ router.post('/fraud/scan', authenticateAdmin, async (req, res) => {
 
     if (logError) throw logError;
 
-    // Return immediate response and run scan in background
     res.json({
       success: true,
       message: 'Fraud detection scan initiated',
@@ -1901,7 +1836,6 @@ router.post('/fraud/suspicious-activities/:id/review', authenticateAdmin, async 
       });
     }
 
-    // Check if activity exists
     const { data: activities, error: actError } = await supabase
       .from('suspicious_activities')
       .select('*')
@@ -1918,7 +1852,6 @@ router.post('/fraud/suspicious-activities/:id/review', authenticateAdmin, async 
 
     const activity = activities[0];
 
-    // Update the activity
     const { error: updateError } = await supabase
       .from('suspicious_activities')
       .update({
@@ -1932,7 +1865,6 @@ router.post('/fraud/suspicious-activities/:id/review', authenticateAdmin, async 
 
     if (updateError) throw updateError;
 
-    // If confirmed as fraud, increase user risk score
     if (status === 'confirmed') {
       const { data: userData } = await supabase
         .from('users')
@@ -1952,7 +1884,6 @@ router.post('/fraud/suspicious-activities/:id/review', authenticateAdmin, async 
       }
     }
 
-    // Log activity
     await supabase
       .from('admin_activity_logs')
       .insert({
@@ -1988,7 +1919,6 @@ async function runFraudScan(scanType, adminId, scanId) {
     let suspiciousFound = 0;
     const triggeredPatterns = [];
 
-    // Get active fraud patterns
     const { data: patterns, error: patternError } = await supabase
       .from('fraud_patterns')
       .select('*')
@@ -1996,7 +1926,6 @@ async function runFraudScan(scanType, adminId, scanId) {
 
     if (patternError) throw patternError;
 
-    // Determine which users to scan
     let userQuery = supabase
       .from('users')
       .select('id, username, email, created_at, last_login_at, balance, risk_score')
@@ -2014,12 +1943,10 @@ async function runFraudScan(scanType, adminId, scanId) {
 
     if (userError) throw userError;
 
-    // Scan each user
     for (const user of (users || [])) {
       usersChecked++;
       let userSuspicious = false;
 
-      // Check each pattern
       for (const pattern of (patterns || [])) {
         try {
           const rules = pattern.rules ? 
@@ -2034,7 +1961,6 @@ async function runFraudScan(scanType, adminId, scanId) {
               patternName: pattern.pattern_name
             });
 
-            // Record suspicious activity
             await supabase
               .from('suspicious_activities')
               .insert({
@@ -2054,7 +1980,6 @@ async function runFraudScan(scanType, adminId, scanId) {
                 })
               });
 
-            // Update user risk score
             const newRiskScore = Math.min((user.risk_score || 0) + (pattern.risk_weight * 5), 100);
             await supabase
               .from('users')
@@ -2076,7 +2001,6 @@ async function runFraudScan(scanType, adminId, scanId) {
 
     const scanDuration = Date.now() - startTime;
 
-    // Update scan log
     await supabase
       .from('fraud_detection_logs')
       .update({
@@ -2104,14 +2028,12 @@ async function runFraudScan(scanType, adminId, scanId) {
   }
 }
 
-// Helper function to check pattern rules
 async function checkPattern(user, rules) {
   if (!rules || typeof rules !== 'object') {
     return false;
   }
 
   try {
-    // Check for rapid account creation (multiple accounts from same IP)
     if (rules.type === 'multiple_accounts') {
       const { count, error } = await supabase
         .from('users')
@@ -2122,7 +2044,6 @@ async function checkPattern(user, rules) {
       return (count || 0) > (rules.threshold || 3);
     }
 
-    // Check for unusual transaction patterns
     if (rules.type === 'transaction_anomaly') {
       const { data: transactions, error } = await supabase
         .from('transactions')
@@ -2139,7 +2060,6 @@ async function checkPattern(user, rules) {
       return txCount > (rules.maxTransactions || 10) || totalAmount > (rules.maxAmount || 100000);
     }
 
-    // Check for login anomalies
     if (rules.type === 'login_anomaly') {
       const { data: logins, error } = await supabase
         .from('user_logins')
@@ -2153,7 +2073,6 @@ async function checkPattern(user, rules) {
       return uniqueIPs > (rules.maxUniqueIPs || 5);
     }
 
-    // Check account age and activity
     if (rules.type === 'new_account_high_activity') {
       const accountAgeHours = Math.floor((new Date() - new Date(user.created_at)) / (1000 * 60 * 60));
       
@@ -2218,7 +2137,6 @@ router.get('/transactions', authenticateAdmin, async (req, res) => {
 
     if (error) throw error;
 
-    // Format transactions
     const formattedTransactions = (transactions || []).map(tx => ({
       ...tx,
       username: tx.users?.username,
@@ -2227,7 +2145,6 @@ router.get('/transactions', authenticateAdmin, async (req, res) => {
       users: undefined
     }));
 
-    // Log activity
     try {
       await supabase
         .from('admin_activity_logs')
@@ -2334,7 +2251,6 @@ router.get('/transactions/:id', authenticateAdmin, async (req, res) => {
       users: undefined
     };
 
-    // Get withdrawal request if exists
     let withdrawalRequest = null;
     if (transaction.type === 'withdrawal') {
       const { data: withdrawals, error: wError } = await supabase
@@ -2383,7 +2299,6 @@ router.put('/transactions/:id/status', authenticateAdmin, async (req, res) => {
       });
     }
 
-    // Get current transaction
     const { data: transactions, error: txError } = await supabase
       .from('transactions')
       .select('*')
@@ -2401,7 +2316,6 @@ router.put('/transactions/:id/status', authenticateAdmin, async (req, res) => {
     const transaction = transactions[0];
     const oldStatus = transaction.status;
 
-    // Update transaction status
     const updateData = {
       status: status,
       updated_at: new Date().toISOString()
@@ -2418,7 +2332,6 @@ router.put('/transactions/:id/status', authenticateAdmin, async (req, res) => {
 
     if (updateError) throw updateError;
 
-    // Also update withdrawal_requests table if it's a withdrawal
     if (transaction.type === 'withdrawal') {
       await supabase
         .from('withdrawal_requests')
@@ -2430,7 +2343,6 @@ router.put('/transactions/:id/status', authenticateAdmin, async (req, res) => {
         .eq('transaction_id', id);
     }
 
-    // Handle balance adjustments
     if (status === 'completed' && oldStatus !== 'completed') {
       if (transaction.type === 'deposit' && transaction.amount > 0) {
         await supabase.rpc('increment_user_balance', {
@@ -2441,7 +2353,6 @@ router.put('/transactions/:id/status', authenticateAdmin, async (req, res) => {
       }
     }
     
-    // Handle refunds/rejections for withdrawals
     if (transaction.type === 'withdrawal' && (status === 'failed' || status === 'rejected') && oldStatus === 'pending_approval') {
       await supabase.rpc('increment_user_balance', {
         user_id: transaction.user_id,
@@ -2450,7 +2361,6 @@ router.put('/transactions/:id/status', authenticateAdmin, async (req, res) => {
       console.log(`✅ Refunded ${Math.abs(transaction.amount)} to user ${transaction.user_id} for failed withdrawal`);
     }
 
-    // Log the status change
     await supabase
       .from('admin_activity_logs')
       .insert({
@@ -2487,7 +2397,6 @@ router.post('/transactions/:id/refund', authenticateAdmin, async (req, res) => {
 
     console.log('💸 Admin: Processing refund for transaction ID:', id);
 
-    // Get transaction (must be a completed deposit)
     const { data: transactions, error: txError } = await supabase
       .from('transactions')
       .select('*')
@@ -2505,13 +2414,10 @@ router.post('/transactions/:id/refund', authenticateAdmin, async (req, res) => {
     }
 
     const transaction = transactions[0];
-
-    // Generate reference
     const refundReference = `REFUND-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
-
-    // Create refund transaction
     const refundId = uuidv4();
-    const { data: refundData, error: refundError } = await supabase
+
+    const { error: refundError } = await supabase
       .from('transactions')
       .insert({
         id: refundId,
@@ -2524,18 +2430,15 @@ router.post('/transactions/:id/refund', authenticateAdmin, async (req, res) => {
         description: reason || 'Admin refund for deposit',
         external_reference: transaction.reference,
         created_at: new Date().toISOString()
-      })
-      .select();
+      });
 
     if (refundError) throw refundError;
 
-    // Deduct from user balance
     await supabase.rpc('increment_user_balance', {
       user_id: transaction.user_id,
       amount: -Math.abs(transaction.amount)
     });
 
-    // Log activity
     await supabase
       .from('admin_activity_logs')
       .insert({
@@ -2608,7 +2511,6 @@ router.get('/matches', authenticateAdmin, async (req, res) => {
 
     if (error) throw error;
 
-    // Format matches
     const formattedMatches = (matches || []).map(m => ({
       ...m,
       player1_username: m.player1?.username,
@@ -2619,7 +2521,6 @@ router.get('/matches', authenticateAdmin, async (req, res) => {
       winner: undefined
     }));
 
-    // Log activity
     try {
       await supabase
         .from('admin_activity_logs')
@@ -2728,7 +2629,6 @@ router.get('/matches/:id', authenticateAdmin, async (req, res) => {
       winner: undefined
     };
 
-    // Get disputes if any
     const { data: disputes, error: dispError } = await supabase
       .from('match_disputes')
       .select('*')
@@ -2764,7 +2664,6 @@ router.post('/matches/:id/cancel', authenticateAdmin, async (req, res) => {
       adminId 
     });
 
-    // Get current match
     const { data: matches, error: mError } = await supabase
       .from('matches')
       .select('*')
@@ -2782,7 +2681,6 @@ router.post('/matches/:id/cancel', authenticateAdmin, async (req, res) => {
 
     const match = matches[0];
 
-    // Update match status
     const { error: updateError } = await supabase
       .from('matches')
       .update({
@@ -2793,7 +2691,6 @@ router.post('/matches/:id/cancel', authenticateAdmin, async (req, res) => {
 
     if (updateError) throw updateError;
 
-    // Refund stake amount to players
     if (match.stake_amount > 0) {
       await supabase.rpc('increment_user_balance', {
         user_id: match.player1_id,
@@ -2808,7 +2705,6 @@ router.post('/matches/:id/cancel', authenticateAdmin, async (req, res) => {
       }
     }
 
-    // Log admin monitoring activity if admin monitoring was enabled
     if (match.admin_monitoring === true) {
       await supabase
         .from('admin_monitoring_logs')
@@ -2827,7 +2723,6 @@ router.post('/matches/:id/cancel', authenticateAdmin, async (req, res) => {
         });
     }
 
-    // Log admin activity
     await supabase
       .from('admin_activity_logs')
       .insert({
@@ -2880,7 +2775,6 @@ router.post('/matches/:id/resolve', authenticateAdmin, async (req, res) => {
       });
     }
 
-    // Get current match
     const { data: matches, error: mError } = await supabase
       .from('matches')
       .select('*')
@@ -2898,7 +2792,6 @@ router.post('/matches/:id/resolve', authenticateAdmin, async (req, res) => {
 
     const match = matches[0];
 
-    // Update match
     const { error: updateError } = await supabase
       .from('matches')
       .update({
@@ -2910,7 +2803,6 @@ router.post('/matches/:id/resolve', authenticateAdmin, async (req, res) => {
 
     if (updateError) throw updateError;
 
-    // Distribute prize if any
     const prizeAmount = match.prize_pool_amount || match.custom_prize_pool || 0;
     if (prizeAmount > 0) {
       await supabase.rpc('increment_user_balance', {
@@ -2918,7 +2810,6 @@ router.post('/matches/:id/resolve', authenticateAdmin, async (req, res) => {
         amount: prizeAmount
       });
       
-      // Create transaction record
       const reference = `MATCH_PRIZE_${id}_${Date.now()}`;
       await supabase
         .from('transactions')
@@ -2934,7 +2825,6 @@ router.post('/matches/:id/resolve', authenticateAdmin, async (req, res) => {
       console.log(`✅ Created transaction with reference: ${reference}`);
     }
 
-    // Log admin monitoring activity if admin monitoring was enabled
     if (match.admin_monitoring === true) {
       await supabase
         .from('admin_monitoring_logs')
@@ -2954,7 +2844,6 @@ router.post('/matches/:id/resolve', authenticateAdmin, async (req, res) => {
       console.log('📝 Admin monitoring log created');
     }
 
-    // Log admin activity
     await supabase
       .from('admin_activity_logs')
       .insert({
@@ -2995,11 +2884,9 @@ router.post('/matches/:id/resolve', authenticateAdmin, async (req, res) => {
 router.get('/matches/:id/audit-logs', authenticateAdmin, async (req, res) => {
   try {
     const { id } = req.params;
-    const adminId = req.admin.id;
     
     console.log('📝 Admin: Fetching audit logs for match ID:', id);
 
-    // First, verify match exists
     const { data: matches, error: mError } = await supabase
       .from('matches')
       .select('id')
@@ -3014,7 +2901,6 @@ router.get('/matches/:id/audit-logs', authenticateAdmin, async (req, res) => {
       });
     }
 
-    // Get admin monitoring logs
     let monitoringLogs = [];
     const { data: logs, error: logError } = await supabase
       .from('admin_monitoring_logs')
@@ -3034,7 +2920,6 @@ router.get('/matches/:id/audit-logs', authenticateAdmin, async (req, res) => {
       }));
     }
 
-    // Get related admin activity logs
     let activityLogs = [];
     const { data: activities, error: actError } = await supabase
       .from('admin_activity_logs')
@@ -3054,7 +2939,6 @@ router.get('/matches/:id/audit-logs', authenticateAdmin, async (req, res) => {
       }));
     }
 
-    // Get match dispute logs
     let disputeLogs = [];
     const { data: disputes, error: dispError } = await supabase
       .from('match_disputes')
@@ -3072,7 +2956,6 @@ router.get('/matches/:id/audit-logs', authenticateAdmin, async (req, res) => {
       }));
     }
 
-    // Get transaction logs for this match
     let transactionLogs = [];
     const { data: transactions, error: txError } = await supabase
       .from('transactions')
@@ -3090,7 +2973,6 @@ router.get('/matches/:id/audit-logs', authenticateAdmin, async (req, res) => {
       }));
     }
 
-    // Combine all logs
     const allLogs = [
       ...monitoringLogs,
       ...activityLogs,
@@ -3115,28 +2997,7 @@ router.get('/matches/:id/audit-logs', authenticateAdmin, async (req, res) => {
     });
   }
 });
-// GET /api/admin/verify - Verify admin token
-router.get('/verify', authenticateAdmin, async (req, res) => {
-  try {
-    console.log('✅ Admin token verification successful for:', req.admin.username);
-    res.json({
-      success: true,
-      admin: {
-        id: req.admin.id,
-        username: req.admin.username,
-        email: req.admin.email,
-        role: req.admin.role,
-        permissions: req.admin.permissions || []
-      }
-    });
-  } catch (error) {
-    console.error('❌ Admin verification error:', error);
-    res.status(401).json({
-      success: false,
-      message: 'Invalid admin session'
-    });
-  }
-});
+
 // ==================== TOURNAMENTS MANAGEMENT ====================
 
 router.get('/tournaments', authenticateAdmin, async (req, res) => {
@@ -3180,7 +3041,6 @@ router.get('/tournaments', authenticateAdmin, async (req, res) => {
       query = query.or(`name.ilike.%${search}%,game.ilike.%${search}%,creator.username.ilike.%${search}%`);
     }
 
-    // Apply sorting
     switch(sort) {
       case 'oldest':
         query = query.order('created_at', { ascending: true });
@@ -3201,7 +3061,6 @@ router.get('/tournaments', authenticateAdmin, async (req, res) => {
 
     if (error) throw error;
 
-    // Get participant counts and log counts for each tournament
     const tournamentsWithStats = await Promise.all((tournaments || []).map(async (tournament) => {
       const { count: participantCount } = await supabase
         .from('tournament_participants')
@@ -3231,7 +3090,6 @@ router.get('/tournaments', authenticateAdmin, async (req, res) => {
       };
     }));
 
-    // Log activity
     try {
       await supabase
         .from('admin_activity_logs')
@@ -3360,7 +3218,6 @@ router.post('/tournaments/:id/cancel', authenticateAdmin, async (req, res) => {
       adminId 
     });
 
-    // Get tournament details
     const { data: tournaments, error: tError } = await supabase
       .from('tournaments')
       .select('*')
@@ -3378,7 +3235,6 @@ router.post('/tournaments/:id/cancel', authenticateAdmin, async (req, res) => {
 
     const tournament = tournaments[0];
 
-    // Update tournament status
     const { error: updateError } = await supabase
       .from('tournaments')
       .update({
@@ -3389,7 +3245,6 @@ router.post('/tournaments/:id/cancel', authenticateAdmin, async (req, res) => {
 
     if (updateError) throw updateError;
 
-    // Refund XP entry fees if any
     if (tournament.xp_entry_fee > 0) {
       const { data: participants, error: partError } = await supabase
         .from('tournament_participants')
@@ -3419,7 +3274,6 @@ router.post('/tournaments/:id/cancel', authenticateAdmin, async (req, res) => {
       }
     }
 
-    // Notify participants
     const { data: participants } = await supabase
       .from('tournament_participants')
       .select('user_id')
@@ -3441,7 +3295,6 @@ router.post('/tournaments/:id/cancel', authenticateAdmin, async (req, res) => {
       }
     }
 
-    // Log admin activity
     await supabase
       .from('admin_activity_logs')
       .insert({
@@ -3481,7 +3334,6 @@ router.post('/tournaments/:id/distribute-prizes', authenticateAdmin, async (req,
 
     console.log('💰 Admin: Distributing prizes for tournament:', id);
 
-    // Get tournament details
     const { data: tournaments, error: tError } = await supabase
       .from('tournaments')
       .select('*')
@@ -3506,7 +3358,6 @@ router.post('/tournaments/:id/distribute-prizes', authenticateAdmin, async (req,
       });
     }
 
-    // Check if prizes already distributed
     const { data: existingPrizes, error: checkError } = await supabase
       .from('xp_transactions')
       .select('id')
@@ -3544,7 +3395,6 @@ router.post('/tournaments/:id/distribute-prizes', authenticateAdmin, async (req,
       console.log(`💰 Awarded ${totalPrize} XP to winner ${tournament.winner_id}`);
     }
 
-    // Log admin activity
     await supabase
       .from('admin_activity_logs')
       .insert({
@@ -3586,7 +3436,6 @@ router.delete('/tournaments/:id/participants/:userId', authenticateAdmin, async 
 
     console.log('👢 Admin: Removing participant:', { tournamentId: id, userId, adminId });
 
-    // Check if tournament exists
     const { data: tournaments, error: tError } = await supabase
       .from('tournaments')
       .select('*')
@@ -3604,7 +3453,6 @@ router.delete('/tournaments/:id/participants/:userId', authenticateAdmin, async 
 
     const tournament = tournaments[0];
 
-    // Check if participant exists
     const { data: participants, error: pError } = await supabase
       .from('tournament_participants')
       .select(`
@@ -3626,14 +3474,12 @@ router.delete('/tournaments/:id/participants/:userId', authenticateAdmin, async 
 
     const participant = participants[0];
 
-    // Update participant status
     await supabase
       .from('tournament_participants')
       .update({ status: 'declined' })
       .eq('tournament_id', id)
       .eq('user_id', userId);
 
-    // Refund entry fee if any
     if (tournament.xp_entry_fee > 0) {
       await supabase.rpc('increment_user_xp', {
         user_id: userId,
@@ -3652,7 +3498,6 @@ router.delete('/tournaments/:id/participants/:userId', authenticateAdmin, async 
         });
     }
 
-    // Notify user
     await supabase
       .from('notifications')
       .insert({
@@ -3664,7 +3509,6 @@ router.delete('/tournaments/:id/participants/:userId', authenticateAdmin, async 
         created_at: new Date().toISOString()
       });
 
-    // Log admin activity
     await supabase
       .from('admin_activity_logs')
       .insert({
@@ -3760,7 +3604,6 @@ router.get('/monitored-tournaments', authenticateAdmin, async (req, res) => {
 
     if (error) throw error;
 
-    // Get participant counts and log counts
     const tournamentsWithStats = await Promise.all((tournaments || []).map(async (tournament) => {
       const { count: participantsCount } = await supabase
         .from('tournament_participants')
@@ -3881,7 +3724,6 @@ router.get('/maintenance/health', authenticateAdmin, async (req, res) => {
   try {
     console.log('🔧 Checking system health');
     
-    // Check database connection
     let dbStatus = 'disconnected';
     try {
       const { error } = await supabase.from('users').select('id').limit(1);
@@ -3924,7 +3766,6 @@ router.post('/broadcast-message', authenticateAdmin, async (req, res) => {
 
     console.log('📢 Broadcasting in-app message to all users:', message);
 
-    // Get all active users
     const { data: users, error: userError } = await supabase
       .from('users')
       .select('id')
@@ -3935,7 +3776,6 @@ router.post('/broadcast-message', authenticateAdmin, async (req, res) => {
 
     let usersNotified = 0;
     
-    // Create notifications for all users
     for (const user of (users || [])) {
       try {
         await supabase
@@ -3954,7 +3794,6 @@ router.post('/broadcast-message', authenticateAdmin, async (req, res) => {
       }
     }
 
-    // Log activity
     await supabase
       .from('admin_activity_logs')
       .insert({
@@ -4043,7 +3882,6 @@ router.post('/games', authenticateAdmin, async (req, res) => {
 
     console.log('🎮 Admin: Adding new game:', name);
 
-    // Check if game already exists
     const { data: existingGames, error: checkError } = await supabase
       .from('games')
       .select('id')
@@ -4058,7 +3896,6 @@ router.post('/games', authenticateAdmin, async (req, res) => {
       });
     }
 
-    // Insert new game
     const { data: newGame, error: insertError } = await supabase
       .from('games')
       .insert({
@@ -4074,7 +3911,6 @@ router.post('/games', authenticateAdmin, async (req, res) => {
 
     if (insertError) throw insertError;
 
-    // Log activity
     await supabase
       .from('admin_activity_logs')
       .insert({
@@ -4106,7 +3942,6 @@ router.put('/games/:id', authenticateAdmin, async (req, res) => {
 
     console.log('🎮 Admin: Updating game ID:', id, 'Data:', gameData);
 
-    // Check if game exists
     const { data: games, error: checkError } = await supabase
       .from('games')
       .select('id, name')
@@ -4149,7 +3984,6 @@ router.put('/games/:id', authenticateAdmin, async (req, res) => {
 
     if (updateError) throw updateError;
 
-    // Log activity
     await supabase
       .from('admin_activity_logs')
       .insert({
@@ -4179,7 +4013,6 @@ router.delete('/games/:id', authenticateAdmin, async (req, res) => {
 
     console.log('🎮 Admin: Deleting game ID:', id);
 
-    // Check if game exists
     const { data: games, error: checkError } = await supabase
       .from('games')
       .select('name')
@@ -4196,7 +4029,6 @@ router.delete('/games/:id', authenticateAdmin, async (req, res) => {
 
     const gameName = games[0].name;
 
-    // Soft delete (deactivate) instead of hard delete
     const { error: updateError } = await supabase
       .from('games')
       .update({
@@ -4207,7 +4039,6 @@ router.delete('/games/:id', authenticateAdmin, async (req, res) => {
 
     if (updateError) throw updateError;
 
-    // Log activity
     await supabase
       .from('admin_activity_logs')
       .insert({
@@ -4239,7 +4070,6 @@ router.post('/factory-reset', authenticateAdmin, async (req, res) => {
 
     console.log('🏭 Admin performing factory reset', { backup, adminId });
 
-    // Create backup if requested
     if (backup) {
       const { data: settings, error: settingsError } = await supabase
         .from('system_settings')
@@ -4262,7 +4092,6 @@ router.post('/factory-reset', authenticateAdmin, async (req, res) => {
       }
     }
 
-    // Define default settings
     const defaultSettings = [
       { setting_key: 'platformName', setting_value: 'Xperience', category: 'general' },
       { setting_key: 'platformCurrency', setting_value: 'NGN', category: 'general' },
@@ -4299,13 +4128,11 @@ router.post('/factory-reset', authenticateAdmin, async (req, res) => {
       { setting_key: 'cacheEnabled', setting_value: 'true', category: 'system' }
     ];
 
-    // Clear all existing settings
     await supabase
       .from('system_settings')
       .delete()
-      .neq('setting_key', 'none'); // Delete all
+      .neq('setting_key', 'none');
 
-    // Insert default settings
     for (const setting of defaultSettings) {
       await supabase
         .from('system_settings')
@@ -4316,7 +4143,6 @@ router.post('/factory-reset', authenticateAdmin, async (req, res) => {
         });
     }
 
-    // Reset XP rates to defaults
     await supabase
       .from('xp_rates')
       .delete()
@@ -4335,7 +4161,6 @@ router.post('/factory-reset', authenticateAdmin, async (req, res) => {
         .insert(rate);
     }
 
-    // Log activity
     await supabase
       .from('admin_activity_logs')
       .insert({
@@ -4368,7 +4193,6 @@ router.post('/factory-reset/undo', authenticateAdmin, async (req, res) => {
 
     console.log('↩️ Admin undoing factory reset', { adminId });
 
-    // Get latest backup
     const { data: backups, error: backupError } = await supabase
       .from('settings_backup')
       .select('*')
@@ -4389,13 +4213,11 @@ router.post('/factory-reset/undo', authenticateAdmin, async (req, res) => {
       ? JSON.parse(backup.settings_data) 
       : backup.settings_data;
 
-    // Clear current settings
     await supabase
       .from('system_settings')
       .delete()
       .neq('setting_key', 'none');
 
-    // Restore from backup
     for (const [key, value] of Object.entries(settingsData)) {
       await supabase
         .from('system_settings')
@@ -4407,7 +4229,6 @@ router.post('/factory-reset/undo', authenticateAdmin, async (req, res) => {
         });
     }
 
-    // Log activity
     await supabase
       .from('admin_activity_logs')
       .insert({
@@ -4485,7 +4306,6 @@ router.post('/email/templates', authenticateAdmin, async (req, res) => {
 
     if (error) throw error;
 
-    // Log activity
     await supabase
       .from('admin_activity_logs')
       .insert({
@@ -4629,7 +4449,6 @@ router.post('/send-email-notification', authenticateAdmin, async (req, res) => {
 
     console.log(`📧 BACKEND: Will send to ${userEmails.length} users`);
 
-    // Send emails
     const emailResults = await emailService.sendToUsers(
       userEmails,
       cleanSubject,
@@ -4639,7 +4458,6 @@ router.post('/send-email-notification', authenticateAdmin, async (req, res) => {
     const sentCount = emailResults.filter(r => r.success).length;
     const failedCount = emailResults.filter(r => !r.success).length;
 
-    // Store emails in queue for tracking
     if (userEmails.length > 0) {
       for (const email of userEmails) {
         await supabase
@@ -4655,7 +4473,6 @@ router.post('/send-email-notification', authenticateAdmin, async (req, res) => {
       console.log('📧 BACKEND: Emails logged to queue');
     }
 
-    // Create in-app notifications for all users
     const broadcastMessage = `SYSTEM: ${cleanSubject} - ${cleanMessage.substring(0, 200)}${cleanMessage.length > 200 ? '...' : ''}`;
     let broadcastCount = 0;
     
@@ -4677,7 +4494,6 @@ router.post('/send-email-notification', authenticateAdmin, async (req, res) => {
       }
     }
 
-    // Log activity
     await supabase
       .from('admin_activity_logs')
       .insert({
@@ -4773,7 +4589,6 @@ router.post('/email/test', authenticateAdmin, async (req, res) => {
       `
     );
 
-    // Log activity
     await supabase
       .from('admin_activity_logs')
       .insert({
@@ -4870,7 +4685,6 @@ router.get('/groups', authenticateAdmin, async (req, res) => {
 
     if (error) throw error;
 
-    // Get member counts for each group
     const groupsWithCounts = await Promise.all((groups || []).map(async (group) => {
       const { count: memberCount } = await supabase
         .from('group_members')
@@ -4896,7 +4710,6 @@ router.get('/groups', authenticateAdmin, async (req, res) => {
       };
     }));
 
-    // Log activity
     try {
       await supabase
         .from('admin_activity_logs')
@@ -4934,7 +4747,6 @@ router.get('/groups', authenticateAdmin, async (req, res) => {
 router.get('/groups/:id', authenticateAdmin, async (req, res) => {
   try {
     const { id } = req.params;
-    const adminId = req.admin.id;
 
     console.log('👥 Admin: Fetching group details for ID:', id);
 
@@ -4997,11 +4809,9 @@ router.get('/groups/:id', authenticateAdmin, async (req, res) => {
 router.get('/groups/:id/members', authenticateAdmin, async (req, res) => {
   try {
     const { id } = req.params;
-    const adminId = req.admin.id;
 
     console.log('👥 Admin: Fetching members for group ID:', id);
 
-    // Verify group exists
     const { data: groups, error: gError } = await supabase
       .from('groups')
       .select('id, name')
@@ -5016,7 +4826,6 @@ router.get('/groups/:id/members', authenticateAdmin, async (req, res) => {
       });
     }
 
-    // Get group members
     const { data: members, error: mError } = await supabase
       .from('group_members')
       .select(`
@@ -5029,7 +4838,6 @@ router.get('/groups/:id/members', authenticateAdmin, async (req, res) => {
 
     if (mError) throw mError;
 
-    // Format members
     const formattedMembers = (members || []).map(member => ({
       user_id: member.user_id,
       group_id: member.group_id,
@@ -5071,7 +4879,6 @@ router.delete('/groups/:id', authenticateAdmin, async (req, res) => {
 
     console.log('🗑️ Admin: Deleting group ID:', id, 'Reason:', reason);
 
-    // Verify group exists
     const { data: groups, error: gError } = await supabase
       .from('groups')
       .select('*')
@@ -5088,7 +4895,6 @@ router.delete('/groups/:id', authenticateAdmin, async (req, res) => {
 
     const group = groups[0];
 
-    // Check if group has members
     const { count: memberCount, error: countError } = await supabase
       .from('group_members')
       .select('*', { count: 'exact', head: true })
@@ -5096,7 +4902,6 @@ router.delete('/groups/:id', authenticateAdmin, async (req, res) => {
 
     if (countError) throw countError;
 
-    // Remove all group members
     if (memberCount && memberCount > 0) {
       const { error: deleteError } = await supabase
         .from('group_members')
@@ -5106,7 +4911,6 @@ router.delete('/groups/:id', authenticateAdmin, async (req, res) => {
       if (deleteError) throw deleteError;
     }
 
-    // Delete group
     const { error: deleteGroupError } = await supabase
       .from('groups')
       .delete()
@@ -5114,7 +4918,6 @@ router.delete('/groups/:id', authenticateAdmin, async (req, res) => {
 
     if (deleteGroupError) throw deleteGroupError;
 
-    // Notify creator that group was deleted
     try {
       await supabase
         .from('notifications')
@@ -5129,7 +4932,6 @@ router.delete('/groups/:id', authenticateAdmin, async (req, res) => {
       console.warn('⚠️ Could not notify group creator:', notifyError.message);
     }
 
-    // Log admin activity
     await supabase
       .from('admin_activity_logs')
       .insert({
@@ -5172,7 +4974,6 @@ router.delete('/groups/:groupId/members/:userId', authenticateAdmin, async (req,
 
     console.log('👥 Admin: Removing member', userId, 'from group', groupId);
 
-    // Check if member exists
     const { data: members, error: mError } = await supabase
       .from('group_members')
       .select(`
@@ -5194,7 +4995,6 @@ router.delete('/groups/:groupId/members/:userId', authenticateAdmin, async (req,
 
     const member = members[0];
 
-    // Don't allow removing the creator
     const { data: groupInfo, error: infoError } = await supabase
       .from('groups')
       .select('creator_id')
@@ -5209,7 +5009,6 @@ router.delete('/groups/:groupId/members/:userId', authenticateAdmin, async (req,
       });
     }
 
-    // Remove member
     const { error: deleteError } = await supabase
       .from('group_members')
       .delete()
@@ -5218,7 +5017,6 @@ router.delete('/groups/:groupId/members/:userId', authenticateAdmin, async (req,
 
     if (deleteError) throw deleteError;
 
-    // Notify the removed user
     try {
       await supabase
         .from('notifications')
@@ -5233,7 +5031,6 @@ router.delete('/groups/:groupId/members/:userId', authenticateAdmin, async (req,
       console.warn('⚠️ Could not notify removed member:', notifyError.message);
     }
 
-    // Log activity
     await supabase
       .from('admin_activity_logs')
       .insert({
@@ -5303,7 +5100,6 @@ router.get('/analytics', authenticateAdmin, async (req, res) => {
     const { period = '30d' } = req.query;
     console.log('📈 Admin: Fetching analytics for period:', period);
 
-    // Calculate date range
     let intervalDays = 30;
     switch(period) {
       case '7d': intervalDays = 7; break;
@@ -5317,7 +5113,6 @@ router.get('/analytics', authenticateAdmin, async (req, res) => {
     const startDate = new Date();
     startDate.setDate(startDate.getDate() - intervalDays);
 
-    // Get all transactions in period
     const { data: transactions, error: txError } = await supabase
       .from('transactions')
       .select('amount, type, status, created_at')
@@ -5326,7 +5121,6 @@ router.get('/analytics', authenticateAdmin, async (req, res) => {
 
     if (txError) throw txError;
 
-    // Get matches in period
     const { data: matches, error: matchError } = await supabase
       .from('matches')
       .select('stake_amount, status, created_at')
@@ -5334,7 +5128,6 @@ router.get('/analytics', authenticateAdmin, async (req, res) => {
 
     if (matchError) throw matchError;
 
-    // Get tournaments in period
     const { data: tournaments, error: tourError } = await supabase
       .from('tournaments')
       .select('xp_entry_fee, status, created_at')
@@ -5343,7 +5136,6 @@ router.get('/analytics', authenticateAdmin, async (req, res) => {
 
     if (tourError) throw tourError;
 
-    // Get users in period
     const { data: users, error: userError } = await supabase
       .from('users')
       .select('created_at')
@@ -5351,7 +5143,6 @@ router.get('/analytics', authenticateAdmin, async (req, res) => {
 
     if (userError) throw userError;
 
-    // Get active users (last 7 days)
     const sevenDaysAgo = new Date();
     sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
     
@@ -5368,14 +5159,12 @@ router.get('/analytics', authenticateAdmin, async (req, res) => {
       if (match.player2_id) activeUserIds.add(match.player2_id);
     });
 
-    // Calculate totals
     const deposits = transactions?.filter(tx => tx.type === 'deposit') || [];
     const withdrawals = transactions?.filter(tx => tx.type === 'withdrawal') || [];
     
     const totalDeposits = deposits.reduce((sum, tx) => sum + parseFloat(tx.amount), 0);
     const totalWithdrawals = withdrawals.reduce((sum, tx) => sum + parseFloat(tx.amount), 0);
 
-    // Calculate platform fees
     const completedMatches = matches?.filter(m => m.status === 'completed') || [];
     const matchStakes = completedMatches.reduce((sum, m) => sum + (parseFloat(m.stake_amount) || 0), 0);
     const matchPlatformFees = matchStakes * 0.15;
@@ -5385,7 +5174,6 @@ router.get('/analytics', authenticateAdmin, async (req, res) => {
     
     const totalPlatformFees = matchPlatformFees + tournamentPlatformFees;
 
-    // Get revenue trend
     const revenueTrend = [];
     const days = intervalDays > 90 ? 7 : 1;
     let currentDate = new Date(startDate);
@@ -5406,7 +5194,6 @@ router.get('/analytics', authenticateAdmin, async (req, res) => {
       currentDate.setDate(currentDate.getDate() + days);
     }
 
-    // Get top games
     const { data: gameStats, error: gameError } = await supabase
       .from('matches')
       .select('game, stake_amount')
@@ -5485,7 +5272,6 @@ router.get('/reports/history', authenticateAdmin, async (req, res) => {
 
     console.log('📋 Admin: Fetching report history - Page:', page, 'Limit:', limit);
 
-    // Check if admin_reports table exists
     const { data: reports, error, count } = await supabase
       .from('admin_reports')
       .select('*', { count: 'exact' })
@@ -5493,7 +5279,6 @@ router.get('/reports/history', authenticateAdmin, async (req, res) => {
       .range(offset, offset + limit - 1);
 
     if (error) {
-      // Table might not exist, create it
       console.warn('Reports table might not exist:', error.message);
       return res.json({
         success: true,
@@ -5667,7 +5452,6 @@ router.post('/reports/generate', authenticateAdmin, async (req, res) => {
           net_amount: tx.type === 'deposit' ? tx.amount : tx.type === 'withdrawal' ? -tx.amount : tx.amount
         }));
 
-        // Get platform fees
         const { data: platformFeesMatches, error: pfError } = await supabase
           .from('matches')
           .select('stake_amount, created_at, id')
@@ -5712,7 +5496,6 @@ router.post('/reports/generate', authenticateAdmin, async (req, res) => {
         });
     }
 
-    // Save report to database
     const reportId = `report_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
     
     try {
@@ -5734,7 +5517,6 @@ router.post('/reports/generate', authenticateAdmin, async (req, res) => {
       console.warn('⚠️ Could not save report to database:', saveError.message);
     }
 
-    // Log activity
     await supabase
       .from('admin_activity_logs')
       .insert({
@@ -5744,7 +5526,6 @@ router.post('/reports/generate', authenticateAdmin, async (req, res) => {
         created_at: new Date().toISOString()
       });
 
-    // Return report data
     if (format === 'csv') {
       const csv = convertToCSV(reportData);
       res.setHeader('Content-Type', 'text/csv');
@@ -5874,7 +5655,6 @@ router.get('/reports/:id/download', authenticateAdmin, async (req, res) => {
 
     console.log('📥 Admin: Downloading report:', id, 'Format:', format);
 
-    // Get report from database
     const { data: reports, error: reportError } = await supabase
       .from('admin_reports')
       .select('*')
@@ -5889,13 +5669,11 @@ router.get('/reports/:id/download', authenticateAdmin, async (req, res) => {
 
     const report = reports[0];
 
-    // Update download count
     await supabase
       .from('admin_reports')
       .update({ download_count: (report.download_count || 0) + 1 })
       .eq('id', id);
 
-    // Generate report data
     let reportData = [];
 
     switch(report.report_type) {
@@ -6003,7 +5781,6 @@ router.get('/reports/:id/download', authenticateAdmin, async (req, res) => {
         break;
     }
 
-    // Log activity
     await supabase
       .from('admin_activity_logs')
       .insert({
@@ -6037,7 +5814,6 @@ router.get('/reports/:id/download', authenticateAdmin, async (req, res) => {
   }
 });
 
-// Helper function to convert data to CSV
 function convertToCSV(data) {
   if (!data || data.length === 0) return '';
   
@@ -6178,7 +5954,6 @@ router.post('/admins', authenticateAdmin, async (req, res) => {
       });
     }
 
-    // Check if username already exists
     const { data: existingUsername, error: uError } = await supabase
       .from('admin_users')
       .select('id')
@@ -6193,7 +5968,6 @@ router.post('/admins', authenticateAdmin, async (req, res) => {
       });
     }
 
-    // Check if email already exists
     const { data: existingEmail, error: eError } = await supabase
       .from('admin_users')
       .select('id')
@@ -6208,10 +5982,8 @@ router.post('/admins', authenticateAdmin, async (req, res) => {
       });
     }
 
-    // Hash password
     const hashedPassword = await bcrypt.hash(password, 10);
 
-    // Ensure permissions is valid JSON
     let permissionsJson = '[]';
     try {
       if (Array.isArray(permissions)) {
@@ -6225,7 +5997,6 @@ router.post('/admins', authenticateAdmin, async (req, res) => {
       permissionsJson = '[]';
     }
 
-    // Create admin
     const { data: newAdmin, error: createError } = await supabase
       .from('admin_users')
       .insert({
@@ -6242,7 +6013,6 @@ router.post('/admins', authenticateAdmin, async (req, res) => {
 
     if (createError) throw createError;
 
-    // Log activity
     await supabase
       .from('admin_activity_logs')
       .insert({
@@ -6285,7 +6055,6 @@ router.put('/admins/:id', authenticateAdmin, async (req, res) => {
 
     console.log('👑 Admin: Updating admin:', id, 'Requested by:', adminId);
 
-    // Check if admin exists
     const { data: admins, error: checkError } = await supabase
       .from('admin_users')
       .select('id, username')
@@ -6358,7 +6127,6 @@ router.put('/admins/:id', authenticateAdmin, async (req, res) => {
 
     if (updateError) throw updateError;
 
-    // Log activity
     await supabase
       .from('admin_activity_logs')
       .insert({
@@ -6403,7 +6171,6 @@ router.put('/admins/:id/password', authenticateAdmin, async (req, res) => {
       });
     }
 
-    // Check if admin exists
     const { data: admins, error: checkError } = await supabase
       .from('admin_users')
       .select('id, username')
@@ -6419,11 +6186,8 @@ router.put('/admins/:id/password', authenticateAdmin, async (req, res) => {
     }
 
     const admin = admins[0];
-
-    // Hash new password
     const hashedPassword = await bcrypt.hash(newPassword, 10);
 
-    // Update password
     const { error: updateError } = await supabase
       .from('admin_users')
       .update({
@@ -6434,7 +6198,6 @@ router.put('/admins/:id/password', authenticateAdmin, async (req, res) => {
 
     if (updateError) throw updateError;
 
-    // Log activity
     await supabase
       .from('admin_activity_logs')
       .insert({
@@ -6467,7 +6230,6 @@ router.delete('/admins/:id', authenticateAdmin, async (req, res) => {
 
     console.log('👑 Admin: Deleting admin:', id, 'Requested by:', adminId);
 
-    // Cannot delete yourself
     if (parseInt(id) === parseInt(adminId)) {
       return res.status(400).json({
         success: false,
@@ -6475,7 +6237,6 @@ router.delete('/admins/:id', authenticateAdmin, async (req, res) => {
       });
     }
 
-    // Check if admin exists
     const { data: admins, error: checkError } = await supabase
       .from('admin_users')
       .select('id, username, role')
@@ -6492,7 +6253,6 @@ router.delete('/admins/:id', authenticateAdmin, async (req, res) => {
 
     const admin = admins[0];
 
-    // Get requester role
     const { data: requesterData, error: reqError } = await supabase
       .from('admin_users')
       .select('role')
@@ -6509,7 +6269,6 @@ router.delete('/admins/:id', authenticateAdmin, async (req, res) => {
       });
     }
 
-    // Soft delete (deactivate) instead of hard delete
     const { error: updateError } = await supabase
       .from('admin_users')
       .update({
@@ -6520,7 +6279,6 @@ router.delete('/admins/:id', authenticateAdmin, async (req, res) => {
 
     if (updateError) throw updateError;
 
-    // Log activity
     await supabase
       .from('admin_activity_logs')
       .insert({
@@ -6558,7 +6316,6 @@ router.post('/admins/:id/toggle-active', authenticateAdmin, async (req, res) => 
 
     console.log('👑 Admin: Toggling active status for admin:', id, 'Status:', is_active);
 
-    // Cannot toggle your own status
     if (parseInt(id) === parseInt(adminId)) {
       return res.status(400).json({
         success: false,
@@ -6566,7 +6323,6 @@ router.post('/admins/:id/toggle-active', authenticateAdmin, async (req, res) => 
       });
     }
 
-    // Check if admin exists
     const { data: admins, error: checkError } = await supabase
       .from('admin_users')
       .select('id, username')
@@ -6583,7 +6339,6 @@ router.post('/admins/:id/toggle-active', authenticateAdmin, async (req, res) => 
 
     const admin = admins[0];
 
-    // Update active status
     const { error: updateError } = await supabase
       .from('admin_users')
       .update({
@@ -6594,7 +6349,6 @@ router.post('/admins/:id/toggle-active', authenticateAdmin, async (req, res) => 
 
     if (updateError) throw updateError;
 
-    // Log activity
     await supabase
       .from('admin_activity_logs')
       .insert({
@@ -6667,7 +6421,6 @@ router.post('/admins/:id/promote', authenticateAdmin, async (req, res) => {
       });
     }
 
-    // Only super admin can promote to super_admin
     if (promote_to === 'super_admin') {
       const { data: requesterData, error: reqError } = await supabase
         .from('admin_users')
@@ -6686,7 +6439,6 @@ router.post('/admins/:id/promote', authenticateAdmin, async (req, res) => {
       }
     }
 
-    // Check if admin exists
     const { data: admins, error: checkError } = await supabase
       .from('admin_users')
       .select('id, username, role')
@@ -6704,7 +6456,6 @@ router.post('/admins/:id/promote', authenticateAdmin, async (req, res) => {
     const admin = admins[0];
     const oldRole = admin.role;
 
-    // Update role
     const { error: updateError } = await supabase
       .from('admin_users')
       .update({
@@ -6715,7 +6466,6 @@ router.post('/admins/:id/promote', authenticateAdmin, async (req, res) => {
 
     if (updateError) throw updateError;
 
-    // Log activity
     await supabase
       .from('admin_activity_logs')
       .insert({
