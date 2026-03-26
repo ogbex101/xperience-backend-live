@@ -1,11 +1,28 @@
+console.log('🔧 LOADING admin.js - START');
+
 const express = require('express');
 const router = express.Router();
+console.log('🔧 1. Express loaded');
+
 const { supabaseAdmin, supabase, isSupabase } = require('../config/database');
+console.log('🔧 2. Database loaded, isSupabase:', isSupabase);
+
 const bcrypt = require('bcrypt');
+console.log('🔧 3. Bcrypt loaded');
+
 const jwt = require('jsonwebtoken');
+console.log('🔧 4. JWT loaded');
+
 const { v4: uuidv4 } = require('uuid');
+console.log('🔧 5. UUID loaded');
+
 const multer = require('multer');
+console.log('🔧 6. Multer loaded');
+
 const emailService = require('../services/emailService');
+console.log('🔧 7. Email service loaded');
+
+console.log('🔧 LOADING admin.js - COMPLETE');
 
 // ==================== TEST & DEBUG ROUTES ====================
 
