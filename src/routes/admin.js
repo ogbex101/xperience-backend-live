@@ -89,7 +89,6 @@ router.post('/login-test', (req, res) => {
 
 // ==================== MIDDLEWARE ====================
 
-// Middleware to verify admin token
 const authenticateAdmin = async (req, res, next) => {
   try {
     console.log('🛡️ Admin auth middleware checking...');
@@ -120,36 +119,65 @@ const authenticateAdmin = async (req, res, next) => {
     console.log('Token decoded:', { 
       id: decoded.id, 
       username: decoded.username,
-      role: decoded.role 
+      role: decoded.role,
+      type: decoded.type 
     });
     
-    // Check if user is admin using Supabase
-    const { data: adminRows, error: adminError } = await supabase
-      .from('admin_users')
-      .select('id, username, role, is_active')
-      .eq('id', decoded.id);
+    // ✅ FIX: Handle hardcoded admin (id: 999)
+    if (decoded.id === 999 && decoded.username === 'admin') {
+      console.log('✅ Hardcoded admin detected (id: 999) - granting access');
+      req.admin = {
+        id: 999,
+        username: 'admin',
+        email: 'admin@xperience.com',
+        role: 'super_admin',
+        permissions: ['all'],
+        is_active: true
+      };
+      console.log('✅ Admin authenticated (hardcoded):', req.admin.username);
+      return next();
+    }
+    
+    // For normal database admins with UUID
+    try {
+      // Convert to string for UUID comparison
+      const adminId = String(decoded.id);
+      
+      const { data: adminRows, error: adminError } = await supabase
+        .from('admin_users')
+        .select('id, username, email, role, permissions, is_active')
+        .eq('id', adminId);
 
-    if (adminError) {
-      console.error('❌ Admin query error:', adminError);
-      return res.status(401).json({ 
+      if (adminError) {
+        console.error('❌ Admin query error:', adminError);
+        return res.status(401).json({ 
+          success: false, 
+          message: 'Authentication failed' 
+        });
+      }
+
+      const admin = adminRows && adminRows.length > 0 ? adminRows[0] : null;
+
+      if (!admin || admin.is_active !== true) {
+        console.log('❌ Admin not found or inactive');
+        return res.status(403).json({ 
+          success: false, 
+          message: 'Admin access denied' 
+        });
+      }
+
+      req.admin = admin;
+      console.log('✅ Admin authenticated (database):', admin.username);
+      next();
+      
+    } catch (dbError) {
+      console.error('❌ Database lookup error:', dbError);
+      return res.status(500).json({ 
         success: false, 
-        message: 'Authentication failed' 
+        message: 'Database error during authentication' 
       });
     }
-
-    const admin = adminRows && adminRows.length > 0 ? adminRows[0] : null;
-
-    if (!admin || admin.is_active !== true) {
-      console.log('❌ Admin not found or inactive');
-      return res.status(403).json({ 
-        success: false, 
-        message: 'Admin access denied' 
-      });
-    }
-
-    req.admin = admin;
-    console.log('✅ Admin authenticated:', admin.username);
-    next();
+    
   } catch (error) {
     console.error('❌ Admin auth error:', error.message);
     
