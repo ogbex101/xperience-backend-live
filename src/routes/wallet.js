@@ -6,7 +6,28 @@ const { v4: uuidv4 } = require('uuid');
 const crypto = require('crypto');
 const supabase = db.isSupabase ? db.supabaseBuilder : null;
 const supabaseBuilder = db.isSupabase ? db.supabaseBuilder : null;
-
+// Helper to get authenticated Supabase client for the current user
+const getAuthSupabase = (token) => {
+  if (!db.isSupabase) return db;
+  
+  const { createClient } = require('@supabase/supabase-js');
+  
+  return createClient(
+    process.env.SUPABASE_URL,
+    process.env.SUPABASE_ANON_KEY,
+    {
+      auth: {
+        autoRefreshToken: false,
+        persistSession: false
+      },
+      global: {
+        headers: {
+          Authorization: `Bearer ${token}`
+        }
+      }
+    }
+  );
+};
 // Helper function to verify transaction PIN
 const verifyTransactionPin = async (userId, pin) => {
   if (db.isSupabase) {
@@ -502,69 +523,46 @@ router.get('/xp-transactions', authenticateToken, async (req, res) => {
   }
 });
 
-// Initialize Flutterwave payment (V4 API)
 router.post('/fund/initialize', authenticateToken, async (req, res) => {
   try {
     const { amount, currency = 'NGN' } = req.body;
     const userId = req.user.id;
+    const token = req.headers.authorization?.replace('Bearer ', '');
     
-    if (!amount || amount <= 0) {
-      return res.status(400).json({ success: false, message: 'Invalid amount' });
-    }
+    // Create authenticated client for THIS user
+    const supabaseAuth = getAuthSupabase(token);
     
-    // Generate transaction reference
     const reference = `XTX-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
     
-    // Create pending transaction in database
-    let transactionId;
-    if (db.isSupabase) {
-      const { data, error } = await db.supabase
-        .from('transactions')
-        .insert([{
-          user_id: userId,
-          amount,
-          currency,
-          type: 'deposit',
-          status: 'pending',
-          reference,
-          description: 'Wallet deposit via Flutterwave'
-        }])
-        .select();
-      
-      if (error) throw error;
-      transactionId = data[0].id;
-    } else {
-      const result = await db.query(
-        `INSERT INTO transactions 
-         (user_id, amount, currency, type, status, reference, description) 
-         VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
-        [userId, amount, currency, 'deposit', 'pending', reference, 'Wallet deposit via Flutterwave']
-      );
-      
-      const rows = result[0];
-      transactionId = rows[0].id;
+    // Use the authenticated client for INSERT
+    const { data, error } = await supabaseAuth
+      .from('transactions')
+      .insert([{
+        user_id: userId,
+        amount,
+        currency,
+        type: 'deposit',
+        status: 'pending',
+        reference,
+        description: 'Wallet deposit via Flutterwave'
+      }])
+      .select();
+    
+    if (error) {
+      console.error('Error creating transaction:', error);
+      return res.status(500).json({ success: false, message: error.message });
     }
     
-    // Get user details
-    let user;
-    if (db.isSupabase) {
-      const { data, error } = await db.supabase
-        .from('users')
-        .select('email, username')
-        .eq('id', userId)
-        .single();
-      
-      if (!error) user = data;
-    } else {
-      const userResult = await db.query(
-        'SELECT email, username FROM users WHERE id = $1',
-        [userId]
-      );
-      const userRows = userResult[0];
-      user = userRows[0];
-    }
+    const transactionId = data[0].id;
     
-    // Create payment payload for Flutterwave V4 API
+    // Get user details (use regular db.supabase for SELECT - no auth needed)
+    const { data: user } = await db.supabase
+      .from('users')
+      .select('email, username')
+      .eq('id', userId)
+      .single();
+    
+    // Rest of your Flutterwave code remains the same...
     const paymentPayload = {
       tx_ref: reference,
       amount: parseFloat(amount),
@@ -581,9 +579,6 @@ router.post('/fund/initialize', authenticateToken, async (req, res) => {
       }
     };
     
-    console.log('💰 Creating Flutterwave payment:', { reference, amount, currency });
-    
-    // Make API call to Flutterwave
     const flutterwaveResponse = await fetch('https://api.flutterwave.com/v3/payments', {
       method: 'POST',
       headers: {
@@ -594,29 +589,19 @@ router.post('/fund/initialize', authenticateToken, async (req, res) => {
     });
     
     const flutterwaveData = await flutterwaveResponse.json();
-    console.log('💰 Flutterwave response:', flutterwaveData);
     
     if (flutterwaveData.status === 'success') {
       res.json({
         success: true,
         transaction_id: transactionId,
         reference: reference,
-        payment_link: flutterwaveData.data.link,
-        flutterwave_data: flutterwaveData.data
+        payment_link: flutterwaveData.data.link
       });
     } else {
-      // Update transaction status to failed
-      if (db.isSupabase) {
-        await db.supabase
-          .from('transactions')
-          .update({ status: 'failed' })
-          .eq('id', transactionId);
-      } else {
-        await db.query(
-          'UPDATE transactions SET status = $1 WHERE id = $2',
-          ['failed', transactionId]
-        );
-      }
+      await supabaseAuth
+        .from('transactions')
+        .update({ status: 'failed' })
+        .eq('id', transactionId);
       
       res.status(400).json({
         success: false,
