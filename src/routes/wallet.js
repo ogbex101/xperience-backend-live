@@ -502,7 +502,7 @@ router.get('/xp-transactions', authenticateToken, async (req, res) => {
   }
 });
 
-// Initialize Flutterwave payment
+// Initialize Flutterwave payment (V4 API)
 router.post('/fund/initialize', authenticateToken, async (req, res) => {
   try {
     const { amount, currency = 'NGN' } = req.body;
@@ -515,7 +515,7 @@ router.post('/fund/initialize', authenticateToken, async (req, res) => {
     // Generate transaction reference
     const reference = `XTX-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
     
-    // Create pending transaction
+    // Create pending transaction in database
     let transactionId;
     if (db.isSupabase) {
       const { data, error } = await db.supabase
@@ -534,19 +534,18 @@ router.post('/fund/initialize', authenticateToken, async (req, res) => {
       if (error) throw error;
       transactionId = data[0].id;
     } else {
-      const resultResult = await db.query(
+      const result = await db.query(
         `INSERT INTO transactions 
          (user_id, amount, currency, type, status, reference, description) 
          VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
-        [userId, amount, currency, 'deposit', 'pending', reference, `Wallet deposit via Flutterwave`]
+        [userId, amount, currency, 'deposit', 'pending', reference, 'Wallet deposit via Flutterwave']
       );
       
-      const rows = resultResult[0];
-      const result = rows && rows.length > 0 ? rows[0] : null;
-      transactionId = result.id;
+      const rows = result[0];
+      transactionId = rows[0].id;
     }
     
-    // Get user details for Flutterwave
+    // Get user details
     let user;
     if (db.isSupabase) {
       const { data, error } = await db.supabase
@@ -561,126 +560,162 @@ router.post('/fund/initialize', authenticateToken, async (req, res) => {
         'SELECT email, username FROM users WHERE id = $1',
         [userId]
       );
-      
       const userRows = userResult[0];
-      user = userRows && userRows.length > 0 ? userRows[0] : null;
+      user = userRows[0];
     }
     
-    // In your wallet.js, in the /fund/initialize endpoint
-const flutterwaveConfig = {
-  public_key: process.env.FLUTTERWAVE_PUBLIC_KEY,
-  tx_ref: reference,
-  amount: amount,
-  currency: currency,
-  redirect_url: `${process.env.CLIENT_URL || 'https://xperience-frontend-live-49xr.vercel.app'}/wallet/callback`,
-  customer: {
-    email: user?.email || 'customer@example.com',
-    name: user?.username || 'User',
-  },
-  customizations: {
-    title: "XP Gaming Wallet",
-    description: `Deposit of ${amount} ${currency}`,
-    logo: "https://your-logo-url.com/logo.png"
-  }
-};
+    // Create payment payload for Flutterwave V4 API
+    const paymentPayload = {
+      tx_ref: reference,
+      amount: parseFloat(amount),
+      currency: currency,
+      redirect_url: `${process.env.CLIENT_URL}/wallet/callback`,
+      customer: {
+        email: user?.email || 'customer@example.com',
+        name: user?.username || 'User',
+      },
+      customizations: {
+        title: "XP Gaming Wallet",
+        description: `Deposit of ${amount} ${currency}`,
+        logo: "https://your-logo-url.com/logo.png"
+      }
+    };
     
-    res.json({
-      success: true,
-      transaction_id: transactionId,
-      reference,
-      flutterwave_config: flutterwaveConfig
+    console.log('💰 Creating Flutterwave payment:', { reference, amount, currency });
+    
+    // Make API call to Flutterwave
+    const flutterwaveResponse = await fetch('https://api.flutterwave.com/v3/payments', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${process.env.FLUTTERWAVE_CLIENT_SECRET}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(paymentPayload)
     });
+    
+    const flutterwaveData = await flutterwaveResponse.json();
+    console.log('💰 Flutterwave response:', flutterwaveData);
+    
+    if (flutterwaveData.status === 'success') {
+      res.json({
+        success: true,
+        transaction_id: transactionId,
+        reference: reference,
+        payment_link: flutterwaveData.data.link,
+        flutterwave_data: flutterwaveData.data
+      });
+    } else {
+      // Update transaction status to failed
+      if (db.isSupabase) {
+        await db.supabase
+          .from('transactions')
+          .update({ status: 'failed' })
+          .eq('id', transactionId);
+      } else {
+        await db.query(
+          'UPDATE transactions SET status = $1 WHERE id = $2',
+          ['failed', transactionId]
+        );
+      }
+      
+      res.status(400).json({
+        success: false,
+        message: flutterwaveData.message || 'Payment initialization failed'
+      });
+    }
     
   } catch (error) {
     console.error('Error initializing payment:', error);
     res.status(500).json({ success: false, message: 'Error initializing payment' });
   }
 });
-
-// Flutterwave webhook/callback
 router.post('/fund/webhook', async (req, res) => {
   try {
     const secretHash = process.env.FLW_SECRET_HASH;
     const signature = req.headers['verif-hash'];
     
+    console.log('📡 Webhook received');
+    
+    // Verify webhook signature
     if (!signature || signature !== secretHash) {
+      console.log('❌ Invalid webhook signature');
       return res.status(401).json({ success: false, message: 'Unauthorized' });
     }
     
     const payload = req.body;
-    const { tx_ref, status, transaction_id: flw_transaction_id } = payload.data;
+    console.log('📡 Webhook payload:', JSON.stringify(payload, null, 2));
     
-    // Find transaction
-    let transaction;
-    if (db.isSupabase) {
-      const { data, error } = await db.supabase
-        .from('transactions')
-        .select('*')
-        .eq('reference', tx_ref)
-        .single();
-      
-      if (error || !data) {
-        return res.status(404).json({ success: false, message: 'Transaction not found' });
-      }
-      transaction = data;
-    } else {
-      const transactionsResult = await db.query(
-        'SELECT * FROM transactions WHERE reference = $1',
-        [tx_ref]
-      );
-      
-      const rows = transactionsResult[0];
-      const transactions = rows || [];
-      
-      if (transactions.length === 0) {
-        return res.status(404).json({ success: false, message: 'Transaction not found' });
-      }
-      
-      transaction = transactions[0];
-    }
-    
-    let newStatus = 'pending';
+    const { tx_ref, status, amount, currency } = payload.data;
     
     if (status === 'successful') {
-      newStatus = 'completed';
-      
-      // Update user balance
+      // Find transaction
+      let transaction;
       if (db.isSupabase) {
-        const { error } = await db.supabase
-          .from('users')
-          .update({ balance: db.supabase.rpc('increment', { x: parseFloat(transaction.amount) }) })
-          .eq('id', transaction.user_id);
+        const { data, error } = await db.supabase
+          .from('transactions')
+          .select('*')
+          .eq('reference', tx_ref)
+          .single();
         
-        if (error) throw error;
+        if (error || !data) {
+          console.error('Transaction not found:', tx_ref);
+          return res.status(404).json({ success: false, message: 'Transaction not found' });
+        }
+        transaction = data;
       } else {
-        await db.query(
-          'UPDATE users SET balance = balance + $1 WHERE id = $2',
-          [parseFloat(transaction.amount), transaction.user_id]
+        const result = await db.query(
+          'SELECT * FROM transactions WHERE reference = $1',
+          [tx_ref]
         );
+        const rows = result[0];
+        if (!rows || rows.length === 0) {
+          console.error('Transaction not found:', tx_ref);
+          return res.status(404).json({ success: false, message: 'Transaction not found' });
+        }
+        transaction = rows[0];
       }
-    } else if (status === 'failed') {
-      newStatus = 'failed';
-    }
-    
-    // Update transaction
-    if (db.isSupabase) {
-      const { error } = await db.supabase
-        .from('transactions')
-        .update({
-          status: newStatus,
-          external_reference: flw_transaction_id || null,
-          completed_at: new Date().toISOString()
-        })
-        .eq('id', transaction.id);
       
-      if (error) throw error;
-    } else {
-      await db.query(
-        `UPDATE transactions 
-         SET status = $1, external_reference = $2, completed_at = NOW() 
-         WHERE id = $3`,
-        [newStatus, flw_transaction_id || null, transaction.id]
-      );
+      // Only process if still pending
+      if (transaction.status === 'pending') {
+        // Update user balance
+        if (db.isSupabase) {
+          const { data: userData } = await db.supabase
+            .from('users')
+            .select('balance')
+            .eq('id', transaction.user_id)
+            .single();
+          
+          const newBalance = (userData?.balance || 0) + parseFloat(transaction.amount);
+          
+          await db.supabase
+            .from('users')
+            .update({ balance: newBalance })
+            .eq('id', transaction.user_id);
+        } else {
+          await db.query(
+            'UPDATE users SET balance = balance + $1 WHERE id = $2',
+            [parseFloat(transaction.amount), transaction.user_id]
+          );
+        }
+        
+        // Update transaction status
+        if (db.isSupabase) {
+          await db.supabase
+            .from('transactions')
+            .update({ 
+              status: 'completed',
+              completed_at: new Date().toISOString()
+            })
+            .eq('id', transaction.id);
+        } else {
+          await db.query(
+            'UPDATE transactions SET status = $1, completed_at = NOW() WHERE id = $2',
+            ['completed', transaction.id]
+          );
+        }
+        
+        console.log(`✅ Payment completed for user ${transaction.user_id}: +${transaction.amount}`);
+      }
     }
     
     res.json({ success: true, message: 'Webhook processed' });
