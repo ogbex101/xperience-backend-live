@@ -522,7 +522,112 @@ router.get('/xp-transactions', authenticateToken, async (req, res) => {
     res.status(500).json({ success: false, message: 'Error fetching XP transaction history' });
   }
 });
-
+// Payment Link Method - SIMPLE & RELIABLE
+router.post('/fund/payment-link', authenticateToken, async (req, res) => {
+  try {
+    const { amount, currency = 'USD' } = req.body;
+    const userId = req.user.id;
+    
+    if (!amount || amount <= 0) {
+      return res.status(400).json({ success: false, message: 'Invalid amount' });
+    }
+    
+    // Generate unique transaction reference
+    const reference = `XTX-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+    
+    // Create pending transaction in database
+    const { data, error } = await db.supabaseAdmin
+      .from('transactions')
+      .insert([{
+        user_id: userId,
+        amount: parseFloat(amount),
+        currency,
+        type: 'deposit',
+        status: 'pending',
+        reference,
+        description: 'Wallet deposit via Flutterwave Payment Link'
+      }])
+      .select();
+    
+    if (error) {
+      console.error('Error creating transaction:', error);
+      return res.status(500).json({ success: false, message: 'Failed to create transaction' });
+    }
+    
+    // Your payment link (the one you created)
+    const PAYMENT_LINK = 'https://flutterwave.com/pay/ppbagwxxxhep';
+    
+    // Append amount, reference, and customer email as query parameters
+    const paymentLink = `${PAYMENT_LINK}?amount=${amount}&currency=${currency}&tx_ref=${reference}`;
+    
+    res.json({
+      success: true,
+      transaction_id: data[0].id,
+      reference: reference,
+      payment_link: paymentLink
+    });
+    
+  } catch (error) {
+    console.error('Error creating payment link:', error);
+    res.status(500).json({ success: false, message: 'Error creating payment link' });
+  }
+});
+// Webhook for Flutterwave Payment Link
+router.post('/flutterwave-webhook', async (req, res) => {
+  try {
+    const payload = req.body;
+    console.log('📡 Webhook received:', payload);
+    
+    const { tx_ref, status, amount, currency } = payload.data || payload;
+    
+    if (status === 'successful') {
+      // Find transaction
+      const { data: transaction, error } = await db.supabaseAdmin
+        .from('transactions')
+        .select('*')
+        .eq('reference', tx_ref)
+        .single();
+      
+      if (error || !transaction) {
+        console.error('Transaction not found:', tx_ref);
+        return res.status(404).json({ success: false, message: 'Transaction not found' });
+      }
+      
+      if (transaction.status === 'pending') {
+        // Update user balance
+        const { data: userData } = await db.supabaseAdmin
+          .from('users')
+          .select('balance')
+          .eq('id', transaction.user_id)
+          .single();
+        
+        const newBalance = (userData?.balance || 0) + parseFloat(transaction.amount);
+        
+        await db.supabaseAdmin
+          .from('users')
+          .update({ balance: newBalance })
+          .eq('id', transaction.user_id);
+        
+        // Update transaction status
+        await db.supabaseAdmin
+          .from('transactions')
+          .update({ 
+            status: 'completed',
+            completed_at: new Date().toISOString()
+          })
+          .eq('id', transaction.id);
+        
+        console.log(`✅ Payment completed for user ${transaction.user_id}: +${transaction.amount}`);
+      }
+    }
+    
+    res.json({ success: true, message: 'Webhook processed' });
+    
+  } catch (error) {
+    console.error('Error processing webhook:', error);
+    res.status(500).json({ success: false, message: 'Error processing webhook' });
+  }
+});
 router.post('/fund/initialize', authenticateToken, async (req, res) => {
   try {
     const { amount, currency = 'NGN' } = req.body;
