@@ -527,15 +527,15 @@ router.post('/fund/initialize', authenticateToken, async (req, res) => {
   try {
     const { amount, currency = 'NGN' } = req.body;
     const userId = req.user.id;
-    const token = req.headers.authorization?.replace('Bearer ', '');
     
-    // Create authenticated client for THIS user
-    const supabaseAuth = getAuthSupabase(token);
+    if (!amount || amount <= 0) {
+      return res.status(400).json({ success: false, message: 'Invalid amount' });
+    }
     
     const reference = `XTX-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
     
-    // Use the authenticated client for INSERT
-    const { data, error } = await supabaseAuth
+    // USE supabaseAdmin to bypass RLS - NO token needed
+    const { data, error } = await db.supabaseAdmin
       .from('transactions')
       .insert([{
         user_id: userId,
@@ -555,14 +555,14 @@ router.post('/fund/initialize', authenticateToken, async (req, res) => {
     
     const transactionId = data[0].id;
     
-    // Get user details (use regular db.supabase for SELECT - no auth needed)
+    // Get user details (SELECT is fine with regular client)
     const { data: user } = await db.supabase
       .from('users')
       .select('email, username')
       .eq('id', userId)
       .single();
     
-    // Rest of your Flutterwave code remains the same...
+    // Flutterwave payment initialization
     const paymentPayload = {
       tx_ref: reference,
       amount: parseFloat(amount),
@@ -582,7 +582,7 @@ router.post('/fund/initialize', authenticateToken, async (req, res) => {
     const flutterwaveResponse = await fetch('https://api.flutterwave.com/v3/payments', {
       method: 'POST',
       headers: {
-        'Authorization': `Bearer ${process.env.FLUTTERWAVE_CLIENT_SECRET}`,
+        'Authorization': `Bearer ${process.env.FLUTTERWAVE_SECRET_KEY}`,
         'Content-Type': 'application/json'
       },
       body: JSON.stringify(paymentPayload)
@@ -598,7 +598,8 @@ router.post('/fund/initialize', authenticateToken, async (req, res) => {
         payment_link: flutterwaveData.data.link
       });
     } else {
-      await supabaseAuth
+      // Update transaction to failed using supabaseAdmin
+      await db.supabaseAdmin
         .from('transactions')
         .update({ status: 'failed' })
         .eq('id', transactionId);
