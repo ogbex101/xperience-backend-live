@@ -1462,11 +1462,13 @@ if (xpTxError) {
     });
   }
 });
-// Transfer XP points to another user
+// Transfer XP points to another user - FIXED VERSION
 router.post('/transfer/xp', authenticateToken, async (req, res) => {
   try {
     const { recipient_account, xp_points, pin, description } = req.body;
     const senderId = req.user.id;
+    
+    console.log('💰 XP Transfer request:', { recipient_account, xp_points, senderId });
     
     if (!recipient_account || !xp_points || !pin) {
       return res.status(400).json({ 
@@ -1494,34 +1496,38 @@ router.post('/transfer/xp', authenticateToken, async (req, res) => {
     let sender, recipient;
     
     if (db.isSupabase) {
-      // Get sender data
-      const { data: senderData, error: senderError } = await db.supabase
+      // Get sender data - USE ADMIN CLIENT
+      const { data: senderData, error: senderError } = await db.supabaseAdmin
         .from('users')
         .select('xp_points, username')
         .eq('id', senderId)
         .single();
       
-      if (senderError) throw senderError;
+      if (senderError) {
+        console.error('Error fetching sender:', senderError);
+        throw senderError;
+      }
       sender = senderData;
       
       if ((parseInt(sender.xp_points) || 0) < parseInt(xp_points)) {
         return res.status(400).json({ 
           success: false, 
-          message: 'Insufficient XP points' 
+          message: `Insufficient XP points. You have ${sender.xp_points || 0} XP` 
         });
       }
       
-      // Find recipient
-      const { data: recipientData, error: recipientError } = await db.supabase
+      // Find recipient by wallet account number - USE ADMIN CLIENT
+      const { data: recipientData, error: recipientError } = await db.supabaseAdmin
         .from('users')
-        .select('id, username')
+        .select('id, username, xp_points')
         .eq('wallet_account_number', recipient_account)
         .single();
       
       if (recipientError || !recipientData) {
+        console.error('Recipient not found:', recipient_account);
         return res.status(404).json({ 
           success: false, 
-          message: 'Recipient not found' 
+          message: 'Recipient not found. Please check the account number.' 
         });
       }
       recipient = recipientData;
@@ -1529,54 +1535,82 @@ router.post('/transfer/xp', authenticateToken, async (req, res) => {
       if (recipient.id === senderId) {
         return res.status(400).json({ 
           success: false, 
-          message: 'Cannot transfer to yourself' 
+          message: 'Cannot transfer XP to yourself' 
         });
       }
       
-      // Perform transfer in Supabase (sequential)
+      // Calculate new XP values
+      const newSenderXp = (parseInt(sender.xp_points) || 0) - parseInt(xp_points);
+      const newRecipientXp = (parseInt(recipient.xp_points) || 0) + parseInt(xp_points);
+      
+      console.log('XP Transfer calculation:', {
+        sender: { old: sender.xp_points, new: newSenderXp },
+        recipient: { old: recipient.xp_points, new: newRecipientXp },
+        amount: xp_points
+      });
+      
       // 1. Deduct from sender
-      const { error: deductError } = await db.supabase
+      const { error: deductError } = await db.supabaseAdmin
         .from('users')
-        .update({ xp_points: db.supabase.rpc('decrement', { x: parseInt(xp_points) }) })
+        .update({ xp_points: newSenderXp })
         .eq('id', senderId);
       
-      if (deductError) throw deductError;
+      if (deductError) {
+        console.error('Error deducting XP:', deductError);
+        throw deductError;
+      }
       
       // 2. Add to recipient
-      const { error: addError } = await db.supabase
+      const { error: addError } = await db.supabaseAdmin
         .from('users')
-        .update({ xp_points: db.supabase.rpc('increment', { x: parseInt(xp_points) }) })
+        .update({ xp_points: newRecipientXp })
         .eq('id', recipient.id);
       
-      if (addError) throw addError;
+      if (addError) {
+        console.error('Error adding XP:', addError);
+        // Try to rollback sender deduction
+        await db.supabaseAdmin
+          .from('users')
+          .update({ xp_points: sender.xp_points })
+          .eq('id', senderId);
+        throw addError;
+      }
       
       // 3. Create sender XP transaction
-      const { error: txError1 } = await db.supabase
+      const { error: txError1 } = await db.supabaseAdmin
         .from('xp_transactions')
         .insert([{
           user_id: senderId,
           type: 'transferred_out',
-          amount: xp_points,
+          amount: parseInt(xp_points),
           sender_id: senderId,
           receiver_id: recipient.id,
           description: description || `XP transfer to ${recipient.username}`
         }]);
       
-      if (txError1) throw txError1;
+      if (txError1) {
+        console.error('Error creating sender transaction:', txError1);
+        // Don't throw, transaction is already complete
+      }
       
       // 4. Create recipient XP transaction
-      const { error: txError2 } = await db.supabase
+      const { error: txError2 } = await db.supabaseAdmin
         .from('xp_transactions')
         .insert([{
           user_id: recipient.id,
           type: 'transferred_in',
-          amount: xp_points,
+          amount: parseInt(xp_points),
           sender_id: senderId,
           receiver_id: recipient.id,
           description: description || `XP transfer from ${sender.username}`
         }]);
       
-      if (txError2) throw txError2;
+      if (txError2) {
+        console.error('Error creating recipient transaction:', txError2);
+        // Don't throw, transaction is already complete
+      }
+      
+      console.log('✅ XP Transfer successful:', { from: senderId, to: recipient.id, amount: xp_points });
       
     } else {
       // PostgreSQL with transaction
@@ -1600,7 +1634,7 @@ router.post('/transfer/xp', authenticateToken, async (req, res) => {
         }
         
         const recipientResult = await db.query(
-          'SELECT id, username FROM users WHERE wallet_account_number = $1',
+          'SELECT id, username, xp_points FROM users WHERE wallet_account_number = $1',
           [recipient_account]
         );
         
@@ -1675,14 +1709,18 @@ router.post('/transfer/xp', authenticateToken, async (req, res) => {
     
     res.json({
       success: true,
-      message: 'XP transfer successful',
-      xp_points,
-      recipient: recipient.username
+      message: `Successfully transferred ${xp_points} XP to ${recipient.username}`,
+      xp_points: parseInt(xp_points),
+      recipient: recipient.username,
+      new_sender_balance: parseInt(sender.xp_points) - parseInt(xp_points)
     });
     
   } catch (error) {
     console.error('Error transferring XP:', error);
-    res.status(500).json({ success: false, message: 'Error transferring XP' });
+    res.status(500).json({ 
+      success: false, 
+      message: 'Error transferring XP: ' + error.message 
+    });
   }
 });
 
