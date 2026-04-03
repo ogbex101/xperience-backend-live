@@ -580,13 +580,13 @@ router.post('/fund/initialize', authenticateToken, async (req, res) => {
     };
     
     const flutterwaveResponse = await fetch('https://api.flutterwave.com/v3/payments', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${process.env.FLUTTERWAVE_SECRET_KEY}`,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify(paymentPayload)
-    });
+  method: 'POST',
+  headers: {
+    'Content-Type': 'application/json',
+    'Authorization': process.env.FLUTTERWAVE_CLIENT_SECRET  // Just the secret, no "Bearer"
+  },
+  body: JSON.stringify(paymentPayload)
+});
     
     const flutterwaveData = await flutterwaveResponse.json();
     
