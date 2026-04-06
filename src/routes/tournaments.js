@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const db = require('../config/database'); // PostgreSQL pool with Supabase support
+const { authenticateToken } = require('../middleware/auth');
 
 // ============================
 // NO AUTHENTICATION MIDDLEWARE HERE - server.js already applies auth globally
@@ -6564,11 +6565,11 @@ router.post('/', async (req, res) => {
   }
 });
 
-// POST /api/tournaments/:id/start - Simplified version
+// POST /api/tournaments/:id/start - Start tournament
 router.post('/:id/start', authenticateToken, async (req, res) => {
   try {
     const tournamentId = req.params.id;
-    const userId = req.user.userId || req.user.id || req.user.user_id;
+    const userId = req.user.id;
 
     console.log('🚀 Starting tournament:', {
       tournamentId,
@@ -6614,7 +6615,7 @@ router.post('/:id/start', authenticateToken, async (req, res) => {
       tournament.participants_count = joinedParticipants.length;
 
       // Check if user is creator
-      if (parseInt(tournament.creator_id) !== parseInt(userId)) {
+      if (tournament.creator_id.toString() !== userId.toString()) {
         return res.status(403).json({
           success: false,
           error: 'Only tournament creator can start the tournament'
@@ -6670,13 +6671,10 @@ router.post('/:id/start', authenticateToken, async (req, res) => {
         }
       } else if (tournament.type === 'survival') {
         console.log('🔥 Starting survival tournament - no bracket needed');
-        // No matches needed for survival - it's a free-for-all
       } else if (tournament.type === 'freeforall') {
         console.log('🎯 Starting free-for-all tournament - no bracket needed');
-        // No matches needed for freeforall either
       } else if (tournament.type === 'squad') {
         console.log('👥 Starting squad tournament - bracket generation would go here');
-        // Squad bracket logic would go here
       }
 
       // Send notifications to all participants
@@ -6717,7 +6715,8 @@ router.post('/:id/start', authenticateToken, async (req, res) => {
       });
       
     } else {
-      // POSTGRESQL VERSION - keep your original code
+      // POSTGRESQL VERSION
+      
       // Get tournament details
       const tournamentResult = await db.query(`
         SELECT t.*, 
@@ -6741,7 +6740,7 @@ router.post('/:id/start', authenticateToken, async (req, res) => {
       const tournament = tournamentResult[0][0];
 
       // Check if user is creator
-      if (parseInt(tournament.creator_id) !== parseInt(userId)) {
+      if (tournament.creator_id.toString() !== userId.toString()) {
         return res.status(403).json({
           success: false,
           error: 'Only tournament creator can start the tournament'
@@ -6808,13 +6807,10 @@ router.post('/:id/start', authenticateToken, async (req, res) => {
           }
         } else if (tournament.type === 'survival') {
           console.log('🔥 Starting survival tournament - no bracket needed');
-          // No matches needed for survival - it's a free-for-all
         } else if (tournament.type === 'freeforall') {
           console.log('🎯 Starting free-for-all tournament - no bracket needed');
-          // No matches needed for freeforall either
         } else if (tournament.type === 'squad') {
           console.log('👥 Starting squad tournament - bracket generation would go here');
-          // Squad bracket logic would go here
         }
 
         // Send notifications to all participants
