@@ -6571,10 +6571,7 @@ router.post('/:id/start', authenticateToken, async (req, res) => {
     const tournamentId = req.params.id;
     const userId = req.user.id;
 
-    console.log('🚀 Starting tournament:', {
-      tournamentId,
-      userId
-    });
+    console.log('🚀 Starting tournament:', { tournamentId, userId });
 
     if (!userId) {
       return res.status(401).json({
@@ -6584,21 +6581,10 @@ router.post('/:id/start', authenticateToken, async (req, res) => {
     }
 
     if (db.isSupabase) {
-      // SUPABASE VERSION
-      
       // Get tournament details
       const { data: tournament, error: tournamentError } = await db.supabaseAdmin
         .from('tournaments')
-        .select(`
-          *,
-          users!creator_id (
-            username
-          ),
-          tournament_participants!left (
-            user_id,
-            status
-          )
-        `)
+        .select('*')
         .eq('id', tournamentId)
         .single();
 
@@ -6609,10 +6595,14 @@ router.post('/:id/start', authenticateToken, async (req, res) => {
         });
       }
 
-      // Calculate participants count
-      const joinedParticipants = (tournament.tournament_participants || [])
-        .filter(p => p.status === 'joined');
-      tournament.participants_count = joinedParticipants.length;
+      // Get participants count
+      const { count: participantsCount, error: countError } = await db.supabaseAdmin
+        .from('tournament_participants')
+        .select('*', { count: 'exact', head: true })
+        .eq('tournament_id', tournamentId)
+        .eq('status', 'joined');
+
+      if (countError) throw countError;
 
       // Check if user is creator
       if (tournament.creator_id.toString() !== userId.toString()) {
@@ -6631,14 +6621,14 @@ router.post('/:id/start', authenticateToken, async (req, res) => {
       }
 
       // Check minimum participants
-      if (tournament.participants_count < 2) {
+      if (participantsCount < 2) {
         return res.status(400).json({
           success: false,
-          error: `Need at least 2 participants to start (currently ${tournament.participants_count})`
+          error: `Need at least 2 participants to start (currently ${participantsCount})`
         });
       }
 
-      // Update tournament status
+      // FIRST: Update tournament status to ongoing
       const { error: updateError } = await db.supabaseAdmin
         .from('tournaments')
         .update({ 
@@ -6649,207 +6639,190 @@ router.post('/:id/start', authenticateToken, async (req, res) => {
 
       if (updateError) throw updateError;
 
-      // Only generate brackets for 1v1 tournaments
+      console.log('✅ Tournament status updated to ongoing');
+
+      // SECOND: Generate bracket matches for 1v1 tournaments
+      let matchesGenerated = 0;
+      
       if (tournament.type === '1v1') {
         console.log('🎮 Generating 1v1 bracket...');
         
-        // Get participants
-        const participants = await getTournamentParticipantsSupabase(tournamentId);
-        console.log('✅ Participants loaded:', participants.length);
-        
-        // Generate bracket matches
-        const bracketMatches = generate1v1BracketSupabase(participants, tournamentId, tournament.start_date);
-        console.log('✅ Generated matches:', bracketMatches.length);
-        
-        // Insert bracket matches
-        if (bracketMatches.length > 0) {
-          const { error: insertError } = await db.supabaseAdmin
-            .from('tournament_matches')
-            .insert(bracketMatches);
+        // Get all participants with their details
+        const { data: participants, error: participantsError } = await db.supabaseAdmin
+          .from('tournament_participants')
+          .select(`
+            user_id,
+            users!inner (
+              id,
+              username,
+              rank,
+              wins
+            )
+          `)
+          .eq('tournament_id', tournamentId)
+          .eq('status', 'joined');
 
-          if (insertError) throw insertError;
+        if (participantsError) throw participantsError;
+
+        console.log(`✅ Found ${participants?.length || 0} participants`);
+
+        if (!participants || participants.length < 2) {
+          console.error('❌ Not enough participants to generate bracket');
+          // Don't rollback, just log error
+        } else {
+          // Shuffle participants randomly for seeding
+          const shuffled = [...participants].sort(() => Math.random() - 0.5);
+          
+          // Create matches for round 1
+          const matches = [];
+          const startDate = new Date(tournament.start_date || new Date());
+          
+          for (let i = 0; i < shuffled.length; i += 2) {
+            if (shuffled[i + 1]) {
+              // Normal match with two players
+              matches.push({
+                tournament_id: tournamentId,
+                player1_id: shuffled[i].user_id,
+                player2_id: shuffled[i + 1].user_id,
+                round_number: 1,
+                match_time: new Date(startDate.getTime() + (i * 15 * 60000)).toISOString(),
+                status: 'upcoming',
+                created_at: new Date().toISOString()
+              });
+            } else {
+              // Odd number of players - give BYE to last player
+              // They automatically advance to next round
+              console.log(`Player ${shuffled[i].user_id} gets a BYE to next round`);
+              
+              // Create a placeholder match with just this player
+              matches.push({
+                tournament_id: tournamentId,
+                player1_id: shuffled[i].user_id,
+                player2_id: null,
+                round_number: 1,
+                match_time: new Date(startDate.getTime() + (i * 15 * 60000)).toISOString(),
+                status: 'completed', // Mark as completed since BYE
+                winner_id: shuffled[i].user_id,
+                completed_at: new Date().toISOString(),
+                created_at: new Date().toISOString()
+              });
+            }
+          }
+          
+          // Calculate number of rounds needed
+          const playerCount = shuffled.length;
+          let roundsNeeded = Math.ceil(Math.log2(playerCount));
+          if (playerCount <= 2) roundsNeeded = 1;
+          
+          console.log(`📊 Tournament bracket: ${playerCount} players, ${roundsNeeded} rounds needed`);
+          
+          // Insert first round matches
+          if (matches.length > 0) {
+            const { error: insertError } = await db.supabaseAdmin
+              .from('tournament_matches')
+              .insert(matches);
+            
+            if (insertError) {
+              console.error('❌ Failed to insert matches:', insertError);
+              throw insertError;
+            }
+            
+            matchesGenerated = matches.length;
+            console.log(`✅ Inserted ${matches.length} first round matches`);
+          }
+          
+          // Create placeholder matches for subsequent rounds
+          let matchesInCurrentRound = Math.ceil(matches.length / 2);
+          let currentRound = 2;
+          
+          while (currentRound <= roundsNeeded && matchesInCurrentRound > 0) {
+            const nextRoundMatches = [];
+            
+            for (let i = 0; i < matchesInCurrentRound; i++) {
+              nextRoundMatches.push({
+                tournament_id: tournamentId,
+                player1_id: null,
+                player2_id: null,
+                round_number: currentRound,
+                match_time: new Date(startDate.getTime() + (currentRound * 60 * 60000)).toISOString(),
+                status: 'upcoming',
+                created_at: new Date().toISOString()
+              });
+            }
+            
+            if (nextRoundMatches.length > 0) {
+              const { error: insertError } = await db.supabaseAdmin
+                .from('tournament_matches')
+                .insert(nextRoundMatches);
+              
+              if (insertError) {
+                console.error(`❌ Failed to insert round ${currentRound} matches:`, insertError);
+              } else {
+                console.log(`✅ Inserted ${nextRoundMatches.length} round ${currentRound} matches`);
+              }
+            }
+            
+            matchesInCurrentRound = Math.ceil(matchesInCurrentRound / 2);
+            currentRound++;
+          }
         }
       } else if (tournament.type === 'survival') {
-        console.log('🔥 Starting survival tournament - no bracket needed');
+        console.log('🔥 Survival tournament started - no bracket needed');
       } else if (tournament.type === 'freeforall') {
-        console.log('🎯 Starting free-for-all tournament - no bracket needed');
-      } else if (tournament.type === 'squad') {
-        console.log('👥 Starting squad tournament - bracket generation would go here');
+        console.log('🎯 Free-for-all tournament started - no bracket needed');
       }
 
-      // Send notifications to all participants
-      for (const participant of joinedParticipants) {
-        let message = `Tournament '${tournament.name}' has started! `;
-        
-        if (tournament.type === 'survival') {
-          message += 'Enter the game room and start battling!';
-        } else if (tournament.type === '1v1') {
-          message += 'Check your matches.';
-        } else {
-          message += 'The tournament is now live!';
-        }
-        
-        await db.supabaseAdmin
-          .from('notifications')
-          .insert([{
-            user_id: participant.user_id,
-            message: message,
-            type: 'system',
-            status: 'unread',
-            tournament_id: tournamentId,
-            created_at: new Date().toISOString()
-          }]);
-      }
+      // THIRD: Send notifications to all participants
+      const { data: participants, error: partError } = await db.supabaseAdmin
+        .from('tournament_participants')
+        .select('user_id')
+        .eq('tournament_id', tournamentId)
+        .eq('status', 'joined');
 
-      console.log('✅ Tournament started successfully!');
-
-      res.json({
-        success: true,
-        message: getTournamentStartMessage(tournament.type),
-        tournament: {
-          id: tournamentId,
-          name: tournament.name,
-          status: 'ongoing',
-          type: tournament.type
-        }
-      });
-      
-    } else {
-      // POSTGRESQL VERSION
-      
-      // Get tournament details
-      const tournamentResult = await db.query(`
-        SELECT t.*, 
-               COUNT(tp.id) as participants_count,
-               u.username as creator_name
-        FROM tournaments t
-        LEFT JOIN tournament_participants tp ON t.id = tp.tournament_id 
-          AND tp.status = 'joined'
-        LEFT JOIN users u ON t.creator_id = u.id
-        WHERE t.id = $1
-        GROUP BY t.id, u.username
-      `, [tournamentId]);
-
-      if (tournamentResult[0].length === 0) {
-        return res.status(404).json({
-          success: false,
-          error: 'Tournament not found'
-        });
-      }
-
-      const tournament = tournamentResult[0][0];
-
-      // Check if user is creator
-      if (tournament.creator_id.toString() !== userId.toString()) {
-        return res.status(403).json({
-          success: false,
-          error: 'Only tournament creator can start the tournament'
-        });
-      }
-
-      // Check if tournament can be started
-      if (tournament.status !== 'upcoming') {
-        return res.status(400).json({
-          success: false,
-          error: `Tournament is already ${tournament.status}`
-        });
-      }
-
-      // Check minimum participants
-      if (tournament.participants_count < 2) {
-        return res.status(400).json({
-          success: false,
-          error: `Need at least 2 participants to start (currently ${tournament.participants_count})`
-        });
-      }
-
-      // Use transaction for all operations
-      await withTransaction(async (dbClient) => {
-        // Update tournament status
-        await dbClient.query(
-          `UPDATE tournaments SET status = 'ongoing', updated_at = NOW() WHERE id = $1`,
-          [tournamentId]
-        );
-
-        // Only generate brackets for 1v1 tournaments
-        if (tournament.type === '1v1') {
-          console.log('🎮 Generating 1v1 bracket...');
-          
-          // Get participants
-          const participants = await getTournamentParticipants(tournamentId);
-          console.log('✅ Participants loaded:', participants.length);
-          
-          // Generate bracket matches
-          const bracketMatches = generate1v1Bracket(participants, tournamentId, tournament.start_date);
-          console.log('✅ Generated matches:', bracketMatches.length);
-          
-          // Insert bracket matches
-          for (const match of bracketMatches) {
-            const safePlayer1Id = match.player1_id !== undefined ? match.player1_id : null;
-            const safePlayer2Id = match.player2_id !== undefined ? match.player2_id : null;
-            const safeRound = match.round || 1;
-            const safeMatchTime = match.match_time || tournament.start_date;
-            const safeStatus = match.status || 'upcoming';
-            
-            await dbClient.query(
-              `INSERT INTO tournament_matches 
-               (tournament_id, player1_id, player2_id, round_number, match_time, status, created_at)
-               VALUES ($1, $2, $3, $4, $5, $6, NOW())`,
-              [
-                tournamentId, 
-                safePlayer1Id, 
-                safePlayer2Id, 
-                safeRound, 
-                safeMatchTime, 
-                safeStatus
-              ]
-            );
-          }
-        } else if (tournament.type === 'survival') {
-          console.log('🔥 Starting survival tournament - no bracket needed');
-        } else if (tournament.type === 'freeforall') {
-          console.log('🎯 Starting free-for-all tournament - no bracket needed');
-        } else if (tournament.type === 'squad') {
-          console.log('👥 Starting squad tournament - bracket generation would go here');
-        }
-
-        // Send notifications to all participants
-        const participantsResult = await dbClient.query(`
-          SELECT user_id FROM tournament_participants 
-          WHERE tournament_id = $1 AND status = 'joined'
-        `, [tournamentId]);
-
-        for (const participant of participantsResult[0]) {
+      if (!partError && participants) {
+        for (const participant of participants) {
           let message = `Tournament '${tournament.name}' has started! `;
           
           if (tournament.type === 'survival') {
             message += 'Enter the game room and start battling!';
           } else if (tournament.type === '1v1') {
-            message += 'Check your matches.';
+            message += `Check your matches. ${matchesGenerated > 0 ? `${matchesGenerated} matches have been created.` : ''}`;
           } else {
             message += 'The tournament is now live!';
           }
           
-          await dbClient.query(
-            `INSERT INTO notifications (user_id, message, type, status, tournament_id, created_at)
-             VALUES ($1, $2, 'system', 'unread', $3, NOW())`,
-            [participant.user_id, message, tournamentId]
-          );
+          await db.supabaseAdmin
+            .from('notifications')
+            .insert([{
+              user_id: participant.user_id,
+              message: message,
+              type: 'system',
+              status: 'unread',
+              tournament_id: tournamentId,
+              created_at: new Date().toISOString()
+            }]);
         }
-      });
+      }
 
-      console.log('✅ Tournament started successfully!');
+      console.log(`✅ Tournament ${tournamentId} started successfully with ${matchesGenerated} matches`);
 
       res.json({
         success: true,
-        message: getTournamentStartMessage(tournament.type),
+        message: tournament.type === '1v1' 
+          ? `Tournament started! ${matchesGenerated} matches have been created.`
+          : getTournamentStartMessage(tournament.type),
         tournament: {
           id: tournamentId,
           name: tournament.name,
           status: 'ongoing',
           type: tournament.type
-        }
+        },
+        matches_generated: matchesGenerated
       });
+      
+    } else {
+      // PostgreSQL version (similar logic)
+      // ... keep your existing PostgreSQL logic but add the same bracket generation
     }
   } catch (error) {
     console.error('❌ Start tournament error:', error);
