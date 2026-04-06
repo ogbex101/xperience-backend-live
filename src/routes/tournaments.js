@@ -6565,7 +6565,7 @@ router.post('/', async (req, res) => {
 });
 
 // POST /api/tournaments/:id/start - Simplified version
-router.post('/:id/start', async (req, res) => {
+router.post('/:id/start', authenticateToken, async (req, res) => {
   try {
     const tournamentId = req.params.id;
     const userId = req.user.userId || req.user.id || req.user.user_id;
