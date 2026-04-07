@@ -4624,13 +4624,83 @@ router.post('/:id/kick-group', async (req, res) => {
     });
   }
 });
-// GET /api/tournaments/:id/bracket - Get tournament bracket (UPDATED with participant count)
+// GET /api/tournaments/:id/bracket - Get tournament bracket (FIXED with fallback)
 router.get('/:id/bracket', async (req, res) => {
   try {
     const tournamentId = req.params.id;
     const userId = req.user.userId || req.user.id;
 
     console.log('📊 FETCHING BRACKET FOR TOURNAMENT:', tournamentId);
+
+    // Define fallback function INSIDE the endpoint to ensure it exists
+    const getRoundNameSafe = (roundNumber, totalParticipants = null) => {
+      // Calculate expected participants in this round
+      const participantsInRound = totalParticipants ? Math.pow(2, Math.ceil(Math.log2(totalParticipants)) - roundNumber + 1) : null;
+      
+      // Specific round names based on participant count
+      const roundNameMap = {
+        2048: 'Round of 2048',
+        1024: 'Round of 1024',
+        512: 'Round of 512',
+        256: 'Round of 256',
+        128: 'Round of 128',
+        64: 'Round of 64',
+        32: 'Round of 32',
+        16: 'Round of 16',
+        8: 'Quarter Finals',
+        4: 'Semi Finals',
+        2: 'Finals'
+      };
+      
+      // If we have participant count and it matches a known round name
+      if (participantsInRound && roundNameMap[participantsInRound]) {
+        return roundNameMap[participantsInRound];
+      }
+      
+      // For final rounds detection
+      if (roundNumber === 1 && participantsInRound === 2) {
+        return 'Finals';
+      }
+      
+      if (roundNumber === 1 && participantsInRound === 4) {
+        return 'Semi Finals';
+      }
+      
+      if (roundNumber === 1 && participantsInRound === 8) {
+        return 'Quarter Finals';
+      }
+      
+      // Handle round numbers with specific names
+      const specificRoundNames = {
+        1: 'Round 1',
+        2: 'Round 2',
+        3: 'Quarter Finals',
+        4: 'Semi Finals',
+        5: 'Finals',
+        6: 'Grand Finals',
+        7: 'Championship',
+        8: 'Ultimate Finals'
+      };
+      
+      if (specificRoundNames[roundNumber]) {
+        return specificRoundNames[roundNumber];
+      }
+      
+      // For rounds beyond known ones, use ordinal numbers
+      const lastDigit = roundNumber % 10;
+      const lastTwoDigits = roundNumber % 100;
+      
+      if (lastTwoDigits >= 11 && lastTwoDigits <= 13) {
+        return `${roundNumber}th Round`;
+      }
+      
+      switch (lastDigit) {
+        case 1: return `${roundNumber}st Round`;
+        case 2: return `${roundNumber}nd Round`;
+        case 3: return `${roundNumber}rd Round`;
+        default: return `${roundNumber}th Round`;
+      }
+    };
 
     if (db.isSupabase) {
       // SUPABASE VERSION
@@ -4763,7 +4833,7 @@ router.get('/:id/bracket', async (req, res) => {
         });
       });
 
-      // 6. Create rounds array - PASS participant_count to getRoundName
+      // 6. Create rounds array - USING SAFE FUNCTION
       const roundsArray = Object.keys(rounds)
         .map(roundNumber => {
           const roundNum = parseInt(roundNumber);
@@ -4771,7 +4841,7 @@ router.get('/:id/bracket', async (req, res) => {
           
           return {
             number: roundNum,
-            name: getRoundName(roundNum, tournament.participant_count),
+            name: getRoundNameSafe(roundNum, tournament.participant_count),
             matches: roundMatches || [],
             match_count: roundMatches.length,
             completed_count: roundMatches.filter(m => m.status === 'completed').length
@@ -4932,7 +5002,7 @@ router.get('/:id/bracket', async (req, res) => {
         });
       });
 
-      // 6. Create rounds array - PASS participant_count to getRoundName
+      // 6. Create rounds array - USING SAFE FUNCTION
       const roundsArray = Object.keys(rounds)
         .map(roundNumber => {
           const roundNum = parseInt(roundNumber);
@@ -4940,7 +5010,7 @@ router.get('/:id/bracket', async (req, res) => {
           
           return {
             number: roundNum,
-            name: getRoundName(roundNum, tournament.participant_count),
+            name: getRoundNameSafe(roundNum, tournament.participant_count),
             matches: roundMatches || [],
             match_count: roundMatches.length,
             completed_count: roundMatches.filter(m => m.status === 'completed').length
@@ -4973,7 +5043,6 @@ router.get('/:id/bracket', async (req, res) => {
     });
   }
 });
-
 // ============================
 // TEST ROUTE FOR SURVIVAL TITLES
 // ============================
