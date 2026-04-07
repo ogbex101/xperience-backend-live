@@ -114,7 +114,167 @@ const withTransaction = async (callback) => {
 // ============================
 // ALL ROUTES - COMPLETE CONVERSION
 // ============================
+// ============================
+// ADVANCED BRACKET GENERATOR - ONLY FOR 1v1 TOURNAMENTS
+// ============================
 
+function generateAdvancedBracket(participants, tournamentId, startDate, config) {
+  const {
+    elimination_type = 'single',
+    max_rounds = null,
+    consolation_bracket = false
+  } = config;
+  
+  const matches = [];
+  const participantCount = participants.length;
+  
+  if (participantCount < 2) return matches;
+  
+  // Calculate rounds needed
+  let roundsNeeded = max_rounds || Math.ceil(Math.log2(participantCount));
+  const firstRoundSize = Math.pow(2, roundsNeeded);
+  
+  console.log(`🏆 Generating ${elimination_type} elimination bracket for ${participantCount} players`);
+  
+  // Shuffle participants for random seeding
+  const shuffled = [...participants].sort(() => Math.random() - 0.5);
+  const startDateTime = new Date(startDate || new Date());
+  
+  // ========== WINNERS BRACKET ==========
+  const winnersMatches = [];
+  let matchIndex = 0;
+  
+  // Create first round matches
+  for (let i = 0; i < firstRoundSize / 2; i++) {
+    const player1Index = i * 2;
+    const player2Index = i * 2 + 1;
+    
+    const player1 = shuffled[player1Index] || null;
+    const player2 = shuffled[player2Index] || null;
+    
+    const matchTime = new Date(startDateTime.getTime() + (matchIndex * 15 * 60000));
+    
+    // BYE match (only one player)
+    if (player1 && !player2) {
+      winnersMatches.push({
+        tournament_id: tournamentId,
+        player1_id: player1.user_id,
+        player2_id: null,
+        round_number: 1,
+        match_time: matchTime.toISOString(),
+        status: 'completed',
+        winner_id: player1.user_id,
+        completed_at: new Date().toISOString(),
+        bracket_type: 'winners',
+        created_at: new Date().toISOString()
+      });
+    } 
+    else if (!player1 && player2) {
+      winnersMatches.push({
+        tournament_id: tournamentId,
+        player1_id: player2.user_id,
+        player2_id: null,
+        round_number: 1,
+        match_time: matchTime.toISOString(),
+        status: 'completed',
+        winner_id: player2.user_id,
+        completed_at: new Date().toISOString(),
+        bracket_type: 'winners',
+        created_at: new Date().toISOString()
+      });
+    }
+    else if (player1 && player2) {
+      winnersMatches.push({
+        tournament_id: tournamentId,
+        player1_id: player1.user_id,
+        player2_id: player2.user_id,
+        round_number: 1,
+        match_time: matchTime.toISOString(),
+        status: 'upcoming',
+        bracket_type: 'winners',
+        created_at: new Date().toISOString()
+      });
+    }
+    matchIndex++;
+  }
+  
+  matches.push(...winnersMatches);
+  
+  // Create subsequent winners bracket rounds
+  let matchesInCurrentRound = Math.ceil(winnersMatches.filter(m => m.status !== 'completed').length / 2);
+  let currentRound = 2;
+  
+  while (currentRound <= roundsNeeded && matchesInCurrentRound > 0) {
+    for (let i = 0; i < matchesInCurrentRound; i++) {
+      const matchTime = new Date(startDateTime.getTime() + (currentRound * 60 * 60000));
+      matches.push({
+        tournament_id: tournamentId,
+        player1_id: null,
+        player2_id: null,
+        round_number: currentRound,
+        match_time: matchTime.toISOString(),
+        status: 'upcoming',
+        bracket_type: 'winners',
+        created_at: new Date().toISOString()
+      });
+    }
+    matchesInCurrentRound = Math.ceil(matchesInCurrentRound / 2);
+    currentRound++;
+  }
+  
+  // ========== LOSERS BRACKET (Double Elimination Only) ==========
+  if (elimination_type === 'double') {
+    const losersRoundsNeeded = (roundsNeeded * 2) - 1;
+    
+    for (let round = 1; round <= losersRoundsNeeded; round++) {
+      const matchesInRound = Math.max(1, Math.pow(2, Math.ceil(losersRoundsNeeded - round)));
+      for (let i = 0; i < matchesInRound; i++) {
+        const matchTime = new Date(startDateTime.getTime() + ((round + roundsNeeded) * 45 * 60000));
+        matches.push({
+          tournament_id: tournamentId,
+          player1_id: null,
+          player2_id: null,
+          round_number: round,
+          match_time: matchTime.toISOString(),
+          status: 'upcoming',
+          bracket_type: 'losers',
+          created_at: new Date().toISOString()
+        });
+      }
+    }
+    
+    // Grand Finals
+    matches.push({
+      tournament_id: tournamentId,
+      player1_id: null,
+      player2_id: null,
+      round_number: roundsNeeded + 1,
+      match_time: new Date(startDateTime.getTime() + ((roundsNeeded + 1) * 60 * 60000)).toISOString(),
+      status: 'upcoming',
+      bracket_type: 'grand_finals',
+      is_bracket_reset: true,
+      created_at: new Date().toISOString()
+    });
+  }
+  
+  // ========== CONSOLATION BRACKET (3rd Place) ==========
+  if (consolation_bracket) {
+    matches.push({
+      tournament_id: tournamentId,
+      player1_id: null,
+      player2_id: null,
+      round_number: roundsNeeded + (elimination_type === 'double' ? 2 : 1),
+      match_time: new Date(startDateTime.getTime() + ((roundsNeeded + 1) * 60 * 60000)).toISOString(),
+      status: 'upcoming',
+      bracket_type: 'consolation',
+      is_third_place: true,
+      created_at: new Date().toISOString()
+    });
+  }
+  
+  console.log(`✅ Generated ${matches.length} matches for ${elimination_type} elimination`);
+  return matches;
+}
 // Add this route to your tournaments.js file (anywhere before module.exports)
 router.get('/:id/debug-state', async (req, res) => {
   try {
@@ -5904,26 +6064,30 @@ router.post('/:id/join', async (req, res) => {
 // POST /api/tournaments - Create tournament
 router.post('/', async (req, res) => {
   try {
-    const {
-      name,
-      game,
-      description,
-      max_players,
-      entry_fee,
-      prize_pool_option,
-      custom_prize_pool,
-      type,
-      start_date,
-      group_id,
-      squad_name,
-      max_squads = 8,
-      admin_monitoring = false,
-      admin_pin = null,
-      dispute_resolution = 'auto',
-      title_requirements_boundless = '',
-      title_requirements_chaos = '',
-      title_requirements_order = ''
-    } = req.body;
+  const {
+  name,
+  game,
+  description,
+  max_players,
+  entry_fee,
+  prize_pool_option,
+  custom_prize_pool,
+  type,
+  start_date,
+  group_id,
+  squad_name,
+  max_squads = 8,
+  admin_monitoring = false,
+  admin_pin = null,
+  dispute_resolution = 'auto',
+  title_requirements_boundless = '',
+  title_requirements_chaos = '',
+  title_requirements_order = '',
+  elimination_type = 'single',
+  max_rounds = null,
+  bracket_seed_type = 'random',
+  consolation_bracket = false,
+} = req.body;
 
     const userId = req.user.id;
     const isUserAdmin = Boolean(req.user.is_admin);
@@ -6099,37 +6263,41 @@ router.post('/', async (req, res) => {
 
         console.log('💾 Inserting tournament...');
         
-        const { data: tournamentData, error: insertError } = await db.supabaseAdmin
-          .from('tournaments')
-          .insert([{
-            name: name.trim(),
-            game: game,
-            description: description ? description.trim() : null,
-            creator_id: userId,
-            group_id: group_id || null,
-            max_players: maxPlayers,
-            xp_entry_fee: xpEntryFee,
-            prize_pool: prize_pool,
-            custom_prize_pool: customPrizePool,
-            platform_fee: platform_fee,
-            start_date: start_date,
-            status: 'upcoming',
-            type: dbType,
-            prize_pool_option: prize_pool_option,
-            currency: 'xp',
-            squad_name: squad_name ? squad_name.trim() : null,
-            max_squads: max_squads,
-            max_players_per_squad: 5,
-            admin_monitoring: finalAdminMonitoring,
-            admin_pin: admin_pin,
-            dispute_resolution: finalDisputeResolution,
-            title_requirements_boundless: dbType === 'survival' ? (title_requirements_boundless || 'Boundless Explorer') : null,
-            title_requirements_chaos: dbType === 'survival' ? (title_requirements_chaos || 'Master of Chaos') : null,
-            title_requirements_order: dbType === 'survival' ? (title_requirements_order || 'Grand Master of Order') : null,
-            created_at: new Date().toISOString(),
-            updated_at: new Date().toISOString()
-          }])
-          .select();
+       const { data: tournamentData, error: insertError } = await db.supabaseAdmin
+  .from('tournaments')
+  .insert([{
+    name: name.trim(),
+    game: game,
+    description: description ? description.trim() : null,
+    creator_id: userId,
+    group_id: group_id || null,
+    max_players: maxPlayers,
+    xp_entry_fee: xpEntryFee,
+    prize_pool: prize_pool,
+    custom_prize_pool: customPrizePool,
+    platform_fee: platform_fee,
+    start_date: start_date,
+    status: 'upcoming',
+    type: dbType,
+    prize_pool_option: prize_pool_option,
+    currency: 'xp',
+    squad_name: squad_name ? squad_name.trim() : null,
+    max_squads: max_squads,
+    max_players_per_squad: 5,
+    admin_monitoring: finalAdminMonitoring,
+    admin_pin: admin_pin,
+    dispute_resolution: finalDisputeResolution,
+    title_requirements_boundless: dbType === 'survival' ? (title_requirements_boundless || 'Boundless Explorer') : null,
+    title_requirements_chaos: dbType === 'survival' ? (title_requirements_chaos || 'Master of Chaos') : null,
+    title_requirements_order: dbType === 'survival' ? (title_requirements_order || 'Grand Master of Order') : null,
+    elimination_type: elimination_type,
+    max_rounds: max_rounds ? parseInt(max_rounds) : null,
+    bracket_seed_type: bracket_seed_type,
+    consolation_bracket: consolation_bracket,
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString()
+  }])
+  .select();
 
         if (insertError) throw insertError;
 
@@ -6778,60 +6946,29 @@ router.post('/:id/start', authenticateToken, async (req, res) => {
         });
       }
 
-      // 6. Generate bracket matches for 1v1 tournaments
+            // 6. Generate bracket matches for 1v1 tournaments ONLY
       let matchesGenerated = 0;
       
       if (tournament.type === '1v1') {
-        console.log('🎮 Generating 1v1 bracket for', participantsCount, 'participants...');
+        console.log('🎮 Generating advanced bracket for 1v1 tournament...');
         
-        // Shuffle participants randomly for fair seeding
-        const shuffled = [...participants].sort(() => Math.random() - 0.5);
-        const startDate = new Date(tournament.start_date || new Date());
-        const matches = [];
+        const bracketConfig = {
+          elimination_type: tournament.elimination_type || 'single',
+          max_rounds: tournament.max_rounds || null,
+          consolation_bracket: tournament.consolation_bracket || false
+        };
         
-        // Create first round matches
-        for (let i = 0; i < shuffled.length; i += 2) {
-          const player1 = shuffled[i];
-          const player2 = shuffled[i + 1];
-          
-          if (player2) {
-            // Normal match with two players
-            matches.push({
-              tournament_id: tournamentId,
-              player1_id: player1.user_id,
-              player2_id: player2.user_id,
-              round_number: 1,
-              match_time: new Date(startDate.getTime() + (i * 15 * 60000)).toISOString(),
-              status: 'upcoming',
-              created_at: new Date().toISOString()
-            });
-            console.log(`✅ Match created: ${player1.users?.username} vs ${player2.users?.username}`);
-          } else if (player1) {
-            // Odd number of players - BYE (auto-advance to next round)
-            matches.push({
-              tournament_id: tournamentId,
-              player1_id: player1.user_id,
-              player2_id: null,
-              round_number: 1,
-              match_time: new Date(startDate.getTime() + (i * 15 * 60000)).toISOString(),
-              status: 'completed',
-              winner_id: player1.user_id,
-              completed_at: new Date().toISOString(),
-              created_at: new Date().toISOString()
-            });
-            console.log(`✅ BYE match created for: ${player1.users?.username}`);
-          }
-        }
+        const bracketMatches = generateAdvancedBracket(
+          participants, 
+          tournamentId, 
+          tournament.start_date || new Date(),
+          bracketConfig
+        );
         
-        // Calculate number of rounds needed
-        const roundsNeeded = Math.ceil(Math.log2(participantsCount));
-        console.log(`📊 Tournament needs ${roundsNeeded} rounds total`);
-        
-        // Insert first round matches
-        if (matches.length > 0) {
+        if (bracketMatches.length > 0) {
           const { error: insertError } = await db.supabaseAdmin
             .from('tournament_matches')
-            .insert(matches);
+            .insert(bracketMatches);
           
           if (insertError) {
             console.error('❌ Failed to insert matches:', insertError);
@@ -6841,44 +6978,8 @@ router.post('/:id/start', authenticateToken, async (req, res) => {
             });
           }
           
-          matchesGenerated = matches.length;
-          console.log(`✅ Inserted ${matches.length} first round matches`);
-        }
-        
-        // Create placeholder matches for subsequent rounds
-        let matchesInCurrentRound = Math.ceil(matches.length / 2);
-        let currentRound = 2;
-        
-        while (currentRound <= roundsNeeded && matchesInCurrentRound > 0) {
-          const nextRoundMatches = [];
-          
-          for (let i = 0; i < matchesInCurrentRound; i++) {
-            nextRoundMatches.push({
-              tournament_id: tournamentId,
-              player1_id: null,
-              player2_id: null,
-              round_number: currentRound,
-              match_time: new Date(startDate.getTime() + (currentRound * 60 * 60000)).toISOString(),
-              status: 'upcoming',
-              created_at: new Date().toISOString()
-            });
-          }
-          
-          if (nextRoundMatches.length > 0) {
-            const { error: insertError } = await db.supabaseAdmin
-              .from('tournament_matches')
-              .insert(nextRoundMatches);
-            
-            if (insertError) {
-              console.error(`❌ Failed to insert round ${currentRound} matches:`, insertError);
-            } else {
-              console.log(`✅ Inserted ${nextRoundMatches.length} round ${currentRound} matches`);
-              matchesGenerated += nextRoundMatches.length;
-            }
-          }
-          
-          matchesInCurrentRound = Math.ceil(matchesInCurrentRound / 2);
-          currentRound++;
+          matchesGenerated = bracketMatches.length;
+          console.log(`✅ Generated ${bracketMatches.length} matches with ${bracketConfig.elimination_type} elimination`);
         }
       } else if (tournament.type === 'survival') {
         console.log('🔥 Survival tournament started - no bracket needed');
