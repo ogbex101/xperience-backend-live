@@ -907,27 +907,31 @@ router.post('/:id/matches/:matchId/result', async (req, res) => {
       try {
         // Get match details
         console.log('📋 Fetching match details...');
-        const { data: match, error: matchError } = await db.supabaseAdmin
-          .from('tournament_matches')
-          .select(`
-            *,
-            tournaments!inner (
-              type,
-              prize_pool,
-              xp_entry_fee as entry_fee,
-              prize_pool_option,
-              custom_prize_pool,
-              name as tournament_name,
-              status as tournament_status
-            )
-          `)
-          .eq('id', matchId)
-          .eq('tournament_id', tournamentId)
-          .single();
-        
-        if (matchError || !match) {
-          throw new Error('Match not found');
-        }
+       // First get the match
+const { data: match, error: matchError } = await db.supabaseAdmin
+  .from('tournament_matches')
+  .select('*')
+  .eq('id', matchId)
+  .eq('tournament_id', tournamentId)
+  .single();
+
+if (matchError || !match) {
+  throw new Error('Match not found');
+}
+
+// Then get the tournament details separately
+const { data: tournamentDetails, error: tournamentError } = await db.supabaseAdmin
+  .from('tournaments')
+  .select('type, prize_pool, xp_entry_fee, prize_pool_option, custom_prize_pool, name, status')
+  .eq('id', tournamentId)
+  .single();
+
+if (tournamentError) {
+  throw new Error('Tournament not found');
+}
+
+// Combine them
+match.tournaments = tournamentDetails;
         
         console.log('🔍 MATCH DETAILS:', {
           matchId,
