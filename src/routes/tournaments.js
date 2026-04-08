@@ -892,7 +892,7 @@ router.post('/:id/validate-group', async (req, res) => {
   }
 });
 
-// POST /api/tournaments/:id/matches/:matchId/result - Submit match result (FULLY DEBUGGED - FIXED)
+// POST /api/tournaments/:id/matches/:matchId/result - Submit match result with confirmation system
 router.post('/:id/matches/:matchId/result', async (req, res) => {
   try {
     const tournamentId = req.params.id;
@@ -903,44 +903,42 @@ router.post('/:id/matches/:matchId/result', async (req, res) => {
     console.log('🏆 SUBMIT MATCH RESULT:', { tournamentId, matchId, winnerId, userId });
 
     if (db.isSupabase) {
-      // SUPABASE VERSION - Will need to execute sequentially
       try {
         // Get match details
         console.log('📋 Fetching match details...');
-       // First get the match
-const { data: match, error: matchError } = await db.supabaseAdmin
-  .from('tournament_matches')
-  .select('*')
-  .eq('id', matchId)
-  .eq('tournament_id', tournamentId)
-  .single();
+        const { data: match, error: matchError } = await db.supabaseAdmin
+          .from('tournament_matches')
+          .select('*')
+          .eq('id', matchId)
+          .eq('tournament_id', tournamentId)
+          .single();
 
-if (matchError || !match) {
-  throw new Error('Match not found');
-}
+        if (matchError || !match) {
+          throw new Error('Match not found');
+        }
 
-// Then get the tournament details separately
-const { data: tournamentDetails, error: tournamentError } = await db.supabaseAdmin
-  .from('tournaments')
-  .select('type, prize_pool, xp_entry_fee, prize_pool_option, custom_prize_pool, name, status')
-  .eq('id', tournamentId)
-  .single();
+        // Get tournament details separately
+        const { data: tournamentDetails, error: tournamentError } = await db.supabaseAdmin
+          .from('tournaments')
+          .select('type, prize_pool, xp_entry_fee, prize_pool_option, custom_prize_pool, name, status')
+          .eq('id', tournamentId)
+          .single();
 
-if (tournamentError) {
-  throw new Error('Tournament not found');
-}
+        if (tournamentError) {
+          throw new Error('Tournament not found');
+        }
 
-// Combine them
-match.tournaments = tournamentDetails;
-        
+        // Combine them
+        match.tournaments = tournamentDetails;
+
         console.log('🔍 MATCH DETAILS:', {
           matchId,
           player1_id: match.player1_id,
           player2_id: match.player2_id,
           currentStatus: match.status,
           tournamentType: match.tournaments.type,
-          tournamentStatus: match.tournaments.tournament_status,
-          tournamentName: match.tournaments.tournament_name,
+          tournamentStatus: match.tournaments.status,
+          tournamentName: match.tournaments.name,
           roundNumber: match.round_number
         });
 
@@ -966,182 +964,376 @@ match.tournaments = tournamentDetails;
 
         const loserId = winnerId === match.player1_id ? match.player2_id : match.player1_id;
 
-        console.log('✅ VALIDATION PASSED. Starting database updates...');
-
-        // ========== UPDATE MATCH STATUS ==========
-        console.log('🔄 Step 1: Updating match status...');
-        const { error: updateError } = await db.supabaseAdmin
-          .from('tournament_matches')
-          .update({ 
-            winner_id: winnerId, 
-            status: 'completed', 
-            completed_at: new Date().toISOString() 
-          })
-          .eq('id', matchId);
+        // ========== CHECK IF THIS IS CONFIRMATION OR FIRST SUBMISSION ==========
         
-        if (updateError) throw updateError;
-        console.log(`✅ MATCH ${matchId} UPDATED: winner=${winnerId}, status=completed`);
-        
-        // VERIFY the update
-        const { data: verifyMatch } = await db.supabaseAdmin
-          .from('tournament_matches')
-          .select('status, winner_id')
-          .eq('id', matchId)
-          .single();
-        
-        console.log(`🔍 VERIFIED Match ${matchId}:`, verifyMatch);
-
-        // ========== RECORD MATCH HISTORY ==========
-        try {
-          console.log('🔄 Step 2: Recording match history...');
-          
-          // Try to insert with scores first
-          try {
-            const { error: historyError } = await db.supabaseAdmin
-              .from('match_history')
-              .insert([{
-                tournament_id: tournamentId,
-                winner_id: winnerId,
-                loser_id: loserId,
-                winner_score: 1,
-                loser_score: 0,
-                match_date: new Date().toISOString(),
-                is_final: false,
-                round_number: match.round_number
-              }]);
+        // Case 1: Match is pending confirmation (other player already submitted)
+        if (match.status === 'pending_confirmation') {
+          // Check if the current user is the one who DID NOT submit the original result
+          if (match.proposed_winner_id === winnerId && match.proposed_by_id !== userId) {
+            // Both players agree! Complete the match
+            console.log('✅ BOTH PLAYERS AGREE! Completing match...');
             
-            if (historyError) {
-              console.log('⚠️ History insert with scores failed, trying without scores...');
-              // Try without scores
-              const { error: historyError2 } = await db.supabaseAdmin
+            // Update match to completed
+            const { error: updateError } = await db.supabaseAdmin
+              .from('tournament_matches')
+              .update({ 
+                winner_id: winnerId, 
+                status: 'completed', 
+                completed_at: new Date().toISOString(),
+                confirmed_by_id: userId,
+                confirmed_at: new Date().toISOString()
+              })
+              .eq('id', matchId);
+            
+            if (updateError) throw updateError;
+            console.log(`✅ MATCH ${matchId} UPDATED: winner=${winnerId}, status=completed`);
+            
+            // VERIFY the update
+            const { data: verifyMatch } = await db.supabaseAdmin
+              .from('tournament_matches')
+              .select('status, winner_id')
+              .eq('id', matchId)
+              .single();
+            
+            console.log(`🔍 VERIFIED Match ${matchId}:`, verifyMatch);
+
+            // ========== RECORD MATCH HISTORY ==========
+            try {
+              console.log('🔄 Recording match history...');
+              const { error: historyError } = await db.supabaseAdmin
                 .from('match_history')
                 .insert([{
                   tournament_id: tournamentId,
                   winner_id: winnerId,
                   loser_id: loserId,
+                  winner_score: 1,
+                  loser_score: 0,
                   match_date: new Date().toISOString(),
                   is_final: false,
                   round_number: match.round_number
                 }]);
               
-              if (historyError2) {
+              if (historyError) {
                 console.log('⚠️ Could not record match history, continuing...');
               } else {
-                console.log('✅ MATCH HISTORY RECORDED (minimal fields)');
+                console.log('✅ MATCH HISTORY RECORDED');
               }
-            } else {
-              console.log('✅ MATCH HISTORY RECORDED with scores (1-0)');
+            } catch (historyError) {
+              console.error('❌ Failed to record history:', historyError);
             }
-          } catch (historyCatchError) {
-            console.log('⚠️ Match history table issue, continuing...');
-          }
-        } catch (historyError) {
-          console.error('❌ Failed to record history:', historyError);
-          // Don't throw - continue with other updates
-        }
 
-        // ========== UPDATE PLAYER STATS ==========
-        try {
-          console.log('🔄 Step 3: Updating player stats...');
-          
-          // Update winner stats
-          const { error: winnerStatsError } = await db.supabaseAdmin.rpc('increment_user_stats', {
-            user_id: winnerId,
-            wins_increment: 1,
-            matches_played_increment: 1
-          });
-          
-          if (winnerStatsError) {
-            // Fallback to direct update
-            await db.supabaseAdmin
-              .from('users')
-              .update({ 
-                wins: db.supabaseAdmin.raw('wins + 1'),
-                matches_played: db.supabaseAdmin.raw('matches_played + 1')
+            // ========== UPDATE PLAYER STATS ==========
+            try {
+              console.log('🔄 Updating player stats...');
+              
+              const { error: winnerStatsError } = await db.supabaseAdmin.rpc('increment_user_stats', {
+                user_id: winnerId,
+                wins_increment: 1,
+                matches_played_increment: 1
+              });
+              
+              if (winnerStatsError) {
+                await db.supabaseAdmin
+                  .from('users')
+                  .update({ 
+                    wins: db.supabaseAdmin.raw('wins + 1'),
+                    matches_played: db.supabaseAdmin.raw('matches_played + 1')
+                  })
+                  .eq('id', winnerId);
+              }
+
+              const { error: loserStatsError } = await db.supabaseAdmin.rpc('increment_user_stats', {
+                user_id: loserId,
+                losses_increment: 1,
+                matches_played_increment: 1
+              });
+              
+              if (loserStatsError) {
+                await db.supabaseAdmin
+                  .from('users')
+                  .update({ 
+                    losses: db.supabaseAdmin.raw('losses + 1'),
+                    matches_played: db.supabaseAdmin.raw('matches_played + 1')
+                  })
+                  .eq('id', loserId);
+              }
+              
+              console.log('✅ PLAYER STATS UPDATED');
+            } catch (statsError) {
+              console.error('❌ Failed to update stats:', statsError);
+            }
+
+            // ========== RECALCULATE WIN RATES ==========
+            try {
+              console.log('🔄 Recalculating win rates...');
+              
+              const { data: winnerStats } = await db.supabaseAdmin
+                .from('users')
+                .select('wins, matches_played')
+                .eq('id', winnerId)
+                .single();
+              
+              if (winnerStats && winnerStats.matches_played > 0) {
+                const winnerWinRate = (winnerStats.wins * 100.0) / winnerStats.matches_played;
+                await db.supabaseAdmin
+                  .from('users')
+                  .update({ win_rate: Math.round(winnerWinRate * 100) / 100 })
+                  .eq('id', winnerId);
+              }
+
+              const { data: loserStats } = await db.supabaseAdmin
+                .from('users')
+                .select('wins, matches_played')
+                .eq('id', loserId)
+                .single();
+              
+              if (loserStats && loserStats.matches_played > 0) {
+                const loserWinRate = (loserStats.wins * 100.0) / loserStats.matches_played;
+                await db.supabaseAdmin
+                  .from('users')
+                  .update({ win_rate: Math.round(loserWinRate * 100) / 100 })
+                  .eq('id', loserId);
+              }
+              
+              console.log('✅ WIN RATES UPDATED');
+            } catch (winrateError) {
+              console.error('❌ Failed to update win rates:', winrateError);
+            }
+
+            // ========== UPDATE USER RANKS ==========
+            try {
+              console.log('🔄 Updating user ranks...');
+              await updateUserRankSupabase(winnerId);
+              await updateUserRankSupabase(loserId);
+              console.log('✅ USER RANKS UPDATED');
+            } catch (rankError) {
+              console.error('❌ Failed to update ranks:', rankError);
+            }
+
+            // ========== RECORD MATCH PROOF ==========
+            if (proof) {
+              try {
+                console.log('🔄 Recording match proof...');
+                const { error: proofError } = await db.supabaseAdmin
+                  .from('match_proofs')
+                  .insert([{
+                    match_id: matchId,
+                    user_id: userId,
+                    proof_path: proof,
+                    proof_type: 'screenshot',
+                    description: notes || 'Match result proof',
+                    created_at: new Date().toISOString()
+                  }]);
+                
+                if (proofError) throw proofError;
+                console.log('✅ MATCH PROOF RECORDED');
+              } catch (proofError) {
+                console.error('❌ Failed to record proof:', proofError);
+              }
+            }
+
+            // ========== RECORD MATCH ATTEMPT ==========
+            try {
+              console.log('🔄 Recording match attempt...');
+              
+              const { data: winnerRank } = await db.supabaseAdmin
+                .from('users')
+                .select('rank')
+                .eq('id', winnerId)
+                .single();
+              
+              const { data: loserRank } = await db.supabaseAdmin
+                .from('users')
+                .select('rank')
+                .eq('id', loserId)
+                .single();
+
+              const { error: attemptError } = await db.supabaseAdmin
+                .from('match_attempts')
+                .insert([{
+                  player1_id: winnerId,
+                  player2_id: loserId,
+                  player1_rank: winnerRank?.rank || 'E',
+                  player2_rank: loserRank?.rank || 'E',
+                  match_id: matchId,
+                  created_at: new Date().toISOString()
+                }]);
+              
+              if (attemptError) throw attemptError;
+              console.log('✅ MATCH ATTEMPT RECORDED');
+            } catch (attemptError) {
+              console.error('❌ Failed to record match attempt:', attemptError);
+            }
+
+            // ========== AUTOMATIC ADVANCEMENT ==========
+            const tournamentType = match.tournaments.type.toLowerCase();
+            const shouldAdvance = tournamentType === '1v1' || tournamentType === 'onevsone' || tournamentType === 'one_vs_one';
+            
+            if (shouldAdvance) {
+              console.log(`🚀 AUTOMATICALLY ADVANCING WINNER ${winnerId} TO NEXT ROUND`);
+              
+              try {
+                const nextMatchId = await advanceWinnerToNextRoundSupabase(tournamentId, matchId, winnerId, match.round_number);
+                
+                if (nextMatchId) {
+                  console.log(`✅ WINNER ${winnerId} ADVANCED TO MATCH ${nextMatchId}`);
+                  
+                  const { data: nextMatch } = await db.supabaseAdmin
+                    .from('tournament_matches')
+                    .select('player1_id, player2_id, status')
+                    .eq('id', nextMatchId)
+                    .single();
+                  
+                  if (nextMatch?.player1_id && nextMatch?.player2_id) {
+                    const matchTime = new Date(Date.now() + 15 * 60000);
+                    await db.supabaseAdmin
+                      .from('tournament_matches')
+                      .update({ match_time: matchTime.toISOString(), status: 'upcoming' })
+                      .eq('id', nextMatchId);
+                    console.log(`⏰ NEXT MATCH ${nextMatchId} SCHEDULED FOR ${matchTime}`);
+                  }
+                } else {
+                  console.log(`⚠️ advanceWinnerToNextRoundSupabase returned null/undefined`);
+                  await manualBracketAdvancementSupabase(tournamentId, matchId, winnerId, match.round_number);
+                }
+              } catch (advanceError) {
+                console.error('❌ Advance function error:', advanceError);
+                try {
+                  await manualBracketAdvancementSupabase(tournamentId, matchId, winnerId, match.round_number);
+                } catch (manualError) {
+                  console.error('❌ Manual advancement also failed:', manualError);
+                }
+              }
+            }
+
+            // ========== CHECK TOURNAMENT COMPLETION ==========
+            try {
+              console.log('🔄 Checking tournament completion...');
+              await checkTournamentCompletionSupabase(tournamentId, false);
+            } catch (completionError) {
+              console.error('❌ Tournament completion check failed:', completionError);
+            }
+
+            // ========== SEND NOTIFICATIONS ==========
+            try {
+              console.log('🔄 Sending notifications...');
+              
+              const { data: winnerUser } = await db.supabaseAdmin
+                .from('users')
+                .select('username')
+                .eq('id', winnerId)
+                .single();
+              
+              const { data: loserUser } = await db.supabaseAdmin
+                .from('users')
+                .select('username')
+                .eq('id', loserId)
+                .single();
+
+              await db.supabaseAdmin
+                .from('notifications')
+                .insert([{
+                  user_id: winnerId,
+                  sender_id: userId,
+                  message: `🎉 Match confirmed! You won your match against ${loserUser?.username || 'opponent'} in tournament ${match.tournaments.name}!`,
+                  type: 'system',
+                  status: 'unread',
+                  match_id: matchId,
+                  tournament_id: tournamentId,
+                  created_at: new Date().toISOString()
+                }]);
+              
+              await db.supabaseAdmin
+                .from('notifications')
+                .insert([{
+                  user_id: loserId,
+                  sender_id: userId,
+                  message: `Match confirmed: You lost to ${winnerUser?.username || 'opponent'} in tournament ${match.tournaments.name}.`,
+                  type: 'system',
+                  status: 'unread',
+                  match_id: matchId,
+                  tournament_id: tournamentId,
+                  created_at: new Date().toISOString()
+                }]);
+              
+              console.log('✅ NOTIFICATIONS SENT');
+            } catch (notificationError) {
+              console.error('❌ Failed to send notifications:', notificationError);
+            }
+
+            console.log(`✅ MATCH ${matchId} COMPLETED SUCCESSFULLY`);
+
+            return res.json({
+              success: true,
+              message: 'Match completed! Both players agreed on the winner.',
+              match_completed: true,
+              winner_advanced: shouldAdvance
+            });
+          } 
+          // Disagreement! Different winner than proposed
+          else if (match.proposed_winner_id !== winnerId) {
+            console.log('⚠️ PLAYERS DISAGREE! Marking match as disputed...');
+            
+            const { error: updateError } = await db.supabaseAdmin
+              .from('tournament_matches')
+              .update({
+                status: 'disputed',
+                dispute_reason: `Player ${userId} claims ${winnerId} won, but previous submission claimed ${match.proposed_winner_id} won.`,
+                disputed_at: new Date().toISOString()
               })
-              .eq('id', winnerId);
-          }
-
-          // Update loser stats
-          const { error: loserStatsError } = await db.supabaseAdmin.rpc('increment_user_stats', {
-            user_id: loserId,
-            losses_increment: 1,
-            matches_played_increment: 1
-          });
-          
-          if (loserStatsError) {
-            // Fallback to direct update
+              .eq('id', matchId);
+            
+            if (updateError) throw updateError;
+            
+            // Get tournament creator
+            const { data: tournament } = await db.supabaseAdmin
+              .from('tournaments')
+              .select('creator_id, name')
+              .eq('id', tournamentId)
+              .single();
+            
             await db.supabaseAdmin
-              .from('users')
-              .update({ 
-                losses: db.supabaseAdmin.raw('losses + 1'),
-                matches_played: db.supabaseAdmin.raw('matches_played + 1')
-              })
-              .eq('id', loserId);
+              .from('notifications')
+              .insert([{
+                user_id: tournament?.creator_id,
+                message: `⚠️ Match dispute in tournament "${tournament?.name}". Players disagree on winner. Please review.`,
+                type: 'dispute',
+                status: 'unread',
+                match_id: matchId,
+                tournament_id: tournamentId,
+                created_at: new Date().toISOString()
+              }]);
+            
+            return res.json({
+              success: false,
+              error: 'Match result disputed! Players disagree on winner. Admin will review.',
+              disputed: true,
+              requires_admin: true
+            });
           }
-          
-          console.log('✅ PLAYER STATS UPDATED');
-        } catch (statsError) {
-          console.error('❌ Failed to update stats:', statsError);
-          throw statsError;
         }
+        
+        // Case 2: First submission (match is upcoming)
+        else if (match.status === 'upcoming') {
+          console.log('📝 First player submitting result...');
+          
+          const { error: updateError } = await db.supabaseAdmin
+            .from('tournament_matches')
+            .update({
+              proposed_winner_id: winnerId,
+              proposed_by_id: userId,
+              status: 'pending_confirmation',
+              proposed_at: new Date().toISOString(),
+              proposed_proof: proof || null,
+              proposed_notes: notes || null
+            })
+            .eq('id', matchId);
 
-        // ========== RECALCULATE WIN RATES ==========
-        try {
-          console.log('🔄 Step 4: Recalculating win rates...');
+          if (updateError) throw updateError;
           
-          // Get winner stats
-          const { data: winnerStats } = await db.supabaseAdmin
-            .from('users')
-            .select('wins, matches_played')
-            .eq('id', winnerId)
-            .single();
-          
-          if (winnerStats && winnerStats.matches_played > 0) {
-            const winnerWinRate = (winnerStats.wins * 100.0) / winnerStats.matches_played;
+          // Record proof if provided
+          if (proof) {
             await db.supabaseAdmin
-              .from('users')
-              .update({ win_rate: Math.round(winnerWinRate * 100) / 100 })
-              .eq('id', winnerId);
-          }
-
-          // Get loser stats
-          const { data: loserStats } = await db.supabaseAdmin
-            .from('users')
-            .select('wins, matches_played')
-            .eq('id', loserId)
-            .single();
-          
-          if (loserStats && loserStats.matches_played > 0) {
-            const loserWinRate = (loserStats.wins * 100.0) / loserStats.matches_played;
-            await db.supabaseAdmin
-              .from('users')
-              .update({ win_rate: Math.round(loserWinRate * 100) / 100 })
-              .eq('id', loserId);
-          }
-          
-          console.log('✅ WIN RATES UPDATED');
-        } catch (winrateError) {
-          console.error('❌ Failed to update win rates:', winrateError);
-          // Don't throw - continue
-        }
-
-        // ========== UPDATE USER RANKS ==========
-        try {
-          console.log('🔄 Step 5: Updating user ranks...');
-          await updateUserRankSupabase(winnerId);
-          await updateUserRankSupabase(loserId);
-          console.log('✅ USER RANKS UPDATED');
-        } catch (rankError) {
-          console.error('❌ Failed to update ranks:', rankError);
-          // Don't throw - continue
-        }
-
-        // ========== RECORD MATCH PROOF ==========
-        if (proof) {
-          try {
-            console.log('🔄 Step 6: Recording match proof...');
-            const { error: proofError } = await db.supabaseAdmin
               .from('match_proofs')
               .insert([{
                 match_id: matchId,
@@ -1151,181 +1343,39 @@ match.tournaments = tournamentDetails;
                 description: notes || 'Match result proof',
                 created_at: new Date().toISOString()
               }]);
-            
-            if (proofError) throw proofError;
-            console.log('✅ MATCH PROOF RECORDED');
-          } catch (proofError) {
-            console.error('❌ Failed to record proof:', proofError);
-            // Don't throw - continue
           }
-        }
-
-        // ========== RECORD MATCH ATTEMPT ==========
-        try {
-          console.log('🔄 Step 7: Recording match attempt...');
           
-          const { data: winnerRank } = await db.supabaseAdmin
-            .from('users')
-            .select('rank')
-            .eq('id', winnerId)
-            .single();
-          
-          const { data: loserRank } = await db.supabaseAdmin
-            .from('users')
-            .select('rank')
-            .eq('id', loserId)
-            .single();
-
-          const { error: attemptError } = await db.supabaseAdmin
-            .from('match_attempts')
-            .insert([{
-              player1_id: winnerId,
-              player2_id: loserId,
-              player1_rank: winnerRank?.rank || 'E',
-              player2_rank: loserRank?.rank || 'E',
-              match_id: matchId,
-              created_at: new Date().toISOString()
-            }]);
-          
-          if (attemptError) throw attemptError;
-          console.log('✅ MATCH ATTEMPT RECORDED');
-        } catch (attemptError) {
-          console.error('❌ Failed to record match attempt:', attemptError);
-          // Don't throw - continue
-        }
-
-        // ========== AUTOMATIC ADVANCEMENT ==========
-        console.log('🚨 DEBUG TOURNAMENT TYPE:', {
-          type: match.tournaments.type,
-          is1v1: match.tournaments.type === '1v1',
-          isOneVsOne: match.tournaments.type === 'onevsone',
-          lowerCaseType: match.tournaments.type.toLowerCase(),
-          shouldAdvance: match.tournaments.type === '1v1' || match.tournaments.type === 'onevsone'
-        });
-        
-        // FIXED TOURNAMENT TYPE CHECK
-        const tournamentType = match.tournaments.type.toLowerCase();
-        const shouldAdvance = tournamentType === '1v1' || tournamentType === 'onevsone' || tournamentType === 'one_vs_one';
-        
-        console.log(`🔍 TOURNAMENT TYPE CHECK: "${match.tournaments.type}" -> "${tournamentType}"`);
-        console.log(`🔍 Should advance: ${shouldAdvance}`);
-        
-        if (shouldAdvance) {
-          console.log(`🚀 AUTOMATICALLY ADVANCING WINNER ${winnerId} TO NEXT ROUND`);
-          
-          try {
-            console.log(`🎯 Calling advanceWinnerToNextRoundSupabase function...`);
-            const nextMatchId = await advanceWinnerToNextRoundSupabase(tournamentId, matchId, winnerId, match.round_number);
-            
-            if (nextMatchId) {
-              console.log(`✅ WINNER ${winnerId} ADVANCED TO MATCH ${nextMatchId}`);
-              
-              // Check if next match is now ready
-              const { data: nextMatch } = await db.supabaseAdmin
-                .from('tournament_matches')
-                .select('player1_id, player2_id, status')
-                .eq('id', nextMatchId)
-                .single();
-              
-              if (nextMatch?.player1_id && nextMatch?.player2_id) {
-                // Schedule the match for 15 minutes from now
-                const matchTime = new Date(Date.now() + 15 * 60000);
-                await db.supabaseAdmin
-                  .from('tournament_matches')
-                  .update({ match_time: matchTime.toISOString(), status: 'upcoming' })
-                  .eq('id', nextMatchId);
-                console.log(`⏰ NEXT MATCH ${nextMatchId} SCHEDULED FOR ${matchTime}`);
-              }
-            } else {
-              console.log(`⚠️ advanceWinnerToNextRoundSupabase returned null/undefined`);
-              
-              // Try manual bracket logic as fallback
-              await manualBracketAdvancementSupabase(tournamentId, matchId, winnerId, match.round_number);
-            }
-          } catch (advanceError) {
-            console.error('❌ Advance function error:', advanceError);
-            
-            // Try manual advancement as fallback
-            console.log('🔄 Trying manual advancement as fallback...');
-            try {
-              await manualBracketAdvancementSupabase(tournamentId, matchId, winnerId, match.round_number);
-            } catch (manualError) {
-              console.error('❌ Manual advancement also failed:', manualError);
-            }
-            // Don't fail the whole transaction if advance fails
-          }
-        } else {
-          console.log(`ℹ️ Tournament type "${tournamentType}", not advancing winner`);
-        }
-
-        // ========== CHECK TOURNAMENT COMPLETION ==========
-        try {
-          console.log('🔄 Checking tournament completion...');
-          const tournamentCompleted = await checkTournamentCompletionSupabase(tournamentId, false);
-          console.log(`✅ Tournament completion check: ${tournamentCompleted}`);
-        } catch (completionError) {
-          console.error('❌ Tournament completion check failed:', completionError);
-          // Don't throw - continue
-        }
-
-        // ========== SEND NOTIFICATIONS ==========
-        try {
-          console.log('🔄 Sending notifications...');
-          
+          // Notify the other player
+          const otherPlayerId = winnerId === match.player1_id ? match.player2_id : match.player1_id;
           const { data: winnerUser } = await db.supabaseAdmin
             .from('users')
             .select('username')
-            .eq('id', winnerId)
+            .eq('id', userId)
             .single();
           
-          const { data: loserUser } = await db.supabaseAdmin
-            .from('users')
-            .select('username')
-            .eq('id', loserId)
-            .single();
-
-          // Winner notification
           await db.supabaseAdmin
             .from('notifications')
             .insert([{
-              user_id: winnerId,
-              sender_id: userId,
-              message: `You won your match against ${loserUser?.username || 'opponent'} in tournament ${match.tournaments.tournament_name}!`,
-              type: 'system',
+              user_id: otherPlayerId,
+              message: `${winnerUser?.username || 'A player'} has submitted a match result claiming they won. Please review and confirm or dispute.`,
+              type: 'match_confirmation',
               status: 'unread',
               match_id: matchId,
               tournament_id: tournamentId,
               created_at: new Date().toISOString()
             }]);
           
-          // Loser notification
-          await db.supabaseAdmin
-            .from('notifications')
-            .insert([{
-              user_id: loserId,
-              sender_id: userId,
-              message: `Match result submitted: You lost to ${winnerUser?.username || 'opponent'} in tournament ${match.tournaments.tournament_name}.`,
-              type: 'system',
-              status: 'unread',
-              match_id: matchId,
-              tournament_id: tournamentId,
-              created_at: new Date().toISOString()
-            }]);
-          
-          console.log('✅ NOTIFICATIONS SENT');
-        } catch (notificationError) {
-          console.error('❌ Failed to send notifications:', notificationError);
-          // Don't throw - continue
+          return res.json({
+            success: true,
+            message: 'Match result submitted. Waiting for opponent confirmation.',
+            pending_confirmation: true,
+            proposed_winner: winnerId
+          });
         }
-
-        console.log(`✅ TRANSACTION COMPLETED - MATCH ${matchId} COMPLETED SUCCESSFULLY`);
-
-        res.json({
-          success: true,
-          message: 'Match result submitted successfully!',
-          tournament_completed: false,
-          winner_advanced: shouldAdvance
-        });
+        
+        else {
+          throw new Error(`Cannot submit result for match with status: ${match.status}`);
+        }
 
       } catch (error) {
         console.error('❌ TRANSACTION ERROR:', error);
@@ -1397,24 +1447,22 @@ match.tournaments = tournamentDetails;
               WHERE id = $2
             `, [winnerId, matchId]);
             console.log(`✅ MATCH ${matchId} UPDATED: winner=${winnerId}, status=completed`);
-           // VERIFY the update
-    const verifyResult = await client.query(
-      `SELECT status, winner_id FROM tournament_matches WHERE id = $1`,
-      [matchId]
-    );
-    console.log(`🔍 VERIFIED Match ${matchId}:`, verifyResult[0][0]);
-  } catch (updateError) {
-    console.error('❌ Failed to update match:', updateError);
-    throw updateError;
-  }
+            
+            const verifyResult = await client.query(
+              `SELECT status, winner_id FROM tournament_matches WHERE id = $1`,
+              [matchId]
+            );
+            console.log(`🔍 VERIFIED Match ${matchId}:`, verifyResult[0][0]);
+          } catch (updateError) {
+            console.error('❌ Failed to update match:', updateError);
+            throw updateError;
+          }
 
           // ========== RECORD MATCH HISTORY ==========
           try {
             console.log('🔄 Step 2: Recording match history...');
             
-            // FIX: Check if match_history table exists and has required columns
             try {
-              // First check if table exists and has score columns
               const checkColumns = await client.query(`
                 SELECT column_name 
                 FROM information_schema.columns 
@@ -1428,7 +1476,6 @@ match.tournaments = tournamentDetails;
               );
               
               if (hasScoreColumns) {
-                // Insert with scores (default 1-0)
                 await client.query(`
                   INSERT INTO match_history 
                   (tournament_id, winner_id, loser_id, winner_score, loser_score, match_date, is_final, round_number)
@@ -1436,7 +1483,6 @@ match.tournaments = tournamentDetails;
                 `, [tournamentId, winnerId, loserId, 1, 0, match.round_number]);
                 console.log('✅ MATCH HISTORY RECORDED with scores (1-0)');
               } else {
-                // Insert without scores
                 await client.query(`
                   INSERT INTO match_history 
                   (tournament_id, winner_id, loser_id, match_date, is_final, round_number)
@@ -1445,10 +1491,8 @@ match.tournaments = tournamentDetails;
                 console.log('✅ MATCH HISTORY RECORDED without scores');
               }
             } catch (tableError) {
-              // Table might not exist or have different structure
               console.log('⚠️ Match history table issue, trying alternative...');
               try {
-                // Try minimal insert
                 await client.query(`
                   INSERT INTO match_history 
                   (tournament_id, winner_id, loser_id, match_date, round_number)
@@ -1461,7 +1505,6 @@ match.tournaments = tournamentDetails;
             }
           } catch (historyError) {
             console.error('❌ Failed to record history:', historyError);
-            // Don't throw - continue with other updates
           }
 
           // ========== UPDATE PLAYER STATS ==========
@@ -1515,7 +1558,6 @@ match.tournaments = tournamentDetails;
             console.log('✅ WIN RATES UPDATED');
           } catch (winrateError) {
             console.error('❌ Failed to update win rates:', winrateError);
-            // Don't throw - continue
           }
 
           // ========== UPDATE USER RANKS ==========
@@ -1526,7 +1568,6 @@ match.tournaments = tournamentDetails;
             console.log('✅ USER RANKS UPDATED');
           } catch (rankError) {
             console.error('❌ Failed to update ranks:', rankError);
-            // Don't throw - continue
           }
 
           // ========== RECORD MATCH PROOF ==========
@@ -1541,7 +1582,6 @@ match.tournaments = tournamentDetails;
               console.log('✅ MATCH PROOF RECORDED');
             } catch (proofError) {
               console.error('❌ Failed to record proof:', proofError);
-              // Don't throw - continue
             }
           }
 
@@ -1566,43 +1606,27 @@ match.tournaments = tournamentDetails;
             console.log('✅ MATCH ATTEMPT RECORDED');
           } catch (attemptError) {
             console.error('❌ Failed to record match attempt:', attemptError);
-            // Don't throw - continue
           }
 
           // ========== AUTOMATIC ADVANCEMENT ==========
-          console.log('🚨 DEBUG TOURNAMENT TYPE:', {
-            type: match.tournament_type,
-            is1v1: match.tournament_type === '1v1',
-            isOneVsOne: match.tournament_type === 'onevsone',
-            lowerCaseType: match.tournament_type.toLowerCase(),
-            shouldAdvance: match.tournament_type === '1v1' || match.tournament_type === 'onevsone'
-          });
-          
-          // FIXED TOURNAMENT TYPE CHECK
           const tournamentType = match.tournament_type.toLowerCase();
           const shouldAdvance = tournamentType === '1v1' || tournamentType === 'onevsone' || tournamentType === 'one_vs_one';
-          
-          console.log(`🔍 TOURNAMENT TYPE CHECK: "${match.tournament_type}" -> "${tournamentType}"`);
-          console.log(`🔍 Should advance: ${shouldAdvance}`);
           
           if (shouldAdvance) {
             console.log(`🚀 AUTOMATICALLY ADVANCING WINNER ${winnerId} TO NEXT ROUND`);
             
             try {
-              console.log(`🎯 Calling advanceWinnerToNextRound function...`);
               const nextMatchId = await advanceWinnerToNextRound(tournamentId, matchId, winnerId, match.round_number, client);
               
               if (nextMatchId) {
                 console.log(`✅ WINNER ${winnerId} ADVANCED TO MATCH ${nextMatchId}`);
                 
-                // Check if next match is now ready
                 const nextMatchResult = await client.query(
                   `SELECT player1_id, player2_id, status FROM tournament_matches WHERE id = $1`,
                   [nextMatchId]
                 );
                 
                 if (nextMatchResult[0][0]?.player1_id && nextMatchResult[0][0]?.player2_id) {
-                  // Schedule the match for 15 minutes from now
                   const matchTime = new Date(Date.now() + 15 * 60000);
                   await client.query(
                     `UPDATE tournament_matches SET match_time = $1, status = 'upcoming' WHERE id = $2`,
@@ -1612,43 +1636,24 @@ match.tournaments = tournamentDetails;
                 }
               } else {
                 console.log(`⚠️ advanceWinnerToNextRound returned null/undefined`);
-                
-                // DEBUG: Check what advanceWinnerToNextRound is doing
-                console.log(`🔍 DEBUG advanceWinnerToNextRound call details:`, {
-                  tournamentId,
-                  matchId,
-                  winnerId,
-                  currentRound: match.round_number
-                });
-                
-                // Try manual bracket logic as fallback
                 await manualBracketAdvancement(tournamentId, matchId, winnerId, match.round_number, client);
               }
             } catch (advanceError) {
               console.error('❌ Advance function error:', advanceError);
-              console.error('❌ Advance error stack:', advanceError.stack);
-              
-              // Try manual advancement as fallback
-              console.log('🔄 Trying manual advancement as fallback...');
               try {
                 await manualBracketAdvancement(tournamentId, matchId, winnerId, match.round_number, client);
               } catch (manualError) {
                 console.error('❌ Manual advancement also failed:', manualError);
               }
-              // Don't fail the whole transaction if advance fails
             }
-          } else {
-            console.log(`ℹ️ Tournament type "${tournamentType}", not advancing winner`);
           }
 
           // ========== CHECK TOURNAMENT COMPLETION ==========
           try {
             console.log('🔄 Checking tournament completion...');
-            const tournamentCompleted = await checkTournamentCompletion(tournamentId, false, client);
-            console.log(`✅ Tournament completion check: ${tournamentCompleted}`);
+            await checkTournamentCompletion(tournamentId, false, client);
           } catch (completionError) {
             console.error('❌ Tournament completion check failed:', completionError);
-            // Don't throw - continue
           }
 
           // ========== SEND NOTIFICATIONS ==========
@@ -1690,7 +1695,6 @@ match.tournaments = tournamentDetails;
             console.log('✅ NOTIFICATIONS SENT');
           } catch (notificationError) {
             console.error('❌ Failed to send notifications:', notificationError);
-            // Don't throw - continue
           }
 
           console.log(`✅ TRANSACTION COMMITTED - MATCH ${matchId} COMPLETED SUCCESSFULLY`);
@@ -1706,7 +1710,7 @@ match.tournaments = tournamentDetails;
       res.json({
         success: true,
         message: 'Match result submitted successfully!',
-        tournament_completed: false, // Will be updated by frontend
+        tournament_completed: false,
         winner_advanced: true
       });
     }
