@@ -119,160 +119,82 @@ const withTransaction = async (callback) => {
 // ============================
 
 function generateAdvancedBracket(participants, tournamentId, startDate, config) {
-  const {
-    elimination_type = 'single',
-    max_rounds = null,
-    consolation_bracket = false
-  } = config;
-  
   const matches = [];
   const participantCount = participants.length;
   
   if (participantCount < 2) return matches;
   
-  // Calculate rounds needed
-  let roundsNeeded = max_rounds || Math.ceil(Math.log2(participantCount));
-  const firstRoundSize = Math.pow(2, roundsNeeded);
-  
-  console.log(`🏆 Generating ${elimination_type} elimination bracket for ${participantCount} players`);
+  console.log(`🏆 Generating bracket for ${participantCount} players`);
   
   // Shuffle participants for random seeding
   const shuffled = [...participants].sort(() => Math.random() - 0.5);
   const startDateTime = new Date(startDate || new Date());
   
-  // ========== WINNERS BRACKET ==========
-  const winnersMatches = [];
-  let matchIndex = 0;
+  // Calculate how many matches in first round (half the participants)
+  const firstRoundMatches = Math.floor(participantCount / 2);
   
-  // Create first round matches
-  for (let i = 0; i < firstRoundSize / 2; i++) {
-    const player1Index = i * 2;
-    const player2Index = i * 2 + 1;
+  // Create first round matches - ONLY the number needed
+  for (let i = 0; i < firstRoundMatches; i++) {
+    const player1 = shuffled[i * 2];
+    const player2 = shuffled[i * 2 + 1];
     
-    const player1 = shuffled[player1Index] || null;
-    const player2 = shuffled[player2Index] || null;
+    const matchTime = new Date(startDateTime.getTime() + (i * 15 * 60000));
     
-    const matchTime = new Date(startDateTime.getTime() + (matchIndex * 15 * 60000));
+    matches.push({
+      tournament_id: tournamentId,
+      player1_id: player1.user_id,
+      player2_id: player2.user_id,
+      round_number: 1,
+      match_time: matchTime.toISOString(),
+      status: 'upcoming',
+      bracket_type: 'winners',
+      created_at: new Date().toISOString()
+    });
     
-    // BYE match (only one player)
-    if (player1 && !player2) {
-      winnersMatches.push({
-        tournament_id: tournamentId,
-        player1_id: player1.user_id,
-        player2_id: null,
-        round_number: 1,
-        match_time: matchTime.toISOString(),
-        status: 'completed',
-        winner_id: player1.user_id,
-        completed_at: new Date().toISOString(),
-        bracket_type: 'winners',
-        created_at: new Date().toISOString()
-      });
-    } 
-    else if (!player1 && player2) {
-      winnersMatches.push({
-        tournament_id: tournamentId,
-        player1_id: player2.user_id,
-        player2_id: null,
-        round_number: 1,
-        match_time: matchTime.toISOString(),
-        status: 'completed',
-        winner_id: player2.user_id,
-        completed_at: new Date().toISOString(),
-        bracket_type: 'winners',
-        created_at: new Date().toISOString()
-      });
-    }
-    else if (player1 && player2) {
-      winnersMatches.push({
-        tournament_id: tournamentId,
-        player1_id: player1.user_id,
-        player2_id: player2.user_id,
-        round_number: 1,
-        match_time: matchTime.toISOString(),
-        status: 'upcoming',
-        bracket_type: 'winners',
-        created_at: new Date().toISOString()
-      });
-    }
-    matchIndex++;
+    console.log(`✅ Match ${i + 1}: ${player1.users?.username} vs ${player2.users?.username}`);
   }
   
-  matches.push(...winnersMatches);
+  // Handle odd number of players - BYE (auto-advance to next round)
+  if (participantCount % 2 !== 0) {
+    const lastPlayer = shuffled[participantCount - 1];
+    matches.push({
+      tournament_id: tournamentId,
+      player1_id: lastPlayer.user_id,
+      player2_id: null,
+      round_number: 1,
+      match_time: new Date(startDateTime.getTime() + (firstRoundMatches * 15 * 60000)).toISOString(),
+      status: 'completed',
+      winner_id: lastPlayer.user_id,
+      completed_at: new Date().toISOString(),
+      bracket_type: 'winners',
+      created_at: new Date().toISOString()
+    });
+    console.log(`✅ BYE for: ${lastPlayer.users?.username} (auto-advances)`);
+  }
   
-  // Create subsequent winners bracket rounds
-  let matchesInCurrentRound = Math.ceil(winnersMatches.filter(m => m.status !== 'completed').length / 2);
-  let currentRound = 2;
+  // Calculate number of rounds needed
+  let roundsNeeded = Math.ceil(Math.log2(participantCount));
+  let matchesInNextRound = Math.ceil(firstRoundMatches / 2);
   
-  while (currentRound <= roundsNeeded && matchesInCurrentRound > 0) {
-    for (let i = 0; i < matchesInCurrentRound; i++) {
-      const matchTime = new Date(startDateTime.getTime() + (currentRound * 60 * 60000));
+  // Create placeholder matches for subsequent rounds
+  for (let round = 2; round <= roundsNeeded; round++) {
+    for (let i = 0; i < matchesInNextRound; i++) {
+      const matchTime = new Date(startDateTime.getTime() + (round * 60 * 60000));
       matches.push({
         tournament_id: tournamentId,
         player1_id: null,
         player2_id: null,
-        round_number: currentRound,
+        round_number: round,
         match_time: matchTime.toISOString(),
         status: 'upcoming',
         bracket_type: 'winners',
         created_at: new Date().toISOString()
       });
     }
-    matchesInCurrentRound = Math.ceil(matchesInCurrentRound / 2);
-    currentRound++;
+    matchesInNextRound = Math.ceil(matchesInNextRound / 2);
   }
   
-  // ========== LOSERS BRACKET (Double Elimination Only) ==========
-  if (elimination_type === 'double') {
-    const losersRoundsNeeded = (roundsNeeded * 2) - 1;
-    
-    for (let round = 1; round <= losersRoundsNeeded; round++) {
-      const matchesInRound = Math.max(1, Math.pow(2, Math.ceil(losersRoundsNeeded - round)));
-      for (let i = 0; i < matchesInRound; i++) {
-        const matchTime = new Date(startDateTime.getTime() + ((round + roundsNeeded) * 45 * 60000));
-        matches.push({
-          tournament_id: tournamentId,
-          player1_id: null,
-          player2_id: null,
-          round_number: round,
-          match_time: matchTime.toISOString(),
-          status: 'upcoming',
-          bracket_type: 'losers',
-          created_at: new Date().toISOString()
-        });
-      }
-    }
-    
-    // Grand Finals
-    matches.push({
-      tournament_id: tournamentId,
-      player1_id: null,
-      player2_id: null,
-      round_number: roundsNeeded + 1,
-      match_time: new Date(startDateTime.getTime() + ((roundsNeeded + 1) * 60 * 60000)).toISOString(),
-      status: 'upcoming',
-      bracket_type: 'grand_finals',
-      is_bracket_reset: true,
-      created_at: new Date().toISOString()
-    });
-  }
-  
-  // ========== CONSOLATION BRACKET (3rd Place) ==========
-  if (consolation_bracket) {
-    matches.push({
-      tournament_id: tournamentId,
-      player1_id: null,
-      player2_id: null,
-      round_number: roundsNeeded + (elimination_type === 'double' ? 2 : 1),
-      match_time: new Date(startDateTime.getTime() + ((roundsNeeded + 1) * 60 * 60000)).toISOString(),
-      status: 'upcoming',
-      bracket_type: 'consolation',
-      is_third_place: true,
-      created_at: new Date().toISOString()
-    });
-  }
-  
-  console.log(`✅ Generated ${matches.length} matches for ${elimination_type} elimination`);
+  console.log(`✅ Generated ${matches.length} total matches for ${participantCount} players`);
   return matches;
 }
 // Add this route to your tournaments.js file (anywhere before module.exports)
@@ -8351,12 +8273,30 @@ function generate1v1BracketSupabase(participants, tournamentId, startDate) {
 }
 
 async function advanceWinnerToNextRoundSupabase(tournamentId, matchId, winnerId, currentRound) {
-  console.log('🎯 ADVANCE FUNCTION CALLED (Supabase):', { tournamentId, matchId, winnerId, currentRound });
+  console.log('🎯 Advancing winner:', { tournamentId, matchId, winnerId, currentRound });
   
   try {
     const nextRound = currentRound + 1;
     
-    // Find matches in the next round
+    // Get ALL matches in current round to find position
+    const { data: currentMatches, error: currentError } = await db.supabaseAdmin
+      .from('tournament_matches')
+      .select('id, player1_id, player2_id')
+      .eq('tournament_id', tournamentId)
+      .eq('round_number', currentRound)
+      .order('id', { ascending: true });
+
+    if (currentError) throw currentError;
+    
+    // Find the index of the completed match in its round
+    const matchIndex = currentMatches.findIndex(m => m.id === matchId);
+    
+    if (matchIndex === -1) {
+      console.log('❌ Match not found in current round');
+      return null;
+    }
+    
+    // Get next round matches
     const { data: nextMatches, error: nextError } = await db.supabaseAdmin
       .from('tournament_matches')
       .select('id, player1_id, player2_id, status')
@@ -8365,147 +8305,71 @@ async function advanceWinnerToNextRoundSupabase(tournamentId, matchId, winnerId,
       .order('id', { ascending: true });
 
     if (nextError) throw nextError;
-
-    console.log(`Found ${nextMatches?.length || 0} matches in round ${nextRound}`);
-
-    if (!nextMatches || nextMatches.length === 0) {
-      console.log('No next round matches found - tournament might be complete');
-      return null;
-    }
-
-    // Get all matches in current round
-    const { data: currentMatches, error: currentError } = await db.supabaseAdmin
-      .from('tournament_matches')
-      .select('id')
-      .eq('tournament_id', tournamentId)
-      .eq('round_number', currentRound)
-      .order('id', { ascending: true });
-
-    if (currentError) throw currentError;
-
-    console.log(`Current round ${currentRound} has ${currentMatches?.length || 0} matches`);
-
-    // Find position of current match in its round
-    const matchIndex = (currentMatches || []).findIndex(m => m.id === parseInt(matchId));
     
-    if (matchIndex === -1) {
-      console.log(`ERROR: Match ${matchId} not found in round ${currentRound}`);
-      console.log('Available matches:', currentMatches?.map(m => m.id));
+    if (!nextMatches || nextMatches.length === 0) {
+      console.log('🏆 No next round matches - tournament complete!');
       return null;
     }
-
-    // Calculate which next match this winner should go to
+    
+    // Each pair of matches in current round feeds into ONE match in next round
+    // Match 0 and 1 feed into next match 0
+    // Match 2 and 3 feed into next match 1, etc.
     const nextMatchIndex = Math.floor(matchIndex / 2);
     
-    if (nextMatchIndex >= (nextMatches || []).length) {
-      console.log(`ERROR: No next match at index ${nextMatchIndex} (only ${nextMatches?.length} next matches)`);
+    if (nextMatchIndex >= nextMatches.length) {
+      console.log('❌ No corresponding next match found');
       return null;
     }
-
-    const targetMatch = nextMatches[nextMatchIndex];
-    const targetMatchId = targetMatch.id;
     
-    // Determine which slot to fill (player1 for even index, player2 for odd)
+    const targetMatch = nextMatches[nextMatchIndex];
     const targetSlot = matchIndex % 2 === 0 ? 'player1' : 'player2';
     
-    console.log(`Bracket position: matchIndex=${matchIndex}, nextMatchIndex=${nextMatchIndex}, targetSlot=${targetSlot}`);
-
-    // Check if winner is already in next round
-    const { data: alreadyInNext, error: alreadyError } = await db.supabaseAdmin
-      .from('tournament_matches')
-      .select('id')
-      .eq('tournament_id', tournamentId)
-      .eq('round_number', nextRound)
-      .or(`player1_id.eq.${winnerId},player2_id.eq.${winnerId}`)
-      .limit(1);
-
-    if (alreadyError) throw alreadyError;
-
-    if (alreadyInNext && alreadyInNext.length > 0) {
-      console.log(`⚠️ Winner ${winnerId} is already in next round`);
-      return null;
+    console.log(`📍 Placing winner into: Match ${targetMatch.id}, Slot: ${targetSlot}`);
+    
+    // Check if winner already in this match
+    if ((targetSlot === 'player1' && targetMatch.player1_id === winnerId) ||
+        (targetSlot === 'player2' && targetMatch.player2_id === winnerId)) {
+      console.log('⚠️ Winner already in this match');
+      return targetMatch.id;
     }
-
-    // Update the database
+    
+    // Update the next match with the winner
     const updateData = {};
     updateData[targetSlot] = winnerId;
     
     const { error: updateError } = await db.supabaseAdmin
       .from('tournament_matches')
       .update(updateData)
-      .eq('id', targetMatchId);
+      .eq('id', targetMatch.id);
 
     if (updateError) throw updateError;
     
-    console.log(`✅ Updated match ${targetMatchId} ${targetSlot} = ${winnerId}`);
+    console.log(`✅ Winner ${winnerId} placed in match ${targetMatch.id} as ${targetSlot}`);
     
-    // If both players are now set, schedule the match
-    const { data: updatedMatch, error: updatedError } = await db.supabaseAdmin
+    // If both players are now set, mark as upcoming
+    const { data: updatedMatch } = await db.supabaseAdmin
       .from('tournament_matches')
       .select('player1_id, player2_id')
-      .eq('id', targetMatchId)
+      .eq('id', targetMatch.id)
       .single();
-
-    if (updatedError) throw updatedError;
     
-    if (updatedMatch.player1_id && updatedMatch.player2_id) {
-      const matchTime = new Date(Date.now() + 15 * 60000); // 15 minutes from now
+    if (updatedMatch?.player1_id && updatedMatch?.player2_id) {
+      const matchTime = new Date(Date.now() + 15 * 60000);
       await db.supabaseAdmin
         .from('tournament_matches')
         .update({ 
-          match_time: matchTime.toISOString(), 
-          status: 'upcoming' 
+          status: 'upcoming', 
+          match_time: matchTime.toISOString() 
         })
-        .eq('id', targetMatchId);
-      console.log(`⏰ Match ${targetMatchId} scheduled for ${matchTime}`);
-      
-      // Get player names for notifications
-      const { data: player1 } = await db.supabaseAdmin
-        .from('users')
-        .select('username')
-        .eq('id', updatedMatch.player1_id)
-        .single();
-      
-      const { data: player2 } = await db.supabaseAdmin
-        .from('users')
-        .select('username')
-        .eq('id', updatedMatch.player2_id)
-        .single();
-      
-      const player1Name = player1?.username || 'Opponent';
-      const player2Name = player2?.username || 'Opponent';
-      
-      // Notify player 1
-      await db.supabaseAdmin
-        .from('notifications')
-        .insert([{
-          user_id: updatedMatch.player1_id,
-          message: `Your next match in the tournament is ready! You'll be facing ${player2Name}. Match starts in 15 minutes.`,
-          type: 'system',
-          status: 'unread',
-          tournament_id: tournamentId,
-          created_at: new Date().toISOString()
-        }]);
-      
-      // Notify player 2
-      await db.supabaseAdmin
-        .from('notifications')
-        .insert([{
-          user_id: updatedMatch.player2_id,
-          message: `Your next match in the tournament is ready! You'll be facing ${player1Name}. Match starts in 15 minutes.`,
-          type: 'system',
-          status: 'unread',
-          tournament_id: tournamentId,
-          created_at: new Date().toISOString()
-        }]);
+        .eq('id', targetMatch.id);
+      console.log(`⏰ Match ${targetMatch.id} scheduled for ${matchTime}`);
     }
-
-    console.log(`✅ Successfully advanced winner ${winnerId} to match ${targetMatchId}`);
-    return targetMatchId;
-
+    
+    return targetMatch.id;
+    
   } catch (error) {
-    console.error('❌ Advance winner error (Supabase):', error);
-    throw error;
+    console.error('❌ Advance winner error:', error);
+    return null;
   }
 }
 
