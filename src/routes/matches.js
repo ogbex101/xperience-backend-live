@@ -2621,6 +2621,42 @@ router.post('/:id/result', authenticateToken, async (req, res) => {
             throw updateError;
           }
 
+          // ============ UPDATE USER STATS ============
+          console.log('📊 Updating user stats...');
+
+          const matchLoserId = agreedWinnerId === match.player1_id ? match.player2_id : match.player1_id;
+
+          // Update winner stats
+          const { error: winnerStatsError } = await db.supabaseAdmin
+            .from('users')
+            .update({ 
+              wins: db.supabaseAdmin.raw('wins + 1'),
+              matches_played: db.supabaseAdmin.raw('matches_played + 1'),
+              win_rate: db.supabaseAdmin.raw('ROUND(((wins + 1)::float / NULLIF((matches_played + 1), 0)) * 100, 2)')
+            })
+            .eq('id', agreedWinnerId);
+
+          if (winnerStatsError) {
+            console.error('❌ Error updating winner stats:', winnerStatsError);
+          } else {
+            console.log('✅ Winner stats updated for:', agreedWinnerId);
+          }
+
+          // Update loser stats
+          const { error: loserStatsError } = await db.supabaseAdmin
+            .from('users')
+            .update({ 
+              matches_played: db.supabaseAdmin.raw('matches_played + 1'),
+              win_rate: db.supabaseAdmin.raw('ROUND((wins::float / NULLIF((matches_played + 1), 0)) * 100, 2)')
+            })
+            .eq('id', matchLoserId);
+
+          if (loserStatsError) {
+            console.error('❌ Error updating loser stats:', loserStatsError);
+          } else {
+            console.log('✅ Loser stats updated for:', matchLoserId);
+          }
+
           // ============ PRIZE DISTRIBUTION ============
           if (match.prize_pool_option === 'entry_fee') {
             const totalStakes = stakeAmount * 2;
@@ -3040,9 +3076,6 @@ router.post('/:id/result', authenticateToken, async (req, res) => {
           const winnerUsername = agreedWinnerId === match.player1_id 
             ? match.player1?.username 
             : match.player2?.username;
-          const loserId = agreedWinnerId === match.player1_id 
-            ? match.player2_id 
-            : match.player1_id;
 
           // Send notifications
           try {
@@ -3059,7 +3092,7 @@ router.post('/:id/result', authenticateToken, async (req, res) => {
 
           try {
             await NotificationService.createNotification({
-              userId: loserId,
+              userId: matchLoserId,
               senderId: null,
               message: `Match completed. Winner: ${winnerUsername}`,
               type: 'match',
@@ -3161,7 +3194,7 @@ router.post('/:id/result', authenticateToken, async (req, res) => {
       });
     }
   } else {
-    // PostgreSQL version - keep existing code
+    // PostgreSQL version
     const connection = await db.pool.connect();
     
     try {
@@ -3283,6 +3316,30 @@ router.post('/:id/result', authenticateToken, async (req, res) => {
           await connection.query(
             'UPDATE matches SET status = $1, winner_id = $2, completed_at = NOW() WHERE id = $3',
             ['completed', agreedWinnerId, matchId]
+          );
+
+          // ============ UPDATE USER STATS (PostgreSQL) ============
+          console.log('📊 Updating user stats...');
+
+          const matchLoserId = parseInt(agreedWinnerId) === parseInt(match.player1_id) ? match.player2_id : match.player1_id;
+
+          // Update winner stats
+          await connection.query(
+            `UPDATE users 
+             SET wins = wins + 1,
+                 matches_played = matches_played + 1,
+                 win_rate = ROUND(((wins + 1)::float / NULLIF((matches_played + 1), 0)) * 100, 2)
+             WHERE id = $1`,
+            [agreedWinnerId]
+          );
+
+          // Update loser stats
+          await connection.query(
+            `UPDATE users 
+             SET matches_played = matches_played + 1,
+                 win_rate = ROUND((wins::float / NULLIF((matches_played + 1), 0)) * 100, 2)
+             WHERE id = $1`,
+            [matchLoserId]
           );
           
           // Prize distribution for PostgreSQL
@@ -3483,10 +3540,9 @@ router.post('/:id/result', authenticateToken, async (req, res) => {
             console.error('Winner notification failed:', notifError.message);
           }
           
-          const loserId = parseInt(agreedWinnerId) === parseInt(match.player1_id) ? match.player2_id : match.player1_id;
           try {
             await NotificationService.createNotification({
-              userId: loserId,
+              userId: matchLoserId,
               senderId: null,
               message: `Match completed. Winner: ${winnerUsername}`,
               type: 'match',
@@ -3542,7 +3598,6 @@ router.post('/:id/result', authenticateToken, async (req, res) => {
     }
   }
 });
-
 // ==================== 6. CONFIRM/CONTEST RESULT ====================
 router.post('/:id/confirm', authenticateToken, async (req, res) => {
   debugLog(req, 'CONFIRM RESULT');
