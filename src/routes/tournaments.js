@@ -197,6 +197,154 @@ function generateAdvancedBracket(participants, tournamentId, startDate, config) 
   console.log(`✅ Generated ${matches.length} total matches for ${participantCount} players`);
   return matches;
 }
+// Helper function to advance winner to next round (used by both auto and manual)
+async function advanceWinnerToNextRound(tournamentId, matchId, winnerId, currentRound, supabaseClient = null) {
+  const client = supabaseClient || db.supabaseAdmin;
+  
+  console.log(`🎯 Advancing winner ${winnerId} from match ${matchId} round ${currentRound}`);
+  
+  try {
+    const nextRound = currentRound + 1;
+    
+    // Get all matches in current round to find position
+    const { data: currentMatches, error: currentError } = await client
+      .from('tournament_matches')
+      .select('id, player1_id, player2_id')
+      .eq('tournament_id', tournamentId)
+      .eq('round_number', currentRound)
+      .order('id', { ascending: true });
+
+    if (currentError) throw currentError;
+    
+    if (!currentMatches || currentMatches.length === 0) {
+      console.log('❌ No current round matches found');
+      return null;
+    }
+    
+    // Find the index of the completed match
+    const matchIndex = currentMatches.findIndex(m => m.id === matchId);
+    
+    if (matchIndex === -1) {
+      console.log('❌ Match not found in current round');
+      return null;
+    }
+    
+    // Get next round matches
+    const { data: nextMatches, error: nextError } = await client
+      .from('tournament_matches')
+      .select('id, player1_id, player2_id, status')
+      .eq('tournament_id', tournamentId)
+      .eq('round_number', nextRound)
+      .order('id', { ascending: true });
+
+    if (nextError) throw nextError;
+    
+    if (!nextMatches || nextMatches.length === 0) {
+      console.log('🏆 No next round matches - tournament complete!');
+      return null;
+    }
+    
+    // Calculate which next match this winner should go to
+    // Match 0 and 1 feed into next match 0, match 2 and 3 feed into next match 1, etc.
+    const nextMatchIndex = Math.floor(matchIndex / 2);
+    
+    if (nextMatchIndex >= nextMatches.length) {
+      console.log(`❌ Next match index ${nextMatchIndex} out of bounds (only ${nextMatches.length} matches)`);
+      return null;
+    }
+    
+    const targetMatch = nextMatches[nextMatchIndex];
+    const targetSlot = matchIndex % 2 === 0 ? 'player1' : 'player2';
+    
+    console.log(`📍 Placing winner into: Match ${targetMatch.id}, Slot: ${targetSlot}`);
+    
+    // Check if winner already in this match
+    if ((targetSlot === 'player1' && targetMatch.player1_id === winnerId) ||
+        (targetSlot === 'player2' && targetMatch.player2_id === winnerId)) {
+      console.log('⚠️ Winner already in this match');
+      return targetMatch.id;
+    }
+    
+    // Check if slot is already filled by someone else
+    if ((targetSlot === 'player1' && targetMatch.player1_id && targetMatch.player1_id !== winnerId) ||
+        (targetSlot === 'player2' && targetMatch.player2_id && targetMatch.player2_id !== winnerId)) {
+      console.log(`❌ Slot ${targetSlot} already filled by another player`);
+      return null;
+    }
+    
+    // Update the next match with the winner
+    const updateData = {};
+    updateData[targetSlot] = winnerId;
+    
+    const { error: updateError } = await client
+      .from('tournament_matches')
+      .update(updateData)
+      .eq('id', targetMatch.id);
+
+    if (updateError) throw updateError;
+    
+    console.log(`✅ Winner ${winnerId} placed in match ${targetMatch.id} as ${targetSlot}`);
+    
+    // If both players are now set, mark as upcoming and schedule
+    const { data: updatedMatch, error: updatedError } = await client
+      .from('tournament_matches')
+      .select('player1_id, player2_id')
+      .eq('id', targetMatch.id)
+      .single();
+
+    if (!updatedError && updatedMatch?.player1_id && updatedMatch?.player2_id) {
+      const matchTime = new Date(Date.now() + 15 * 60000);
+      await client
+        .from('tournament_matches')
+        .update({ 
+          status: 'upcoming', 
+          match_time: matchTime.toISOString() 
+        })
+        .eq('id', targetMatch.id);
+      console.log(`⏰ Match ${targetMatch.id} scheduled for ${matchTime}`);
+      
+      // Notify both players
+      const { data: player1 } = await client
+        .from('users')
+        .select('username')
+        .eq('id', updatedMatch.player1_id)
+        .single();
+      
+      const { data: player2 } = await client
+        .from('users')
+        .select('username')
+        .eq('id', updatedMatch.player2_id)
+        .single();
+      
+      await client
+        .from('notifications')
+        .insert([
+          {
+            user_id: updatedMatch.player1_id,
+            message: `Your next match is ready! You'll be facing ${player2?.username || 'opponent'} in 15 minutes.`,
+            type: 'system',
+            status: 'unread',
+            tournament_id: tournamentId,
+            created_at: new Date().toISOString()
+          },
+          {
+            user_id: updatedMatch.player2_id,
+            message: `Your next match is ready! You'll be facing ${player1?.username || 'opponent'} in 15 minutes.`,
+            type: 'system',
+            status: 'unread',
+            tournament_id: tournamentId,
+            created_at: new Date().toISOString()
+          }
+        ]);
+    }
+    
+    return targetMatch.id;
+    
+  } catch (error) {
+    console.error('❌ Advance winner error:', error);
+    return null;
+  }
+}
 // Add this route to your tournaments.js file (anywhere before module.exports)
 router.get('/:id/debug-state', async (req, res) => {
   try {
@@ -1088,46 +1236,20 @@ router.post('/:id/matches/:matchId/result', async (req, res) => {
             }
 
             // ========== AUTOMATIC ADVANCEMENT ==========
-            const tournamentType = match.tournaments.type.toLowerCase();
-            const shouldAdvance = tournamentType === '1v1' || tournamentType === 'onevsone' || tournamentType === 'one_vs_one';
-            
-            if (shouldAdvance) {
-              console.log(`🚀 AUTOMATICALLY ADVANCING WINNER ${winnerId} TO NEXT ROUND`);
-              
-              try {
-                const nextMatchId = await advanceWinnerToNextRoundSupabase(tournamentId, matchId, winnerId, match.round_number);
-                
-                if (nextMatchId) {
-                  console.log(`✅ WINNER ${winnerId} ADVANCED TO MATCH ${nextMatchId}`);
-                  
-                  const { data: nextMatch } = await db.supabaseAdmin
-                    .from('tournament_matches')
-                    .select('player1_id, player2_id, status')
-                    .eq('id', nextMatchId)
-                    .single();
-                  
-                  if (nextMatch?.player1_id && nextMatch?.player2_id) {
-                    const matchTime = new Date(Date.now() + 15 * 60000);
-                    await db.supabaseAdmin
-                      .from('tournament_matches')
-                      .update({ match_time: matchTime.toISOString(), status: 'upcoming' })
-                      .eq('id', nextMatchId);
-                    console.log(`⏰ NEXT MATCH ${nextMatchId} SCHEDULED FOR ${matchTime}`);
-                  }
-                } else {
-                  console.log(`⚠️ advanceWinnerToNextRoundSupabase returned null/undefined`);
-                  await manualBracketAdvancementSupabase(tournamentId, matchId, winnerId, match.round_number);
-                }
-              } catch (advanceError) {
-                console.error('❌ Advance function error:', advanceError);
-                try {
-                  await manualBracketAdvancementSupabase(tournamentId, matchId, winnerId, match.round_number);
-                } catch (manualError) {
-                  console.error('❌ Manual advancement also failed:', manualError);
-                }
-              }
-            }
+const tournamentType = match.tournaments.type.toLowerCase();
+const shouldAdvance = tournamentType === '1v1' || tournamentType === 'onevsone' || tournamentType === 'one_vs_one';
 
+if (shouldAdvance) {
+  console.log(`🚀 AUTOMATICALLY ADVANCING WINNER ${winnerId} TO NEXT ROUND`);
+  
+  const advanced = await advanceWinnerToNextRound(tournamentId, matchId, winnerId, match.round_number);
+  
+  if (advanced) {
+    console.log(`✅ Winner ${winnerId} automatically advanced to next round`);
+  } else {
+    console.log(`⚠️ Could not auto-advance winner, creator can use manual advance button`);
+  }
+}
             // ========== CHECK TOURNAMENT COMPLETION ==========
             try {
               console.log('🔄 Checking tournament completion...');
@@ -1808,18 +1930,16 @@ router.get('/:id/match-status/:matchId', async (req, res) => {
   }
 });
 
-// POST /api/tournaments/:id/manual-advance - COMPLETE FIXED VERSION
+// POST /api/tournaments/:id/manual-advance - Manual advance for creator
 router.post('/:id/manual-advance', async (req, res) => {
   try {
     const tournamentId = req.params.id;
     const userId = req.user.userId || req.user.id;
     const { match_id, winner_id } = req.body;
 
-    console.log('🔧 Manual advance request:', { tournamentId, match_id, winner_id });
+    console.log('🔧 Manual advance request:', { tournamentId, match_id, winner_id, userId });
 
     if (db.isSupabase) {
-      // SUPABASE VERSION
-      
       // 1. Get tournament details
       const { data: tournament, error: tournamentError } = await db.supabaseAdmin
         .from('tournaments')
@@ -1831,15 +1951,15 @@ router.post('/:id/manual-advance', async (req, res) => {
         return res.status(404).json({ success: false, error: 'Tournament not found' });
       }
 
-      // 2. Check if user is creator
-      if (parseInt(tournament.creator_id) !== parseInt(userId)) {
+      // 2. Check if user is creator - FIXED UUID comparison
+      if (tournament.creator_id.toString() !== userId.toString()) {
         return res.status(403).json({ success: false, error: 'Only tournament creator can manually advance' });
       }
 
       // 3. Get match details
       const { data: match, error: matchError } = await db.supabaseAdmin
         .from('tournament_matches')
-        .select('round_number, winner_id, player1_id, player2_id')
+        .select('round_number, winner_id, player1_id, player2_id, status')
         .eq('id', match_id)
         .eq('tournament_id', tournamentId)
         .single();
@@ -1853,16 +1973,18 @@ router.post('/:id/manual-advance', async (req, res) => {
         return res.status(400).json({ success: false, error: 'Match has no winner' });
       }
 
-      if (parseInt(match.winner_id) !== parseInt(winner_id)) {
+      if (match.winner_id.toString() !== winner_id.toString()) {
         return res.status(400).json({ success: false, error: 'Winner ID does not match' });
       }
 
-      // 5. Check if winner is already in next round (prevent duplicates)
-      const currentRound = match.round_number;
-      const nextRound = currentRound + 1;
+      // 5. Check if match is completed
+      if (match.status !== 'completed') {
+        return res.status(400).json({ success: false, error: 'Match is not completed yet' });
+      }
 
-      // First check if winner is already in next round
-      const { data: alreadyInNextRound, error: alreadyError } = await db.supabaseAdmin
+      // 6. Check if winner already advanced (prevent duplicate)
+      const nextRound = match.round_number + 1;
+      const { data: alreadyInNext, error: alreadyError } = await db.supabaseAdmin
         .from('tournament_matches')
         .select('id')
         .eq('tournament_id', tournamentId)
@@ -1870,170 +1992,31 @@ router.post('/:id/manual-advance', async (req, res) => {
         .or(`player1_id.eq.${winner_id},player2_id.eq.${winner_id}`)
         .limit(1);
 
-      if (alreadyError) throw alreadyError;
-
-      if (alreadyInNextRound && alreadyInNextRound.length > 0) {
+      if (!alreadyError && alreadyInNext && alreadyInNext.length > 0) {
         return res.status(400).json({ 
           success: false, 
-          error: 'Winner is already in next round' 
+          error: 'Winner is already in the next round' 
         });
       }
 
-      // 6. Find matches in next round
-      const { data: nextMatches, error: nextMatchesError } = await db.supabaseAdmin
-        .from('tournament_matches')
-        .select('id, player1_id, player2_id')
-        .eq('tournament_id', tournamentId)
-        .eq('round_number', nextRound)
-        .order('id', { ascending: true });
+      // 7. Use the shared advancement function
+      const advanced = await advanceWinnerToNextRound(tournamentId, match_id, winner_id, match.round_number);
 
-      if (nextMatchesError) throw nextMatchesError;
-
-      if (!nextMatches || nextMatches.length === 0) {
-        return res.status(400).json({ 
-          success: false, 
-          error: 'No next round matches found. Tournament might be complete.' 
+      if (advanced) {
+        res.json({
+          success: true,
+          message: 'Winner advanced to next round!',
+          next_match_id: advanced
+        });
+      } else {
+        res.status(400).json({
+          success: false,
+          error: 'Failed to advance winner. No next round matches available.'
         });
       }
-
-      // 7. DYNAMIC BRACKET LOGIC - Find the correct next match based on bracket position
-      const { data: currentMatches, error: currentMatchesError } = await db.supabaseAdmin
-        .from('tournament_matches')
-        .select('id')
-        .eq('tournament_id', tournamentId)
-        .eq('round_number', currentRound)
-        .order('id', { ascending: true });
-
-      if (currentMatchesError) throw currentMatchesError;
-
-      console.log('🔍 Bracket calculation:', {
-        currentRound,
-        currentMatches: currentMatches?.map(m => m.id) || [],
-        matchId: match_id,
-        nextRound,
-        nextMatches: nextMatches?.map(m => ({ id: m.id, player1: m.player1_id, player2: m.player2_id })) || []
-      });
-
-      // Find position of current match in its round
-      const matchIndex = (currentMatches || []).findIndex(m => m.id === parseInt(match_id));
-      
-      if (matchIndex === -1) {
-        return res.status(400).json({ 
-          success: false, 
-          error: 'Cannot determine bracket position for this match' 
-        });
-      }
-
-      // Calculate which next match this winner should go to
-      // Standard bracket: matches are paired (0,1 → 0), (2,3 → 1), etc.
-      const nextMatchIndex = Math.floor(matchIndex / 2);
-      
-      if (nextMatchIndex >= (nextMatches || []).length) {
-        return res.status(400).json({ 
-          success: false, 
-          error: 'No corresponding next match found' 
-        });
-      }
-
-      const targetMatch = nextMatches[nextMatchIndex];
-      const targetMatchId = targetMatch.id;
-      
-      // Determine which slot to fill (player1 for even index, player2 for odd)
-      const targetSlot = matchIndex % 2 === 0 ? 'player1' : 'player2';
-
-      console.log('🎯 Advancement details:', {
-        matchIndex,
-        nextMatchIndex,
-        targetMatchId,
-        targetSlot,
-        currentMatchCount: currentMatches?.length || 0,
-        nextMatchCount: nextMatches?.length || 0
-      });
-
-      // 8. Check if slot is already filled
-      if (targetSlot === 'player1' && targetMatch.player1_id) {
-        return res.status(400).json({ 
-          success: false, 
-          error: `Player1 slot in match ${targetMatchId} is already filled by user ${targetMatch.player1_id}` 
-        });
-      }
-      
-      if (targetSlot === 'player2' && targetMatch.player2_id) {
-        return res.status(400).json({ 
-          success: false, 
-          error: `Player2 slot in match ${targetMatchId} is already filled by user ${targetMatch.player2_id}` 
-        });
-      }
-
-      // 9. Update the next match
-      const updateData = {};
-      updateData[targetSlot] = winner_id;
-      
-      const { error: updateError } = await db.supabaseAdmin
-        .from('tournament_matches')
-        .update(updateData)
-        .eq('id', targetMatchId);
-
-      if (updateError) throw updateError;
-      
-      console.log(`✅ Set ${targetSlot} of match ${targetMatchId} to ${winner_id}`);
-
-      // 10. Check if next match now has both players
-      const { data: updatedMatch, error: updatedError } = await db.supabaseAdmin
-        .from('tournament_matches')
-        .select('player1_id, player2_id, status')
-        .eq('id', targetMatchId)
-        .single();
-
-      if (updatedError) throw updatedError;
-
-      console.log('🔍 Updated match status:', updatedMatch);
-
-      if (updatedMatch.player1_id && updatedMatch.player2_id) {
-        // Both players are set, schedule the match
-        const matchTime = new Date(Date.now() + 15 * 60000); // 15 minutes from now
-        await db.supabaseAdmin
-          .from('tournament_matches')
-          .update({ status: 'upcoming', match_time: matchTime.toISOString() })
-          .eq('id', targetMatchId);
-        
-        console.log(`⏰ Match ${targetMatchId} scheduled for ${matchTime}`);
-      }
-
-      console.log(`✅ Manual advance successful: winner ${winner_id} added to match ${targetMatchId} (${targetSlot})`);
-
-      // 11. Send notification to the advanced player
-      const { data: winnerUser, error: winnerUserError } = await db.supabaseAdmin
-        .from('users')
-        .select('username')
-        .eq('id', winner_id)
-        .single();
-      
-      const winnerName = winnerUser?.username || 'Player';
-      
-      await db.supabaseAdmin
-        .from('notifications')
-        .insert([{
-          user_id: winner_id,
-          sender_id: userId,
-          message: `You have been advanced to the next round in tournament! Your next match will start soon.`,
-          type: 'system',
-          status: 'unread',
-          tournament_id: tournamentId,
-          created_at: new Date().toISOString()
-        }]);
-
-      res.json({
-        success: true,
-        message: 'Winner advanced to next round!',
-        next_match_id: targetMatchId,
-        next_match_slot: targetSlot,
-        scheduled: !!(updatedMatch.player1_id && updatedMatch.player2_id)
-      });
       
     } else {
-      // POSTGRESQL VERSION - keep your original code (entire block)
-      // 1. Get tournament details
+      // PostgreSQL version - similar logic
       const tournamentResult = await db.query(
         'SELECT creator_id, status, type FROM tournaments WHERE id = $1',
         [tournamentId]
@@ -2045,14 +2028,12 @@ router.post('/:id/manual-advance', async (req, res) => {
 
       const tournament = tournamentResult[0][0];
 
-      // 2. Check if user is creator
-      if (parseInt(tournament.creator_id) !== parseInt(userId)) {
+      if (tournament.creator_id.toString() !== userId.toString()) {
         return res.status(403).json({ success: false, error: 'Only tournament creator can manually advance' });
       }
 
-      // 3. Get match details
       const matchResult = await db.query(
-        'SELECT round_number, winner_id, player1_id, player2_id FROM tournament_matches WHERE id = $1 AND tournament_id = $2',
+        'SELECT round_number, winner_id, player1_id, player2_id, status FROM tournament_matches WHERE id = $1 AND tournament_id = $2',
         [match_id, tournamentId]
       );
 
@@ -2062,178 +2043,79 @@ router.post('/:id/manual-advance', async (req, res) => {
 
       const match = matchResult[0][0];
 
-      // 4. Verify match has winner
       if (!match.winner_id) {
         return res.status(400).json({ success: false, error: 'Match has no winner' });
       }
 
-      if (parseInt(match.winner_id) !== parseInt(winner_id)) {
+      if (match.winner_id.toString() !== winner_id.toString()) {
         return res.status(400).json({ success: false, error: 'Winner ID does not match' });
       }
 
-      // 5. Check if winner is already in next round (prevent duplicates)
-      const currentRound = match.round_number;
-      const nextRound = currentRound + 1;
-
-      // First check if winner is already in next round
-      const alreadyInNextRoundResult = await db.query(
-        `SELECT id FROM tournament_matches 
-         WHERE tournament_id = $1 AND round_number = $2 
-           AND (player1_id = $3 OR player2_id = $3)`,
-        [tournamentId, nextRound, winner_id]
-      );
-
-      if (alreadyInNextRoundResult[0].length > 0) {
-        return res.status(400).json({ 
-          success: false, 
-          error: 'Winner is already in next round' 
-        });
+      if (match.status !== 'completed') {
+        return res.status(400).json({ success: false, error: 'Match is not completed yet' });
       }
 
-      // 6. Find matches in next round
+      // Get current round matches
+      const currentMatchesResult = await db.query(
+        'SELECT id FROM tournament_matches WHERE tournament_id = $1 AND round_number = $2 ORDER BY id ASC',
+        [tournamentId, match.round_number]
+      );
+
+      const matchIndex = currentMatchesResult[0].findIndex(m => m.id === match_id);
+      
+      if (matchIndex === -1) {
+        return res.status(400).json({ success: false, error: 'Cannot determine bracket position' });
+      }
+
+      // Get next round matches
       const nextMatchesResult = await db.query(
         'SELECT id, player1_id, player2_id FROM tournament_matches WHERE tournament_id = $1 AND round_number = $2 ORDER BY id ASC',
-        [tournamentId, nextRound]
+        [tournamentId, match.round_number + 1]
       );
 
       if (nextMatchesResult[0].length === 0) {
-        return res.status(400).json({ 
-          success: false, 
-          error: 'No next round matches found. Tournament might be complete.' 
-        });
+        return res.status(400).json({ success: false, error: 'No next round matches found' });
       }
 
-      // 7. DYNAMIC BRACKET LOGIC - Find the correct next match based on bracket position
-      const currentMatchesResult = await db.query(
-        'SELECT id FROM tournament_matches WHERE tournament_id = $1 AND round_number = $2 ORDER BY id ASC',
-        [tournamentId, currentRound]
-      );
-
-      console.log('🔍 Bracket calculation:', {
-        currentRound,
-        currentMatches: currentMatchesResult[0].map(m => m.id),
-        matchId: match_id,
-        nextRound,
-        nextMatches: nextMatchesResult[0].map(m => ({ id: m.id, player1: m.player1_id, player2: m.player2_id }))
-      });
-
-      // Find position of current match in its round
-      const matchIndex = currentMatchesResult[0].findIndex(m => m.id === parseInt(match_id));
-      
-      if (matchIndex === -1) {
-        return res.status(400).json({ 
-          success: false, 
-          error: 'Cannot determine bracket position for this match' 
-        });
-      }
-
-      // Calculate which next match this winner should go to
-      // Standard bracket: matches are paired (0,1 → 0), (2,3 → 1), etc.
       const nextMatchIndex = Math.floor(matchIndex / 2);
-      
-      if (nextMatchIndex >= nextMatchesResult[0].length) {
-        return res.status(400).json({ 
-          success: false, 
-          error: 'No corresponding next match found' 
-        });
-      }
-
       const targetMatch = nextMatchesResult[0][nextMatchIndex];
-      const targetMatchId = targetMatch.id;
-      
-      // Determine which slot to fill (player1 for even index, player2 for odd)
       const targetSlot = matchIndex % 2 === 0 ? 'player1' : 'player2';
 
-      console.log('🎯 Advancement details:', {
-        matchIndex,
-        nextMatchIndex,
-        targetMatchId,
-        targetSlot,
-        currentMatchCount: currentMatchesResult[0].length,
-        nextMatchCount: nextMatchesResult[0].length
-      });
-
-      // 8. Check if slot is already filled
-      if (targetSlot === 'player1' && targetMatch.player1_id) {
-        return res.status(400).json({ 
-          success: false, 
-          error: `Player1 slot in match ${targetMatchId} is already filled by user ${targetMatch.player1_id}` 
-        });
-      }
-      
-      if (targetSlot === 'player2' && targetMatch.player2_id) {
-        return res.status(400).json({ 
-          success: false, 
-          error: `Player2 slot in match ${targetMatchId} is already filled by user ${targetMatch.player2_id}` 
-        });
-      }
-
-      // 9. Update the next match
       if (targetSlot === 'player1') {
         await db.query(
           'UPDATE tournament_matches SET player1_id = $1 WHERE id = $2',
-          [winner_id, targetMatchId]
+          [winner_id, targetMatch.id]
         );
-        console.log(`✅ Set player1 of match ${targetMatchId} to ${winner_id}`);
       } else {
         await db.query(
           'UPDATE tournament_matches SET player2_id = $1 WHERE id = $2',
-          [winner_id, targetMatchId]
+          [winner_id, targetMatch.id]
         );
-        console.log(`✅ Set player2 of match ${targetMatchId} to ${winner_id}`);
       }
 
-      // 10. Check if next match now has both players
+      // Check if match is now ready
       const updatedMatchResult = await db.query(
-        'SELECT player1_id, player2_id, status FROM tournament_matches WHERE id = $1',
-        [targetMatchId]
+        'SELECT player1_id, player2_id FROM tournament_matches WHERE id = $1',
+        [targetMatch.id]
       );
-
       const updatedMatch = updatedMatchResult[0][0];
-      console.log('🔍 Updated match status:', updatedMatch);
 
       if (updatedMatch.player1_id && updatedMatch.player2_id) {
-        // Both players are set, schedule the match
-        const matchTime = new Date(Date.now() + 15 * 60000); // 15 minutes from now
+        const matchTime = new Date(Date.now() + 15 * 60000);
         await db.query(
           'UPDATE tournament_matches SET status = $1, match_time = $2 WHERE id = $3',
-          ['upcoming', matchTime, targetMatchId]
+          ['upcoming', matchTime, targetMatch.id]
         );
-        console.log(`⏰ Match ${targetMatchId} scheduled for ${matchTime}`);
       }
-
-      console.log(`✅ Manual advance successful: winner ${winner_id} added to match ${targetMatchId} (${targetSlot})`);
-
-      // 11. Send notification to the advanced player
-      const winnerUserResult = await db.query(
-        'SELECT username FROM users WHERE id = $1',
-        [winner_id]
-      );
-      
-      const winnerName = winnerUserResult[0][0]?.username || 'Player';
-      
-      await db.query(`
-        INSERT INTO notifications 
-        (user_id, sender_id, message, type, status, tournament_id, created_at)
-        VALUES ($1, $2, $3, 'system', 'unread', $4, NOW())
-      `, [
-        winner_id,
-        userId,
-        `You have been advanced to the next round in tournament! Your next match will start soon.`,
-        tournamentId
-      ]);
 
       res.json({
         success: true,
         message: 'Winner advanced to next round!',
-        next_match_id: targetMatchId,
-        next_match_slot: targetSlot,
-        scheduled: updatedMatch.player1_id && updatedMatch.player2_id
+        next_match_id: targetMatch.id
       });
     }
   } catch (error) {
     console.error('❌ Manual advance error:', error);
-    console.error('❌ Error stack:', error.stack);
     res.status(500).json({
       success: false,
       error: 'Failed to manually advance: ' + error.message
